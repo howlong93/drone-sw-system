@@ -1,0 +1,105 @@
+<launch>
+  <arg name="paused" default="false"/>
+  <arg name="verbose" default="false"/>
+  <arg name="use_sim_time" default="true"/>
+  <arg name="debug" default="false"/>
+  <arg name="gui" default="true"/>
+  <arg name="rviz" default="true"/>
+
+  <arg name="start_x" default="-18.5"/>
+  <arg name="start_y" default="8.5"/>
+  <arg name="spawn_z" default="0.1"/>
+  <arg name="goal_x" default="9.0"/>
+  <arg name="goal_y" default="-8.5"/>
+  <arg name="goal_z" default="0.75"/>
+  <arg name="goal_yaw" default="0.0"/>
+  <arg name="goal_tolerance" default="0.60"/>
+  <arg name="arrival_dwell_s" default="2.0"/>
+  <arg name="startup_delay_s" default="8.0"/>
+  <arg name="timeout_s" default="240.0"/>
+  <arg name="corridor_quality_stride" default="40"/>
+  <arg name="use_line_seed_risp" default="true"/>
+  <arg name="line_seed_max_length" default="1.0"/>
+  <arg name="run_id" default="quadrotor_left_top_to_right_room_left_bottom"/>
+  <arg name="output_dir" default="/home/PathCover/PathCover_ws/benchmark_results/start_-18.5_8.5__goal_9.0_-8.5"/>
+  <arg name="world_name" default="$(find quadrotor_description)/worlds/floorplan1/floorplan1_static.world"/>
+
+  <include file="$(find gazebo_ros)/launch/empty_world.launch">
+    <arg name="paused" value="$(arg paused)"/>
+    <arg name="world_name" value="$(arg world_name)"/>
+    <arg name="verbose" value="$(arg verbose)"/>
+    <arg name="use_sim_time" value="$(arg use_sim_time)"/>
+    <arg name="debug" value="$(arg debug)"/>
+    <arg name="gui" value="$(arg gui)"/>
+  </include>
+
+  <param name="robot_description"
+         command="$(find xacro)/xacro --inorder '$(find quadrotor_description)/urdf/quadrotor.xacro'"/>
+
+  <node name="spawn_gazebo_model" pkg="gazebo_ros" type="spawn_model"
+        args="-urdf -param robot_description -model quadrotor -x $(arg start_x) -y $(arg start_y) -z $(arg spawn_z)"
+        respawn="false" output="screen"/>
+
+  <node name="quadrotor_ground_truth_node" pkg="quadrotor_description"
+        type="quadrotor_ground_truth_node" output="screen"/>
+
+  <node name="robot_state_publisher" pkg="robot_state_publisher"
+        type="robot_state_publisher" respawn="false" output="screen">
+    <remap from="/joint_states" to="/quadrotor/joint_states"/>
+  </node>
+
+  <node name="corridor_planning_node" pkg="corridor_planning"
+        type="corridor_planning_node" output="screen">
+    <rosparam file="$(find corridor_planning)/config/global_planning_drone.yaml" command="load"/>
+    <!-- The stock YAML targets the map origin immediately.  Hold the planner at
+         the benchmark start until the runner publishes the measured goal. -->
+    <rosparam param="InitialPose" subst_value="true">[$(arg start_x), $(arg start_y), $(arg goal_z)]</rosparam>
+    <rosparam param="GoalPose" subst_value="true">[$(arg start_x), $(arg start_y), $(arg goal_z)]</rosparam>
+    <!-- Override the YAML defaults for controlled point-seed/line-seed experiments. -->
+    <param name="UseLineSeedRisp" value="$(arg use_line_seed_risp)"/>
+    <param name="LineSeedMaxLength" value="$(arg line_seed_max_length)"/>
+  </node>
+
+  <node name="nanovoxmap_node" pkg="nanovoxmap_ros"
+        type="nanovoxmap_ros_node" output="screen">
+    <rosparam file="$(find nanovoxmap_ros)/config/mapping_drone.yaml"/>
+  </node>
+
+  <!-- Preserve periodic map evidence without recording the full high-rate cloud stream. -->
+  <node name="benchmark_voxel_map_throttle" pkg="topic_tools" type="throttle"
+        args="messages /nanovoxmap/Voxel_map 0.5 /benchmark/voxel_map_sample"
+        output="screen"/>
+
+  <node name="occupancy_inflation_node" pkg="occupancy_inflation"
+        type="occupancy_inflation_node" output="screen">
+    <rosparam file="$(find occupancy_inflation)/config/inflation_params_drone.yaml"/>
+  </node>
+
+  <node name="trajectory_server_node" pkg="trajectory_server"
+        type="trajectory_server_node" output="screen">
+    <rosparam file="$(find trajectory_server)/config/gcopter_params_drone.yaml" command="load"/>
+  </node>
+
+  <node if="$(arg rviz)" name="rviz" pkg="rviz" type="rviz"
+        args="-d $(find quadrotor_description)/config/quadrotor_visual.rviz"/>
+
+  <!-- This node records the bag, publishes the goal after the map is live,
+       writes CSV/JSON results, and exits on arrival or timeout.  required=true
+       then shuts down the complete simulation cleanly. -->
+  <node name="pathcover_benchmark_runner" pkg="corridor_planning"
+        type="pathcover_benchmark_runner.py" output="screen" required="true">
+    <param name="start_x" value="$(arg start_x)"/>
+    <param name="start_y" value="$(arg start_y)"/>
+    <param name="goal_x" value="$(arg goal_x)"/>
+    <param name="goal_y" value="$(arg goal_y)"/>
+    <param name="goal_z" value="$(arg goal_z)"/>
+    <param name="goal_yaw" value="$(arg goal_yaw)"/>
+    <param name="goal_tolerance" value="$(arg goal_tolerance)"/>
+    <param name="arrival_dwell_s" value="$(arg arrival_dwell_s)"/>
+    <param name="startup_delay_s" value="$(arg startup_delay_s)"/>
+    <param name="timeout_s" value="$(arg timeout_s)"/>
+    <param name="corridor_quality_stride" value="$(arg corridor_quality_stride)"/>
+    <param name="run_id" value="$(arg run_id)"/>
+    <param name="output_dir" value="$(arg output_dir)"/>
+  </node>
+</launch>

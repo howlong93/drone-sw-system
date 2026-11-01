@@ -1,0 +1,25 @@
+<launch>
+  <arg name="bag_path"/>
+  <arg name="gui" default="true"/>
+  <arg name="rate" default="1.0"/>
+  <arg name="start" default="0.0"/>
+  <arg name="pause_flag" default=""/>
+  <arg name="loop_flag" default=""/>
+  <arg name="corridor_stride" default="3"/>
+
+  <param name="use_sim_time" value="true"/>
+
+  <node name="pathcover_replay_visualizer" pkg="corridor_planning"
+        type="pathcover_replay_visualizer.py" output="screen">
+    <param name="frame_id" value="world"/>
+    <param name="corridor_stride" value="$(arg corridor_stride)"/>
+  </node>
+
+  <node if="$(arg gui)" name="rviz" pkg="rviz" type="rviz"
+        args="-d $(find corridor_planning)/config/replay_drone.rviz" output="screen"/>
+
+  <!-- required=true makes roslaunch close cleanly when this finite bag ends. -->
+  <node name="pathcover_replay_bag" pkg="rosbag" type="play" required="true"
+        args="$(arg bag_path) --clock --delay=1.0 --rate=$(arg rate) --start=$(arg start) $(arg pause_flag) $(arg loop_flag)"
+        output="screen"/>
+</launch>

@@ -1,0 +1,50 @@
+{
+    "name": "ROS Development Container for PathCover gazebo container",
+    "privileged": true,
+    "remoteUser": "PathCover",
+    // "--network=host" builds on the host network stack rather than the default
+    // bridge. On a VPN with a sub-1500 MTU (Cisco AnyConnect's cscotun0 uses
+    // 1390) the bridge black-holes full-size packets, so apt connects but its
+    // .deb downloads stall and time out. Inheriting the host MTU avoids that,
+    // and is a no-op off-VPN.
+    "build": {
+        "dockerfile": "Dockerfile",
+        "options": ["--network=host"]
+    },
+    "workspaceFolder": "/home/PathCover/PathCover_ws",
+    "workspaceMount": "source=${localWorkspaceFolder},target=/home/PathCover/PathCover_ws,type=bind",
+    "customizations": {
+        "vscode": {
+            "extensions":[
+                "ms-vscode.cpptools",
+                "ms-vscode.cpptools-themes",
+                "twxs.cmake",
+                "donjayamanne.python-extension-pack",
+                "eamodio.gitlens",
+                "ms-iot.vscode-ros"
+            ]
+        }
+    },
+    "containerEnv": {
+        "DISPLAY": "unix:0"
+    },
+    // "optional" makes the tooling attach all host GPUs when the NVIDIA
+    // container runtime is present, and start the container normally when it is
+    // not -- nanovoxmap then falls back to its CPU path. Hard-coding
+    // "--gpus all"/"--runtime=nvidia" in runArgs instead would make the
+    // container fail to start on a machine without a GPU.
+    "hostRequirements": {
+        "gpu": "optional"
+    },
+    "runArgs": [
+        "--net=host",
+        "--pid=host",
+        "--ipc=host",
+        "-e", "DISPLAY=${env:DISPLAY}",
+        "-v", "/dev/input:/dev/input"
+    ],
+    "mounts": [
+        "source=/tmp/.X11-unix,target=/tmp/.X11-unix,type=bind,consistency=cached",
+        "source=/dev/dri,target=/dev/dri,type=bind,consistency=cached"
+    ]
+}

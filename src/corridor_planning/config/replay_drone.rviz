@@ -1,0 +1,82 @@
+Panels:
+  - Class: rviz/Displays
+    Name: Displays
+  - Class: rviz/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz/Grid
+      Name: Grid
+      Enabled: true
+      Plane: XY
+      Plane Cell Count: 45
+      Cell Size: 1
+      Color: 160; 160; 164
+      Alpha: 0.5
+    - Class: rviz/PointCloud2
+      Name: Raw voxel map
+      Enabled: true
+      Topic: /benchmark/voxel_map_sample
+      Queue Size: 3
+      Style: Boxes
+      Size (m): 0.08
+      Alpha: 0.20
+      Color Transformer: AxisColor
+      Position Transformer: XYZ
+      Axis: Z
+      Use Fixed Frame: true
+    - Class: rviz/Path
+      Name: Actual flight path
+      Enabled: true
+      Topic: /replay/flight_path
+      Queue Size: 1
+      Buffer Length: 1
+      Line Style: Billboards
+      Line Width: 0.07
+      Color: 30; 210; 70
+      Pose Style: None
+    - Class: rviz/Marker
+      Name: Quadrotor
+      Enabled: true
+      Marker Topic: /replay/vehicle
+      Queue Size: 10
+    - Class: rviz/Marker
+      Name: Start
+      Enabled: true
+      Marker Topic: /replay/start
+      Queue Size: 1
+    - Class: rviz/Marker
+      Name: Goal
+      Enabled: true
+      Marker Topic: /replay/goal
+      Queue Size: 1
+    - Class: rviz/MarkerArray
+      Name: Corridor
+      Enabled: true
+      Marker Topic: /replay/corridor
+      Queue Size: 3
+  Enabled: true
+  Global Options:
+    Background Color: 245; 245; 245
+    Default Light: true
+    Fixed Frame: world
+    Frame Rate: 30
+  Name: root
+  Views:
+    Current:
+      Class: rviz/Orbit
+      Distance: 48
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0
+      Pitch: 1.05
+      Yaw: 4.7
+      Target Frame: <Fixed Frame>
+    Saved: ~
+Window Geometry:
+  Height: 900
+  Width: 1500
+  X: 100
+  Y: 50

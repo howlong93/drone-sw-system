@@ -67,6 +67,7 @@ docker_args=(
   --interactive
   --privileged
   --network=host
+  --hostname "$(hostname)"
   --env "MODE=gazebo"
   --env "ENV=${WORLD}"
   --env "QT_X11_NO_MITSHM=1"
@@ -93,7 +94,21 @@ if [[ "${GUI}" == "1" ]]; then
     echo "        Reconnect with X11 forwarding (ssh -X or ssh -Y), or run GUI=0." >&2
     exit 1
   fi
-  docker_args+=(--env "DISPLAY=${DISPLAY}")
+
+  XAUTH_FILE="${XAUTHORITY:-${HOME}/.Xauthority}"
+  if [[ ! -r "${XAUTH_FILE}" ]]; then
+    echo "[ERROR] GUI=1 requires a readable Xauthority file." >&2
+    echo "        Checked: ${XAUTH_FILE}" >&2
+    echo "        Set XAUTHORITY to the file used by this MobaXterm session." >&2
+    exit 1
+  fi
+
+  docker_args+=(
+    --env "DISPLAY=${DISPLAY}"
+    --env "XAUTHORITY=/root/.Xauthority"
+    --volume "${XAUTH_FILE}:/root/.Xauthority:ro"
+    --volume "/tmp/.X11-unix:/tmp/.X11-unix:rw"
+  )
 else
   docker_args+=(--env "NO_RVIZ=true")
 fi
@@ -114,6 +129,15 @@ source /home/kkondo/code/decomp_ws/install/setup.bash
 source /home/kkondo/code/mighty_ws/install/setup.bash
 source /usr/share/gazebo/setup.sh
 cd /home/kkondo/code/mighty_ws
+
+if [[ "${NO_RVIZ:-false}" != "true" ]]; then
+  if ! xdpyinfo >/dev/null 2>&1; then
+    echo "[ERROR] The container cannot connect to DISPLAY=${DISPLAY:-<unset>}." >&2
+    echo "        Check MobaXterm X11 forwarding and the host XAUTHORITY file." >&2
+    exit 1
+  fi
+  echo "[MIGHTY] X11 preflight passed for DISPLAY=${DISPLAY}."
+fi
 
 args=(--mode gazebo -s /home/kkondo/code/mighty_ws/install/setup.bash --env "${ENV}")
 if [[ "${NO_RVIZ:-false}" == "true" ]]; then
@@ -148,12 +172,6 @@ if [[ "${DRY_RUN:-0}" == "1" ]]; then
   printf '%q ' "${command[@]}"
   printf '\n'
   exit 0
-fi
-
-if [[ "${GUI}" == "1" ]]; then
-  # Match MIGHTY's documented Linux Docker flow. This authorizes the container
-  # to connect to the forwarded/local X server for Gazebo and RViz.
-  xhost + >/dev/null
 fi
 
 exec "${command[@]}"

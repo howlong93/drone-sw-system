@@ -4,12 +4,20 @@ set -Eeuo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: ./run_gazebo_forest.sh [GUI]
+Usage: ./run_gazebo_forest.sh [RVIZ_GUI] [GAZEBO_GUI]
 
 Run the README "Single UAV through a Gazebo forest" scenario in Docker.
 
-  GUI=1  Show both Gazebo and RViz (default; requires DISPLAY/X11 access).
-  GUI=0  Run headless (no Gazebo client and no RViz).
+  RVIZ_GUI=1    Show RViz (default: 1).
+  RVIZ_GUI=0    Do not start RViz.
+  GAZEBO_GUI=1  Show the Gazebo client (default: 0).
+  GAZEBO_GUI=0  Run Gazebo server-only.
+
+Examples:
+  ./run_gazebo_forest.sh        # RViz on, Gazebo GUI off
+  ./run_gazebo_forest.sh 1 1    # RViz and Gazebo GUI on
+  ./run_gazebo_forest.sh 0 1    # Gazebo GUI only
+  ./run_gazebo_forest.sh 0 0    # Fully headless
 
 Optional environment variables:
   MIGHTY_IMAGE   Docker image to run (default: mighty:latest)
@@ -21,16 +29,32 @@ Optional environment variables:
 EOF
 }
 
-GUI="${1:-1}"
-if [[ "${GUI}" == "-h" || "${GUI}" == "--help" ]]; then
+RVIZ_GUI="${1:-1}"
+GAZEBO_GUI="${2:-0}"
+
+if [[ "${RVIZ_GUI}" == "-h" || "${RVIZ_GUI}" == "--help" ]]; then
   usage
   exit 0
 fi
 
-if [[ "${GUI}" != "0" && "${GUI}" != "1" ]]; then
-  echo "[ERROR] GUI must be 0 or 1 (received: ${GUI})." >&2
+if (( $# > 2 )); then
+  echo "[ERROR] Expected at most two arguments." >&2
   usage >&2
   exit 2
+fi
+
+for variable in RVIZ_GUI GAZEBO_GUI; do
+  if [[ "${!variable}" != "0" && "${!variable}" != "1" ]]; then
+    echo "[ERROR] ${variable} must be 0 or 1 (received: ${!variable})." >&2
+    usage >&2
+    exit 2
+  fi
+done
+
+if [[ "${RVIZ_GUI}" == "1" || "${GAZEBO_GUI}" == "1" ]]; then
+  X11_ENABLED=1
+else
+  X11_ENABLED=0
 fi
 
 REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -70,6 +94,8 @@ docker_args=(
   --hostname "$(hostname)"
   --env "MODE=gazebo"
   --env "ENV=${WORLD}"
+  --env "USE_RVIZ=$([[ "${RVIZ_GUI}" == "1" ]] && echo true || echo false)"
+  --env "USE_GAZEBO_GUI=$([[ "${GAZEBO_GUI}" == "1" ]] && echo true || echo false)"
   --env "QT_X11_NO_MITSHM=1"
 )
 
@@ -88,16 +114,17 @@ for component in X Y Z; do
   fi
 done
 
-if [[ "${GUI}" == "1" ]]; then
+if [[ "${X11_ENABLED}" == "1" ]]; then
   if [[ -z "${DISPLAY:-}" ]]; then
-    echo "[ERROR] GUI=1 requires DISPLAY to be set." >&2
-    echo "        Reconnect with X11 forwarding (ssh -X or ssh -Y), or run GUI=0." >&2
+    echo "[ERROR] Enabling RViz or Gazebo GUI requires DISPLAY to be set." >&2
+    echo "        Reconnect with X11 forwarding (ssh -X or ssh -Y)," >&2
+    echo "        or run './run_gazebo_forest.sh 0 0'." >&2
     exit 1
   fi
 
   XAUTH_FILE="${XAUTHORITY:-${HOME}/.Xauthority}"
   if [[ ! -r "${XAUTH_FILE}" ]]; then
-    echo "[ERROR] GUI=1 requires a readable Xauthority file." >&2
+    echo "[ERROR] Enabling RViz or Gazebo GUI requires a readable Xauthority file." >&2
     echo "        Checked: ${XAUTH_FILE}" >&2
     echo "        Set XAUTHORITY to the file used by this MobaXterm session." >&2
     exit 1
@@ -109,8 +136,6 @@ if [[ "${GUI}" == "1" ]]; then
     --volume "${XAUTH_FILE}:/root/.Xauthority:ro"
     --volume "/tmp/.X11-unix:/tmp/.X11-unix:rw"
   )
-else
-  docker_args+=(--env "NO_RVIZ=true")
 fi
 
 if [[ "${DEV}" == "1" ]]; then
@@ -130,7 +155,7 @@ source /home/kkondo/code/mighty_ws/install/setup.bash
 source /usr/share/gazebo/setup.sh
 cd /home/kkondo/code/mighty_ws
 
-if [[ "${NO_RVIZ:-false}" != "true" ]]; then
+if [[ "${USE_RVIZ}" == "true" || "${USE_GAZEBO_GUI}" == "true" ]]; then
   if ! xdpyinfo >/dev/null 2>&1; then
     echo "[ERROR] The container cannot connect to DISPLAY=${DISPLAY:-<unset>}." >&2
     echo "        Check MobaXterm X11 forwarding and the host XAUTHORITY file." >&2
@@ -140,9 +165,10 @@ if [[ "${NO_RVIZ:-false}" != "true" ]]; then
 fi
 
 args=(--mode gazebo -s /home/kkondo/code/mighty_ws/install/setup.bash --env "${ENV}")
-if [[ "${NO_RVIZ:-false}" == "true" ]]; then
+if [[ "${USE_RVIZ}" != "true" ]]; then
   args+=(--no-rviz)
-else
+fi
+if [[ "${USE_GAZEBO_GUI}" == "true" ]]; then
   args+=(--gazebo-gui)
 fi
 
@@ -164,7 +190,8 @@ exec python3 src/mighty/scripts/run_sim.py "${args[@]}"'
 command=(docker "${docker_args[@]}" --entrypoint bash "${IMAGE}" "${container_command[@]}")
 
 echo "[MIGHTY] World: ${WORLD}"
-echo "[MIGHTY] GUI: ${GUI} (1=Gazebo+RViz, 0=headless)"
+echo "[MIGHTY] RViz GUI: ${RVIZ_GUI}"
+echo "[MIGHTY] Gazebo GUI: ${GAZEBO_GUI}"
 echo "[MIGHTY] Image: ${IMAGE}"
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then

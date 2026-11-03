@@ -1,0 +1,48 @@
+# Catkin / CMake generated files
+/build/
+/devel/
+/install/
+/log/
+/logs/
+/.catkin_workspace
+/src/CMakeLists.txt
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+
+# Benchmark, test, and runtime output
+/benchmark_results/
+/test_results/
+*.log
+*.bag
+*.bag.active
+*.db3
+*.mcap
+*.prof
+*.gcda
+*.gcno
+coverage.xml
+.coverage
+htmlcov/
+
+# Python caches and environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Local editor and tool state
+.vscode/
+.idea/
+.codex-backups/
+*.swp
+*~
+
+# Archives and crash dumps
+*.zip
+*.tar
+*.tar.gz
+core
+core.*

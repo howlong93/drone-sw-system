@@ -10,30 +10,25 @@ namespace timer
 
   class Timer
   {
-      
-      typedef std::chrono::high_resolution_clock high_resolution_clock;
-      typedef std::chrono::milliseconds milliseconds;
-
+      typedef std::chrono::steady_clock steady_clock;
     private:
-
-      high_resolution_clock::time_point _start;
+      steady_clock::time_point _start;
 
     public:
-
       explicit Timer(bool run = false)
-    {
+      {
         if (run)
           Reset();
       }
 
       void Reset()
       {
-        _start = high_resolution_clock::now();
+        _start = steady_clock::now();
       }
-      
+
       double getElapsedMs() const
       {
-        return (std::chrono::duration_cast<milliseconds>(high_resolution_clock::now() - _start)).count();
+        return std::chrono::duration<double, std::milli>(steady_clock::now() - _start).count();
       }
 
       void printMs(const std::string &str)
@@ -43,7 +38,7 @@ namespace timer
 
       double getElapsedMicros() const
       {
-        return std::chrono::duration_cast<std::chrono::microseconds>(high_resolution_clock::now() - _start).count();
+        return std::chrono::duration_cast<std::chrono::microseconds>(steady_clock::now() - _start).count();
       }
 
       template <typename T, typename Traits>
@@ -51,10 +46,8 @@ namespace timer
       {
         return out << timer.getElapsedMs();
       }
-
   };
-      
+
 }  // namespace timer
 
 #endif  // TIMER_HPP
-

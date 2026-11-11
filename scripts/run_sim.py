@@ -45,6 +45,7 @@ import argparse
 import math
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -742,7 +743,9 @@ def generate_gazebo_yaml(setup_bash: Path, goal: tuple, sim_env: str,
                          start_pos: tuple = (0, 0, 3.0), start_yaw: float = 1.57,
                          ros_domain_id: int = 7, use_rviz: bool = True,
                          use_gazebo_gui: bool = False, use_ground_robot: bool = False,
-                         no_goal: bool = False, exploration_enabled: bool = None) -> str:
+                         no_goal: bool = False, exploration_enabled: bool = None,
+                         auto_exit_delay: float = -1.0,
+                         benchmark_file: str = None) -> str:
     """Generate YAML for single-agent Gazebo simulation.
 
     exploration_enabled=False is what makes this mode mean "drive to the goal"
@@ -753,6 +756,13 @@ def generate_gazebo_yaml(setup_bash: Path, goal: tuple, sim_env: str,
     """
     goal_x, goal_y, goal_z = goal
     start_x, start_y, start_z = start_pos
+
+    benchmark_args = ''
+    if benchmark_file:
+        benchmark_args = (
+            ' use_benchmark:=true'
+            f' data_file:={shlex.quote(benchmark_file)}'
+        )
 
     panes = [
         # Base station with Gazebo
@@ -789,6 +799,7 @@ def generate_gazebo_yaml(setup_bash: Path, goal: tuple, sim_env: str,
                 f'sim_env:={sim_env} use_ground_robot:={str(use_ground_robot).lower()}'
                 + ('' if exploration_enabled is None
                    else f' exploration_enabled:={str(exploration_enabled).lower()}')
+                + benchmark_args
             ]
         },
     ]
@@ -808,6 +819,18 @@ def generate_gazebo_yaml(setup_bash: Path, goal: tuple, sim_env: str,
                 f"ros2 launch mighty goal_sender.launch.py list_agents:=\"['NX01']\" list_goals:=\"['[{goal_x}, {goal_y}, {goal_z}]']\"{goal_z_arg}"
             ]
         })
+
+        if auto_exit_delay >= 0:
+            delay_text = f'{auto_exit_delay:g}'
+            monitor_commands = [
+                'echo "[AUTO EXIT] Waiting for /NX01/goal_reached..."',
+                'ros2 topic echo --once /NX01/goal_reached std_msgs/msg/Empty',
+                f'echo "[AUTO EXIT] Goal reached; shutting down in {delay_text} second(s)."',
+            ]
+            if auto_exit_delay > 0:
+                monitor_commands.append(f'sleep {delay_text}')
+            monitor_commands.append('tmux kill-session -t mighty_sim')
+            panes.append({'shell_command': monitor_commands})
 
     yaml_content = {
         'session_name': 'mighty_sim',
@@ -939,6 +962,22 @@ def main():
     )
 
     parser.add_argument(
+        '--auto-exit-delay',
+        type=float,
+        default=-1.0,
+        help='Exit this Gazebo tmux session this many seconds after the fixed '
+             'goal is reached; 0 exits immediately and -1 disables auto-exit '
+             '(default: -1)'
+    )
+
+    parser.add_argument(
+        '--benchmark-file',
+        default=None,
+        help='Enable MIGHTY per-replan benchmarking and write the resulting '
+             'CSV to this path (Gazebo mode only)'
+    )
+
+    parser.add_argument(
         '--dry-run',
         action='store_true',
         help='Print the generated YAML without launching'
@@ -978,6 +1017,11 @@ def main():
     )
 
     args = parser.parse_args()
+
+    if args.auto_exit_delay < 0 and args.auto_exit_delay != -1:
+        parser.error('--auto-exit-delay must be -1 or a non-negative number')
+    if args.benchmark_file and args.mode != 'gazebo':
+        parser.error('--benchmark-file is only supported with --mode gazebo')
 
     # Find setup.bash path and rviz config
     setup_bash = find_setup_bash(args.setup_bash)
@@ -1166,7 +1210,9 @@ def main():
             use_gazebo_gui=args.gazebo_gui,
             use_ground_robot=use_ground_robot,
             no_goal=no_goal,
-            exploration_enabled=exploration_enabled
+            exploration_enabled=exploration_enabled,
+            auto_exit_delay=args.auto_exit_delay,
+            benchmark_file=args.benchmark_file
         )
         print(f"[INFO] Mode: Single-agent Gazebo simulation (sim_env={sim_env})")
         print(f"[INFO] Environment: {args.env} (world: {world_name})")

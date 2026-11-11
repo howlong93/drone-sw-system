@@ -183,7 +183,7 @@ mighty_node:
         static_heat_exclude_dynamic: true               # [-] Exclude dynamic obstacles from static heat
 
         # --- Soft-Cost Obstacles ---
-        use_soft_cost_obstacles: true                   # [-] Enable soft-cost traversal mode
+        use_soft_cost_obstacles: false                  # [-] Enable soft-cost traversal mode
         obstacle_soft_cost: 50.0                        # [-] Cost per occupied cell step
 
         # --- Path Smoothing ---
@@ -304,6 +304,7 @@ mighty_node:
 
         # --- Benchmarking ---
         use_benchmark: true                             # [-] Enable benchmarking data logging
+        benchmark_replan_details: false                 # [-] Optional heavy per-replan audit metrics
         file_path: ""                                   # Path to save benchmark CSV
         use_only_global_planner: false                  # [-] Use only global planner for benchmarking
 

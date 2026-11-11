@@ -8,7 +8,9 @@
 
 #pragma once
 
+#include <cstdint>
 #include <fstream>
+#include <limits>
 #include <optional>
 #include <unordered_map>
 #include <vector>
@@ -152,8 +154,8 @@ class MIGHTY_NODE : public rclcpp::Node {
       rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr publisher);
   void runSim();
   void printComputationTime(bool result);
-  void recordData(bool result);
-  void logData();
+  void recordData(const ReplanBenchmarkData& sample, double timestamp);
+  void logData(bool final = true);
   void setComputationTimesToZero();
   void constructFOVMarker();
   void retrieveData();
@@ -387,25 +389,48 @@ class MIGHTY_NODE : public rclcpp::Node {
   // DYNUS pointer
   std::shared_ptr<MIGHTY> mighty_ptr_;
 
+  struct BenchmarkRow {
+    uint64_t replan_id = 0;
+    double timestamp = 0.0;
+    ReplanBenchmarkData sample;
+    double cost = 0.0;
+    double global_planning_ms = 0.0;
+    double initial_guess_ms = 0.0;
+    double optimizer_ms = 0.0;
+    double hgp_static_jps_ms = 0.0;
+    double hgp_check_path_ms = 0.0;
+    double hgp_dynamic_astar_ms = 0.0;
+    double hgp_recover_path_ms = 0.0;
+  };
+
   // Global Path Benchmarking
-  std::string file_path_;         // only for benchmarking
-  std::vector<std::tuple<bool,    // Result
-                         double,  // Cost
-                         double,  // Total replanning time
-                         double,  // Global planning time
-                         double,  // CVX decomposition time
-                         double,  // Initial guess computation time
-                         double,  // Local trajectory time
-                         double,  // Safe paths time
-                         double,  // Safety Check time
-                         double,  // Yaw sequence time
-                         double,  // Yaw fitting time
-                         double,  // Static JPS time in HGP
-                         double,  // Check path time in HGP
-                         double,  // Dynamic A* time in HGP
-                         double   // Recover path time in HGP
-                         >>
-      global_path_benchmark_;  // only for benchmarking
+  std::string file_path_;
+  std::vector<BenchmarkRow> global_path_benchmark_;
+  uint64_t benchmark_replan_id_ = 0;
+  uint64_t benchmark_idle_not_ready_ = 0;
+  uint64_t benchmark_idle_no_replan_ = 0;
+  bool benchmark_logged_ = false;
+  size_t benchmark_rows_flushed_ = 0;
+
+  // Mission-level benchmark state.
+  bool benchmark_goal_active_ = false;
+  bool benchmark_have_previous_state_ = false;
+  Eigen::Vector3d benchmark_previous_position_{0.0, 0.0, 0.0};
+  // Flight-time collection must remain constant-time. Safety evaluation is
+  // deferred until logData(), after the mission has stopped.
+  std::vector<Eigen::Vector3d> benchmark_safety_positions_;
+  std::vector<double> benchmark_trajectory_elapsed_s_;
+  double benchmark_executed_path_length_ = 0.0;
+  double benchmark_max_executed_velocity_ = 0.0;
+  double benchmark_min_occupied_center_distance_ = std::numeric_limits<double>::infinity();
+  uint64_t benchmark_collision_samples_ = 0;
+  uint64_t benchmark_clearance_violation_samples_ = 0;
+  double benchmark_last_clearance_sample_time_ = -std::numeric_limits<double>::infinity();
+  double benchmark_command_to_execution_ms_ = std::numeric_limits<double>::quiet_NaN();
+  double benchmark_goal_to_reached_ms_ = std::numeric_limits<double>::quiet_NaN();
+  double benchmark_flight_start_time_s_ = std::numeric_limits<double>::quiet_NaN();
+  double benchmark_flight_start_to_reached_ms_ = std::numeric_limits<double>::quiet_NaN();
+  double benchmark_terminal_error_m_ = std::numeric_limits<double>::quiet_NaN();
 
   // debug
   double replan_last_time_called_ = 0.0;
@@ -453,6 +478,7 @@ class MIGHTY_NODE : public rclcpp::Node {
   bool state_initialized_ = false;           // State initialized
   bool replan_timer_started_ = false;        // Replan timer started
   bool use_benchmark_ = false;               // Use benchmark
+  bool benchmark_replan_details_ = false;    // Expensive per-replan audit metrics
 
   // Actual-trajectory history for visualization (sando-style: a single
   // persistent LINE_STRIP marker built from a bounded history of past states,

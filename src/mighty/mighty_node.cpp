@@ -15,6 +15,7 @@
 
 #include <fstream>
 #include <iomanip>
+#include <sstream>
 
 using namespace std::chrono_literals;
 
@@ -238,11 +239,11 @@ MIGHTY_NODE::MIGHTY_NODE() : Node("mighty_node") {
   timer_goal_ =
       this->create_wall_timer(std::chrono::duration<double>(par_.dc),
                               std::bind(&MIGHTY_NODE::publishGoal, this), this->cb_group_goal_);
-  // Goal-reached check is needed for both benchmark logging and exploration
-  // (so the manager knows when the robot has reached a frontier).
-  if (use_benchmark_ || par_.expl_enabled)
-    timer_goal_reached_check_ = this->create_wall_timer(
-        100ms, std::bind(&MIGHTY_NODE::goalReachedCheckCallback, this), this->cb_groups_re_[2]);
+  // Keep the completion event available in every mode. Fixed/manual goals use
+  // manual_goal_active_ in the callback to avoid reporting the initial
+  // GOAL_REACHED state before the first goal arrives.
+  timer_goal_reached_check_ = this->create_wall_timer(
+      100ms, std::bind(&MIGHTY_NODE::goalReachedCheckCallback, this), this->cb_groups_re_[2]);
   timer_cleanup_old_trajs_ = this->create_wall_timer(
       500ms, std::bind(&MIGHTY_NODE::cleanUpOldTrajsCallback, this), this->cb_groups_mu_[4]);
   if (par_.use_hardware)
@@ -252,11 +253,10 @@ MIGHTY_NODE::MIGHTY_NODE() : Node("mighty_node") {
   // Stop the timer for callback
   if (timer_replanning_) timer_replanning_->cancel();
   if (timer_goal_) timer_goal_->cancel();
-  if (!use_benchmark_ && !par_.expl_enabled && timer_goal_reached_check_)
-    timer_goal_reached_check_->cancel();
 
   // Initialize the DYNUS object
   mighty_ptr_ = std::make_shared<MIGHTY>(par_);
+  mighty_ptr_->setDetailedBenchmarkEnabled(use_benchmark_ && benchmark_replan_details_);
 
   // Initialize the tf2 buffer and listener
   tf2_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
@@ -483,6 +483,9 @@ MIGHTY_NODE::MIGHTY_NODE() : Node("mighty_node") {
  * @brief Destructor
  */
 MIGHTY_NODE::~MIGHTY_NODE() {
+  if (use_benchmark_ && !benchmark_logged_ &&
+      (!global_path_benchmark_.empty() || !benchmark_safety_positions_.empty()))
+    logData();
   // release the memory
   mighty_ptr_.reset();
 }
@@ -525,6 +528,7 @@ void MIGHTY_NODE::declareParameters() {
   // Global planner parameters
   this->declare_parameter("file_path", "/home/kkondo/code/dynus_ws/src/dynus/data/data.txt");
   this->declare_parameter("use_benchmark", false);
+  this->declare_parameter("benchmark_replan_details", false);
   this->declare_parameter("start_yaw", -90.0);
   this->declare_parameter("global_planner", "sjps");
   this->declare_parameter("global_planner_verbose", false);
@@ -878,6 +882,7 @@ void MIGHTY_NODE::setParameters() {
   // Global Planner parameters
   file_path_ = this->get_parameter("file_path").as_string();
   use_benchmark_ = this->get_parameter("use_benchmark").as_bool();
+  benchmark_replan_details_ = this->get_parameter("benchmark_replan_details").as_bool();
   par_.global_planner = this->get_parameter("global_planner").as_string();
   par_.global_planner_verbose = this->get_parameter("global_planner_verbose").as_bool();
   par_.global_planner_heuristic_weight =
@@ -1512,6 +1517,28 @@ void MIGHTY_NODE::stateCallback(const dynus_interfaces::msg::State::SharedPtr ms
     if (par_.visual_level >= 1) publishVelocityInText(current_state.pos, current_state.vel.norm());
   }
 
+  if (use_benchmark_ && benchmark_goal_active_ &&
+      std::isfinite(benchmark_flight_start_time_s_)) {
+    const Eigen::Vector3d position(msg->pos.x, msg->pos.y, msg->pos.z);
+    const Eigen::Vector3d velocity(msg->vel.x, msg->vel.y, msg->vel.z);
+    if (benchmark_have_previous_state_) {
+      const double step_distance = (position - benchmark_previous_position_).norm();
+      // Ignore simulator teleports/resets while still retaining all physical motion.
+      if (step_distance < 5.0) benchmark_executed_path_length_ += step_distance;
+    }
+    benchmark_previous_position_ = position;
+    benchmark_have_previous_state_ = true;
+    benchmark_max_executed_velocity_ =
+        std::max(benchmark_max_executed_velocity_, velocity.norm());
+
+    const double now_s = this->now().seconds();
+    if (now_s - benchmark_last_clearance_sample_time_ >= 0.1) {
+      benchmark_last_clearance_sample_time_ = now_s;
+      benchmark_safety_positions_.push_back(position);
+      benchmark_trajectory_elapsed_s_.push_back(now_s - benchmark_flight_start_time_s_);
+    }
+  }
+
   if (!state_initialized_) {
     // If we don't use state update, we need to initialize the state
     if (!par_.use_state_update) {
@@ -1579,6 +1606,7 @@ void MIGHTY_NODE::replanCallback() {
   // Replan
   auto [replanning_result, hgp_result] =
       mighty_ptr_->replan(replanning_computation_time_, current_time);
+  const ReplanBenchmarkData benchmark_sample = mighty_ptr_->getReplanBenchmarkData();
 
   // Republish the terminal goal marker so RViz tracks any in-replan
   // relocation done by sanitizeTerminalGoal (e.g. when an obstacle gets
@@ -1589,14 +1617,10 @@ void MIGHTY_NODE::replanCallback() {
     publishState(gterm_now, pub_point_G_term_);
   }
 
-  // Get computation time (used to find point A) - note this value is not updated in the replan
-  // function
-  if (replanning_result) {
-    // Get the replanning computation time
-    replanning_computation_time_ = this->now().seconds() - current_time;
-    if (par_.debug_verbose)
-      printf("Total Replanning: %f ms\n", replanning_computation_time_ * 1000.0);
-  }
+  // The planner uses a wall-clock timer and records every return path, including failures.
+  replanning_computation_time_ = benchmark_sample.total_ms / 1000.0;
+  if (par_.debug_verbose && benchmark_sample.attempted)
+    printf("Total Replanning: %f ms\n", benchmark_sample.total_ms);
 
   // Debug log: dump global path + local trajectory endpoints on every replan
   // so backward-planning bugs can be diagnosed offline.
@@ -1667,6 +1691,14 @@ void MIGHTY_NODE::replanCallback() {
   // Publish command-to-execution time (time from goal received to first trajectory)
   if (replanning_result && waiting_for_first_traj_) {
     double command_to_exec_time_ms = (this->now() - goal_received_time_).seconds() * 1000.0;
+    benchmark_command_to_execution_ms_ = command_to_exec_time_ms;
+    if (use_benchmark_ && benchmark_goal_active_) {
+      benchmark_flight_start_time_s_ = this->now().seconds();
+      benchmark_have_previous_state_ = false;
+      benchmark_safety_positions_.clear();
+      benchmark_trajectory_elapsed_s_.clear();
+      benchmark_last_clearance_sample_time_ = -std::numeric_limits<double>::infinity();
+    }
     std_msgs::msg::Float64 time_msg;
     time_msg.data = command_to_exec_time_ms;
     pub_command_to_exec_time_->publish(time_msg);
@@ -1722,14 +1754,21 @@ void MIGHTY_NODE::replanCallback() {
 
   // If verbose_computation_time_ or use_benchmark_ is true, we need to retrieve data from
   // mighty_ptr_
-  if (verbose_computation_time_ || use_benchmark_) retrieveData();
+  if (verbose_computation_time_ || (use_benchmark_ && benchmark_replan_details_)) retrieveData();
 
   // Verbose computation time to the terminal
   if (verbose_computation_time_) printComputationTime(replanning_result);
 
-  // Record the data
-  // if (replanning_result && use_benchmark_)
-  if (use_benchmark_) recordData(replanning_result);
+  // Record actual planning attempts only. Idle callbacks remain aggregate counters.
+  if (use_benchmark_ && benchmark_replan_details_ && benchmark_goal_active_) {
+    if (benchmark_sample.attempted) {
+      recordData(benchmark_sample, current_time);
+    } else if (benchmark_sample.status == "idle_not_ready") {
+      ++benchmark_idle_not_ready_;
+    } else if (benchmark_sample.status == "idle_no_replan") {
+      ++benchmark_idle_no_replan_;
+    }
+  }
 
   // Usually this is done is goal callback but becuase we don't call that in push path test, we need
   // to call it here
@@ -1772,9 +1811,20 @@ void MIGHTY_NODE::swarmGoalCallback(const geometry_msgs::msg::PoseStamped& msg) 
  */
 void MIGHTY_NODE::terminalGoalCallbackImpl(const geometry_msgs::msg::PoseStamped& msg,
                                            bool from_user) {
-  // Record the time when goal is received (for command-to-execution timing)
-  goal_received_time_ = this->now();
-  waiting_for_first_traj_ = true;
+  const double requested_goal_z = par_.force_goal_z ? par_.default_goal_z : msg.pose.position.z;
+  bool repeated_active_goal = false;
+  if (from_user && (benchmark_goal_active_ || benchmark_logged_) && mighty_ptr_) {
+    state existing_goal;
+    mighty_ptr_->getGterm(existing_goal);
+    const Eigen::Vector3d requested_goal(msg.pose.position.x, msg.pose.position.y, requested_goal_z);
+    repeated_active_goal = (existing_goal.pos - requested_goal).norm() < 1e-6;
+  }
+
+  if (!repeated_active_goal) {
+    // Record the time when a genuinely new goal is received.
+    goal_received_time_ = this->now();
+    waiting_for_first_traj_ = true;
+  }
 
   // Debug log: every received term_goal
   if (auto& s = debug_log_stream(); s.is_open()) {
@@ -1794,6 +1844,33 @@ void MIGHTY_NODE::terminalGoalCallbackImpl(const geometry_msgs::msg::PoseStamped
     unreachable_consec_count_ = 0;
     // Operator override of a return-home — start a fresh session.
     home_return_requested_ = false;
+
+    if (use_benchmark_ && !repeated_active_goal) {
+      global_path_benchmark_.clear();
+      global_path_benchmark_.reserve(4096);
+      benchmark_replan_id_ = 0;
+      benchmark_idle_not_ready_ = 0;
+      benchmark_idle_no_replan_ = 0;
+      benchmark_logged_ = false;
+      benchmark_rows_flushed_ = 0;
+      benchmark_goal_active_ = true;
+      benchmark_have_previous_state_ = false;
+      benchmark_safety_positions_.clear();
+      benchmark_safety_positions_.reserve(4096);
+      benchmark_trajectory_elapsed_s_.clear();
+      benchmark_trajectory_elapsed_s_.reserve(4096);
+      benchmark_executed_path_length_ = 0.0;
+      benchmark_max_executed_velocity_ = 0.0;
+      benchmark_min_occupied_center_distance_ = std::numeric_limits<double>::infinity();
+      benchmark_collision_samples_ = 0;
+      benchmark_clearance_violation_samples_ = 0;
+      benchmark_last_clearance_sample_time_ = -std::numeric_limits<double>::infinity();
+      benchmark_command_to_execution_ms_ = std::numeric_limits<double>::quiet_NaN();
+      benchmark_goal_to_reached_ms_ = std::numeric_limits<double>::quiet_NaN();
+      benchmark_flight_start_time_s_ = std::numeric_limits<double>::quiet_NaN();
+      benchmark_flight_start_to_reached_ms_ = std::numeric_limits<double>::quiet_NaN();
+      benchmark_terminal_error_m_ = std::numeric_limits<double>::quiet_NaN();
+    }
   }
 
   // Set the terminal goal
@@ -1884,9 +1961,22 @@ void MIGHTY_NODE::publishVelocityInText(const Eigen::Vector3d& position, double 
  * @brief Callback function to check if the goal is reached
  */
 void MIGHTY_NODE::goalReachedCheckCallback() {
+  // In benchmark mode, MIGHTY starts in GOAL_REACHED before the first user
+  // goal arrives.  Do not turn that idle state into a successful mission.
+  if (use_benchmark_ && !benchmark_goal_active_) return;
+  if (!use_benchmark_ && !par_.expl_enabled && !manual_goal_active_) return;
   if (!mighty_ptr_->goalReachedCheck()) return;
 
   if (use_benchmark_) {
+    benchmark_goal_to_reached_ms_ = (this->now() - goal_received_time_).seconds() * 1000.0;
+    if (std::isfinite(benchmark_flight_start_time_s_))
+      benchmark_flight_start_to_reached_ms_ =
+          (this->now().seconds() - benchmark_flight_start_time_s_) * 1000.0;
+    state benchmark_state, benchmark_goal;
+    mighty_ptr_->getState(benchmark_state);
+    mighty_ptr_->getGterm(benchmark_goal);
+    benchmark_terminal_error_m_ = (benchmark_state.pos - benchmark_goal.pos).norm();
+    benchmark_goal_active_ = false;
     logData();
   }
   pub_goal_reached_->publish(std_msgs::msg::Empty());
@@ -2286,6 +2376,7 @@ void MIGHTY_NODE::setComputationTimesToZero() {
   safety_check_time_ = 0.0;
   yaw_sequence_time_ = 0.0;
   yaw_fitting_time_ = 0.0;
+  replanning_computation_time_ = 0.0;
 }
 
 // ----------------------------------------------------------------------------
@@ -2336,25 +2427,25 @@ void MIGHTY_NODE::printComputationTime(bool result) {
  * @brief Record the data
  * @param result result of the replanning
  */
-void MIGHTY_NODE::recordData(bool result) {
-  // Record all the data into global_path_benchmark_
-  std::tuple<bool, double, double, double, double, double, double, double, double, double, double,
-             double, double, double, double>
-      data;
-  if (par_.global_planner == "hgp") {
-    data = std::make_tuple(result, final_g_, replanning_computation_time_, global_planning_time_,
-                           cvx_decomp_time_, initial_guess_computation_time_,
-                           local_traj_computation_time_, safe_paths_time_, safety_check_time_,
-                           yaw_sequence_time_, yaw_fitting_time_, hgp_static_jps_time_,
-                           hgp_check_path_time_, hgp_dynamic_astar_time_, hgp_recover_path_time_);
-  } else {
-    data = std::make_tuple(result, final_g_, replanning_computation_time_, global_planning_time_,
-                           cvx_decomp_time_, initial_guess_computation_time_,
-                           local_traj_computation_time_, safe_paths_time_, safety_check_time_,
-                           yaw_sequence_time_, yaw_fitting_time_, 0.0, 0.0, 0.0, 0.0);
-  }
+void MIGHTY_NODE::recordData(const ReplanBenchmarkData& sample, double timestamp) {
+  BenchmarkRow row;
+  row.replan_id = ++benchmark_replan_id_;
+  row.timestamp = timestamp;
+  row.sample = sample;
+  row.cost = final_g_;
+  row.global_planning_ms = global_planning_time_;
+  row.initial_guess_ms = initial_guess_computation_time_;
+  row.optimizer_ms = local_traj_computation_time_;
+  row.hgp_static_jps_ms = hgp_static_jps_time_;
+  row.hgp_check_path_ms = hgp_check_path_time_;
+  row.hgp_dynamic_astar_ms = hgp_dynamic_astar_time_;
+  row.hgp_recover_path_ms = hgp_recover_path_time_;
+  global_path_benchmark_.push_back(std::move(row));
+  benchmark_logged_ = false;
 
-  global_path_benchmark_.push_back(data);
+  // Append only new rows in small, infrequent batches. This bounds data loss
+  // on a forced timeout without repeatedly rewriting the complete CSV.
+  if (global_path_benchmark_.size() % 100 == 0) logData(false);
 }
 
 // ----------------------------------------------------------------------------
@@ -2362,46 +2453,180 @@ void MIGHTY_NODE::recordData(bool result) {
 /**
  * @brief Log the data to a csv file
  */
-void MIGHTY_NODE::logData() {
-  // Loc the computation times to csv file
-  // std::ofstream log_file(file_path_, std::ios_base::app); // Open the file in append mode
-  std::ofstream log_file(file_path_);  // Open the file in overwrite mode
-  if (log_file.is_open()) {
-    if (par_.global_planner == "hgp") {
-      // Header
-      log_file << "Planner,Result,Cost (final node's g),Total replanning time [ms],Global Planning "
-                  "Time [ms],CVX Decomposition Time [ms],Initial Guess Time [ms],Local Traj Time "
-                  "[ms],Safe Paths Time [ms],Safety Check Time [ms],Yaw Sequence Time [ms],Yaw "
-                  "Fitting Time [ms],Static JPS Time [ms],Check Path Time [ms],Dynamic A* Time "
-                  "[ms],Recover Path Time [ms]\n";
-    } else {
-      // Header
-      log_file << "Planner,Result,Cost (final node's g),Total replanning time [ms],Global Planning "
-                  "Time [ms],CVX Decomposition Time [ms],Initial Guess Time [ms],Local Traj Time "
-                  "[ms],Safe Paths Time [ms],Safety Check Time [ms],Yaw Sequence Time [ms],Yaw "
-                  "Fitting Time [ms]\n";
-    }
+void MIGHTY_NODE::logData(bool final) {
+  if (file_path_.empty()) return;
 
-    // Data
-    for (const auto& row : global_path_benchmark_) {
-      if (par_.global_planner == "hgp") {
-        log_file << par_.global_planner << "," << std::get<0>(row) << "," << std::get<1>(row) << ","
-                 << std::get<2>(row) * 1000.0 << "," << std::get<3>(row) << "," << std::get<4>(row)
-                 << "," << std::get<5>(row) << "," << std::get<6>(row) << "," << std::get<7>(row)
-                 << "," << std::get<8>(row) << "," << std::get<9>(row) << "," << std::get<10>(row)
-                 << "," << std::get<11>(row) << "," << std::get<12>(row) << "," << std::get<13>(row)
-                 << std::get<14>(row) << "\n";
-      } else {
-        log_file << par_.global_planner << "," << std::get<0>(row) << "," << std::get<1>(row) << ","
-                 << std::get<2>(row) * 1000.0 << "," << std::get<3>(row) << "," << std::get<4>(row)
-                 << "," << std::get<5>(row) << "," << std::get<6>(row) << "," << std::get<7>(row)
-                 << "," << std::get<8>(row) << "," << std::get<9>(row) << "," << std::get<10>(row)
-                 << "\n";
-      }
+  auto encode_times = [](const std::vector<double>& values) {
+    std::ostringstream stream;
+    for (size_t i = 0; i < values.size(); ++i) {
+      if (i) stream << ';';
+      stream << values[i];
     }
+    return stream.str();
+  };
 
-    log_file.close();
+  const bool write_header = benchmark_rows_flushed_ == 0;
+  std::ofstream log_file(file_path_, write_header ? std::ios::trunc : std::ios::app);
+  if (!log_file.is_open()) return;
+
+  if (write_header) log_file
+      << "replan_id,timestamp_s,planner,status,success,global_path_success,cost,"
+         "current_x,current_y,current_z,local_goal_x,local_goal_y,local_goal_z,"
+         "terminal_goal_x,terminal_goal_y,terminal_goal_z,global_path_points,"
+         "total_ms,housekeeping_ms,global_stage_ms,global_planner_core_ms,local_stage_ms,"
+         "append_plan_ms,final_housekeeping_ms,initial_guess_ms,optimizer_ms,"
+         "sc_total_ms,sc_input_prepare_ms,sc_primary_ms,sc_secondary_ms,sc_validation_ms,"
+         "sc_primary_success,sc_secondary_success,sc_seed_valid,sc_obstacles_valid,"
+         "sc_segments,sc_primary_obstacles,sc_secondary_obstacles,sc_primary_hyperplanes,"
+         "sc_secondary_hyperplanes,sc_obstacle_violations,sc_max_obstacle_penetration_m,"
+         "sc_primary_obstacle_copy_ms,"
+         "sc_primary_dilation_ms,sc_primary_constraint_ms,sc_secondary_obstacle_copy_ms,"
+         "sc_secondary_dilation_ms,sc_secondary_constraint_ms,sc_primary_segment_ms,"
+         "sc_secondary_segment_ms,sc_primary_failure_reason,sc_secondary_failure_reason,"
+         "trajectory_valid,planned_obstacle_safe,trajectory_validation_samples,"
+         "planned_obstacle_violations,trajectory_validation_ms,"
+         "trajectory_min_corridor_margin,planned_min_occupied_center_distance_m,"
+         "planned_length_m,planned_duration_s,"
+         "planned_max_velocity,planned_max_acceleration,planned_max_jerk,"
+         "hgp_static_jps_ms,hgp_check_path_ms,hgp_dynamic_astar_ms,hgp_recover_path_ms\n";
+
+  for (size_t row_index = benchmark_rows_flushed_; row_index < global_path_benchmark_.size();
+       ++row_index) {
+    const auto& row = global_path_benchmark_[row_index];
+    const auto& s = row.sample;
+    log_file << row.replan_id << ',' << row.timestamp << ',' << par_.global_planner << ','
+             << s.status << ',' << s.success << ',' << s.global_path_success << ',' << row.cost
+             << ',' << s.current_x << ',' << s.current_y << ',' << s.current_z << ','
+             << s.local_goal_x << ',' << s.local_goal_y << ',' << s.local_goal_z << ','
+             << s.terminal_goal_x << ',' << s.terminal_goal_y << ',' << s.terminal_goal_z << ','
+             << s.global_path_points << ',' << s.total_ms << ',' << s.housekeeping_ms << ','
+             << s.global_stage_ms << ',' << row.global_planning_ms << ',' << s.local_stage_ms << ','
+             << s.append_plan_ms << ',' << s.final_housekeeping_ms << ',' << row.initial_guess_ms
+             << ',' << row.optimizer_ms << ',' << s.sc_total_ms << ',' << s.sc_input_prepare_ms
+             << ',' << s.sc_primary_ms << ',' << s.sc_secondary_ms << ',' << s.sc_validation_ms
+             << ',' << s.sc_primary_success << ',' << s.sc_secondary_success << ','
+             << s.sc_seed_validation_success << ',' << s.sc_obstacle_validation_success << ','
+             << s.sc_segment_count << ',' << s.sc_primary_obstacle_count << ','
+             << s.sc_secondary_obstacle_count << ',' << s.sc_primary_hyperplanes << ','
+             << s.sc_secondary_hyperplanes << ',' << s.sc_obstacle_violations << ','
+             << s.sc_max_obstacle_penetration << ','
+             << s.sc_primary_obstacle_copy_ms << ',' << s.sc_primary_dilation_ms << ','
+             << s.sc_primary_constraint_ms << ',' << s.sc_secondary_obstacle_copy_ms << ','
+             << s.sc_secondary_dilation_ms << ',' << s.sc_secondary_constraint_ms << ",\""
+             << encode_times(s.sc_primary_segment_ms) << "\",\""
+             << encode_times(s.sc_secondary_segment_ms) << "\"," << s.sc_primary_failure_reason
+             << ',' << s.sc_secondary_failure_reason << ',' << s.trajectory_validation_success
+             << ',' << s.planned_obstacle_validation_success << ','
+             << s.trajectory_validation_samples << ',' << s.planned_obstacle_violations << ','
+             << s.trajectory_validation_ms << ',' << s.trajectory_min_corridor_margin << ','
+             << s.planned_min_occupied_center_distance << ',' << s.planned_trajectory_length << ','
+             << s.planned_trajectory_duration << ',' << s.planned_max_velocity << ','
+             << s.planned_max_acceleration << ',' << s.planned_max_jerk << ','
+             << row.hgp_static_jps_ms << ',' << row.hgp_check_path_ms << ','
+             << row.hgp_dynamic_astar_ms << ',' << row.hgp_recover_path_ms << '\n';
   }
+  log_file.close();
+  benchmark_rows_flushed_ = global_path_benchmark_.size();
+
+  if (!final) return;
+
+  std::string summary_path = file_path_;
+  const auto extension = summary_path.rfind(".csv");
+  if (extension != std::string::npos)
+    summary_path.replace(extension, 4, "_summary.csv");
+  else
+    summary_path += "_summary.csv";
+
+  // Persist the raw executed path first. Collision checking is deliberately
+  // performed by the host after Gazebo exits, against the SDF world geometry;
+  // it must never delay planning callbacks or the goal-reached notification.
+  std::string trajectory_path = file_path_;
+  const auto trajectory_extension = trajectory_path.rfind(".csv");
+  if (trajectory_extension != std::string::npos)
+    trajectory_path.replace(trajectory_extension, 4, "_trajectory.csv");
+  else
+    trajectory_path += "_trajectory.csv";
+  std::ofstream trajectory_file(trajectory_path);
+  if (trajectory_file.is_open()) {
+    trajectory_file << "elapsed_from_flight_start_s,x_m,y_m,z_m\n";
+    const size_t sample_count =
+        std::min(benchmark_safety_positions_.size(), benchmark_trajectory_elapsed_s_.size());
+    for (size_t i = 0; i < sample_count; ++i) {
+      const auto& position = benchmark_safety_positions_[i];
+      trajectory_file << benchmark_trajectory_elapsed_s_[i] << ',' << position.x() << ','
+                      << position.y() << ',' << position.z() << '\n';
+    }
+  }
+
+  size_t successes = 0;
+  size_t sc_failures = 0;
+  size_t trajectory_validation_failures = 0;
+  size_t accepted_corridor_violations = 0;
+  size_t accepted_trajectory_corridor_violations = 0;
+  size_t accepted_planned_obstacle_violations = 0;
+  std::unordered_map<std::string, size_t> status_counts;
+  for (const auto& row : global_path_benchmark_) {
+    if (row.sample.success) ++successes;
+    if (row.sample.status == "sc_generation_failed" ||
+        row.sample.status == "sc_seed_validation_failed")
+      ++sc_failures;
+    if (row.sample.attempted && !row.sample.trajectory_validation_success)
+      ++trajectory_validation_failures;
+    if (row.sample.success && !row.sample.sc_obstacle_validation_success)
+      ++accepted_corridor_violations;
+    if (row.sample.success && !row.sample.trajectory_validation_success)
+      ++accepted_trajectory_corridor_violations;
+    if (row.sample.success && !row.sample.planned_obstacle_validation_success)
+      ++accepted_planned_obstacle_violations;
+    ++status_counts[row.sample.status];
+  }
+
+  std::ofstream summary_file(summary_path);
+  if (summary_file.is_open()) {
+    const bool mission_success = std::isfinite(benchmark_goal_to_reached_ms_);
+    const int corridor_safe = benchmark_replan_details_
+                                  ? (successes > 0 && accepted_corridor_violations == 0)
+                                  : -1;
+    const int planned_trajectory_safe =
+        benchmark_replan_details_
+            ? (successes > 0 && accepted_trajectory_corridor_violations == 0 &&
+               accepted_planned_obstacle_violations == 0)
+            : -1;
+    summary_file << "metric,value\n"
+                 << "mission_success," << mission_success << '\n'
+                 << "safety_validation_success,-1\n"
+                 << "corridor_safe," << corridor_safe << '\n'
+                 << "planned_trajectory_safe," << planned_trajectory_safe << '\n'
+                 << "executed_trajectory_safe,-1\n"
+                 << "collision_validation_source,external_gazebo_world_ground_truth\n"
+                 << "replan_details_enabled," << benchmark_replan_details_ << '\n'
+                 << "required_center_clearance_m," << mighty_ptr_->benchmarkSafetyClearance() << '\n'
+                 << "mission_goal_to_reached_ms," << benchmark_goal_to_reached_ms_ << '\n'
+                 << "flight_start_to_reached_ms," << benchmark_flight_start_to_reached_ms_ << '\n'
+                 << "command_to_first_trajectory_ms," << benchmark_command_to_execution_ms_ << '\n'
+                 << "trajectory_samples_recorded," << benchmark_safety_positions_.size() << '\n'
+                 << "executed_path_length_m," << benchmark_executed_path_length_ << '\n'
+                 << "max_executed_velocity," << benchmark_max_executed_velocity_ << '\n'
+                 << "min_occupied_center_distance_m,nan\n"
+                 << "occupied_collision_samples,-1\n"
+                 << "clearance_violation_samples,-1\n"
+                 << "terminal_error_m," << benchmark_terminal_error_m_ << '\n'
+                 << "replan_attempts," << global_path_benchmark_.size() << '\n'
+                 << "replan_successes," << successes << '\n'
+                 << "replan_failures," << global_path_benchmark_.size() - successes << '\n'
+                 << "idle_not_ready_callbacks," << benchmark_idle_not_ready_ << '\n'
+                 << "idle_no_replan_callbacks," << benchmark_idle_no_replan_ << '\n'
+                 << "sc_primary_failures," << sc_failures << '\n'
+                 << "accepted_corridor_violation_replans," << accepted_corridor_violations << '\n'
+                 << "accepted_trajectory_corridor_violation_replans,"
+                 << accepted_trajectory_corridor_violations << '\n'
+                 << "accepted_planned_obstacle_violation_replans,"
+                 << accepted_planned_obstacle_violations << '\n'
+                 << "trajectory_validation_failures," << trajectory_validation_failures << '\n';
+    for (const auto& [status, count] : status_counts)
+      summary_file << "status_" << status << ',' << count << '\n';
+  }
+  benchmark_logged_ = true;
 }
 
 // ----------------------------------------------------------------------------

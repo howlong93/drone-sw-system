@@ -12,6 +12,7 @@ cmake_install.cmake
 
 # Benchmark, test, and runtime output
 **/benchmark_results/
+**/statistics/
 **/test_results/
 *.log
 *.bag

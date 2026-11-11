@@ -481,18 +481,76 @@ bool MIGHTY::checkIfPointFree(const Vec3f& point) {
 
 // ----------------------------------------------------------------------------
 
+double MIGHTY::nearestOccupiedCenterDistance(const Eigen::Vector3d& point) {
+  vec_Vec3f occupied;
+  hgp_manager_.getVecOccupied(occupied);
+  double min_distance = std::numeric_limits<double>::infinity();
+  for (const auto& obstacle : occupied)
+    min_distance = std::min(min_distance, (obstacle - point).norm());
+  return min_distance;
+}
+
+double MIGHTY::benchmarkSafetyClearance() const {
+  return par_.drone_radius + std::sqrt(3.0) * par_.res * 0.5;
+}
+
+void MIGHTY::evaluateRecordedTrajectorySafety(const std::vector<Eigen::Vector3d>& positions,
+                                              double& min_center_distance,
+                                              uint64_t& occupied_samples,
+                                              uint64_t& clearance_violations) {
+  if (positions.empty()) return;
+
+  // Fetch the occupied map once. The old online validator copied the whole
+  // cloud and performed a brute-force nearest-neighbour scan at 10 Hz, which
+  // could perturb the planner callback timing.
+  vec_Vec3f occupied;
+  hgp_manager_.getVecOccupied(occupied);
+  const double spacing = std::max(0.02, par_.res * 0.5);
+  const double required_clearance = benchmarkSafetyClearance();
+
+  for (size_t segment = 0; segment < positions.size(); ++segment) {
+    const Eigen::Vector3d& start = segment == 0 ? positions.front() : positions[segment - 1];
+    const Eigen::Vector3d& end = positions[segment];
+    const double length = (end - start).norm();
+    const size_t sample_count =
+        std::max<size_t>(1, static_cast<size_t>(std::ceil(length / spacing)));
+    // Adjacent segments share their endpoint; avoid double-counting it.
+    const size_t first_sample = segment == 0 ? 0 : 1;
+    for (size_t i = first_sample; i <= sample_count; ++i) {
+      const Eigen::Vector3d point =
+          start + (end - start) * (static_cast<double>(i) / sample_count);
+      double point_distance = std::numeric_limits<double>::infinity();
+      for (const auto& obstacle : occupied)
+        point_distance = std::min(point_distance, (obstacle - point).norm());
+      min_center_distance = std::min(min_center_distance, point_distance);
+      if (point_distance < required_clearance) ++clearance_violations;
+      if (hgp_manager_.checkIfPointOccupied(point)) ++occupied_samples;
+    }
+  }
+}
+
+// ----------------------------------------------------------------------------
+
 bool MIGHTY::getSafeCorridor(const vec_Vecf<3>& global_path, const state& A) {
+  (void)A;
+  MyTimer sc_total_timer(true);
+  benchmark_data_.sc_segment_count = global_path.size() > 1 ? global_path.size() - 1 : 0;
+
   // Skip decomposition entirely when static obstacle weight is zero
   if (par_.stat_weight <= 0.0) {
     safe_corridor_polytopes_whole_.clear();
     poly_out_whole_.clear();
     poly_out_safe_.clear();
     cvx_decomp_time_ = 0.0;
+    benchmark_data_.sc_primary_success = true;
+    benchmark_data_.sc_secondary_success = true;
+    benchmark_data_.sc_seed_validation_success = true;
+    benchmark_data_.sc_obstacle_validation_success = true;
+    benchmark_data_.sc_total_ms = sc_total_timer.getElapsedMicros() / 1000.0;
     return true;
   }
 
-  // Timer for computing the safe corridor
-  MyTimer cvx_decomp_timer(true);
+  MyTimer input_prepare_timer(true);
 
   // Debug
   if (par_.debug_verbose) std::cout << "Convex decomposition" << std::endl;
@@ -510,24 +568,88 @@ bool MIGHTY::getSafeCorridor(const vec_Vecf<3>& global_path, const state& A) {
     hgp_manager_.getVecUnknownOccupied(base_uo);
   else
     hgp_manager_.getVecOccupied(base_uo);
+  if (detailed_benchmark_enabled_) benchmark_obstacle_snapshot_ = base_uo;
 
   // Empty obstacle arrays (dynamic obstacles handled via heat map, not corridors)
   vec_Vecf<3> obst_pos, obst_bbox;
   // seg_end_times must have one positive entry per segment (path.size()-1)
   std::vector<double> seg_end_times(global_path.size() > 1 ? global_path.size() - 1 : 0, 1.0);
+  benchmark_data_.sc_primary_obstacle_count = base_uo.size();
+  benchmark_data_.sc_input_prepare_ms = input_prepare_timer.getElapsedMicros() / 1000.0;
 
   // Check if the convex decomposition failed
+  CorridorDecompStats primary_stats;
   if (!hgp_manager_.cvxEllipsoidDecomp(ellip, global_path, base_uo, obst_pos, obst_bbox,
                                        seg_end_times, safe_corridor_polytopes_whole_,
-                                       poly_out_whole_)) {
+                                       poly_out_whole_, &primary_stats)) {
+    benchmark_data_.sc_primary_ms = primary_stats.total_ms;
+    benchmark_data_.sc_primary_success = false;
+    benchmark_data_.sc_primary_obstacle_copy_ms = primary_stats.obstacle_copy_ms;
+    benchmark_data_.sc_primary_dilation_ms = primary_stats.dilation_ms;
+    benchmark_data_.sc_primary_constraint_ms = primary_stats.constraint_ms;
+    benchmark_data_.sc_primary_hyperplanes = primary_stats.total_hyperplanes;
+    benchmark_data_.sc_primary_segment_ms = primary_stats.segment_ms;
+    benchmark_data_.sc_primary_failure_reason = primary_stats.failure_reason;
     std::cout << bold << red << "Convex decomposition failed" << reset << std::endl;
     poly_out_whole_.clear();
     poly_out_safe_.clear();
+    benchmark_data_.sc_total_ms = sc_total_timer.getElapsedMicros() / 1000.0;
+    cvx_decomp_time_ = benchmark_data_.sc_total_ms;
     return false;
+  }
+  benchmark_data_.sc_primary_ms = primary_stats.total_ms;
+  benchmark_data_.sc_primary_success = true;
+  benchmark_data_.sc_primary_obstacle_copy_ms = primary_stats.obstacle_copy_ms;
+  benchmark_data_.sc_primary_dilation_ms = primary_stats.dilation_ms;
+  benchmark_data_.sc_primary_constraint_ms = primary_stats.constraint_ms;
+  benchmark_data_.sc_primary_hyperplanes = primary_stats.total_hyperplanes;
+  benchmark_data_.sc_primary_segment_ms = primary_stats.segment_ms;
+
+  if (detailed_benchmark_enabled_) {
+    // Optional independent corridor audit. This is O(corridors * obstacles),
+    // so it is excluded from the default mission benchmark hot path.
+    MyTimer validation_timer(true);
+    constexpr double validation_tol = 1e-7;
+    bool seeds_valid = safe_corridor_polytopes_whole_.size() == benchmark_data_.sc_segment_count;
+    size_t obstacle_violations = 0;
+    double max_obstacle_penetration = 0.0;
+    auto is_inside = [&](const LinearConstraint3D& cs, const Eigen::Vector3d& p) {
+      if (cs.A_.rows() == 0 || cs.b_.size() != cs.A_.rows()) return false;
+      return ((cs.A_ * p - cs.b_).array() <= validation_tol).all();
+    };
+    for (size_t i = 0;
+         i < safe_corridor_polytopes_whole_.size() && i + 1 < global_path.size(); ++i) {
+      const auto& cs = safe_corridor_polytopes_whole_[i];
+      if (!is_inside(cs, global_path[i]) || !is_inside(cs, global_path[i + 1]))
+        seeds_valid = false;
+      for (const auto& obstacle : base_uo) {
+        if (is_inside(cs, obstacle)) {
+          ++obstacle_violations;
+          max_obstacle_penetration = std::max(
+              max_obstacle_penetration,
+              (cs.b_ - cs.A_ * obstacle.cast<double>()).minCoeff());
+        }
+      }
+    }
+    benchmark_data_.sc_seed_validation_success = seeds_valid;
+    benchmark_data_.sc_obstacle_validation_success = obstacle_violations == 0;
+    benchmark_data_.sc_obstacle_violations = obstacle_violations;
+    benchmark_data_.sc_max_obstacle_penetration = max_obstacle_penetration;
+    benchmark_data_.sc_validation_ms = validation_timer.getElapsedMicros() / 1000.0;
+    if (!seeds_valid) {
+      benchmark_data_.status = "sc_seed_validation_failed";
+      benchmark_data_.sc_total_ms = sc_total_timer.getElapsedMicros() / 1000.0;
+      cvx_decomp_time_ = benchmark_data_.sc_total_ms;
+      return false;
+    }
+  } else {
+    benchmark_data_.sc_seed_validation_success = true;
+    benchmark_data_.sc_obstacle_validation_success = true;
   }
 
   // Generate safe corridor (treat unknown regions as occupied)
   {
+    MyTimer secondary_timer(true);
     EllipsoidDecomp3D ellip_safe;
     ellip_safe.set_local_bbox(
         Vec3f(par_.local_box_size[0], par_.local_box_size[1], par_.local_box_size[2]));
@@ -536,17 +658,29 @@ bool MIGHTY::getSafeCorridor(const vec_Vecf<3>& global_path, const state& A) {
 
     vec_Vec3f base_uo_safe;
     hgp_manager_.getVecUnknownOccupied(base_uo_safe);
+    benchmark_data_.sc_secondary_obstacle_count = base_uo_safe.size();
 
     std::vector<LinearConstraint3D> safe_constraints;
+    CorridorDecompStats secondary_stats;
     if (!hgp_manager_.cvxEllipsoidDecomp(ellip_safe, global_path, base_uo_safe, obst_pos, obst_bbox,
-                                         seg_end_times, safe_constraints, poly_out_safe_)) {
+                                         seg_end_times, safe_constraints, poly_out_safe_,
+                                         &secondary_stats)) {
       // Fallback: use whole corridor if safe decomposition fails
       poly_out_safe_ = poly_out_whole_;
     }
+    benchmark_data_.sc_secondary_ms = secondary_timer.getElapsedMicros() / 1000.0;
+    benchmark_data_.sc_secondary_success = secondary_stats.success;
+    benchmark_data_.sc_secondary_obstacle_copy_ms = secondary_stats.obstacle_copy_ms;
+    benchmark_data_.sc_secondary_dilation_ms = secondary_stats.dilation_ms;
+    benchmark_data_.sc_secondary_constraint_ms = secondary_stats.constraint_ms;
+    benchmark_data_.sc_secondary_hyperplanes = secondary_stats.total_hyperplanes;
+    benchmark_data_.sc_secondary_segment_ms = secondary_stats.segment_ms;
+    benchmark_data_.sc_secondary_failure_reason = secondary_stats.failure_reason;
   }
 
   // Get computation time [ms]
-  cvx_decomp_time_ = cvx_decomp_timer.getElapsedMicros() / 1000.0;
+  benchmark_data_.sc_total_ms = sc_total_timer.getElapsedMicros() / 1000.0;
+  cvx_decomp_time_ = benchmark_data_.sc_total_ms;
 
   return true;
 }
@@ -626,6 +760,7 @@ void MIGHTY::getFreeGlobalPath(vec_Vecf<3>& free_global_path) {
 // ----------------------------------------------------------------------------
 
 void MIGHTY::resetData() {
+  benchmark_data_ = ReplanBenchmarkData{};
   final_g_ = 0.0;
   global_planning_time_ = 0.0;
   hgp_static_jps_time_ = 0.0;
@@ -707,6 +842,7 @@ void MIGHTY::retrieveCPs(std::vector<Eigen::Matrix<double, 3, 6>>& cps) { cps = 
  * @param double current_time: Current timestamp.
  */
 std::tuple<bool, bool> MIGHTY::replan(double last_replaning_computation_time, double current_time) {
+  MyTimer timer_total(true);
   /* -------------------- Housekeeping -------------------- */
 
   MyTimer timer_housekeeping(true);
@@ -714,14 +850,29 @@ std::tuple<bool, bool> MIGHTY::replan(double last_replaning_computation_time, do
   // Reset Data
   resetData();
 
+  auto finish = [&](bool success, bool global_path_success,
+                    const std::string& status = std::string()) {
+    benchmark_data_.success = success;
+    benchmark_data_.global_path_success = global_path_success;
+    if (!status.empty()) benchmark_data_.status = status;
+    benchmark_data_.total_ms = timer_total.getElapsedMicros() / 1000.0;
+    return std::make_tuple(success, global_path_success);
+  };
+
   // Check if we need to replan
-  if (!checkReadyToReplan()) return std::make_tuple(false, false);
+  if (!checkReadyToReplan()) return finish(false, false, "idle_not_ready");
 
   // Get states we need
   state local_state, local_G_term, last_plan_state;
   getState(local_state);
   getGterm(local_G_term);
   getLastPlanState(last_plan_state);
+  benchmark_data_.current_x = local_state.pos.x();
+  benchmark_data_.current_y = local_state.pos.y();
+  benchmark_data_.current_z = local_state.pos.z();
+  benchmark_data_.terminal_goal_x = local_G_term.pos.x();
+  benchmark_data_.terminal_goal_y = local_G_term.pos.y();
+  benchmark_data_.terminal_goal_z = local_G_term.pos.z();
 
   // Re-run goal sanitization each replan: as the planning window slides
   // forward and previously-unknown cells become observed, an occupied goal
@@ -740,7 +891,11 @@ std::tuple<bool, bool> MIGHTY::replan(double last_replaning_computation_time, do
   }
 
   // Check if we need to replan based on the distance to the terminal goal
-  if (!needReplan(local_state, local_G_term, last_plan_state)) return std::make_tuple(false, false);
+  if (!needReplan(local_state, local_G_term, last_plan_state))
+    return finish(false, false, "idle_no_replan");
+
+  benchmark_data_.attempted = true;
+  benchmark_data_.housekeeping_ms = timer_housekeeping.getElapsedMicros() / 1000.0;
 
   if (par_.debug_verbose)
     printf("[TIMING] Housekeeping: %.2f ms\n", timer_housekeeping.getElapsedMicros() / 1000.0);
@@ -750,11 +905,20 @@ std::tuple<bool, bool> MIGHTY::replan(double last_replaning_computation_time, do
   MyTimer timer_global(true);
   vec_Vecf<3> global_path;
   if (!generateGlobalPath(global_path, current_time, last_replaning_computation_time)) {
+    benchmark_data_.global_stage_ms = timer_global.getElapsedMicros() / 1000.0;
     if (par_.debug_verbose)
       printf("[TIMING] Global Planning (FAILED): %.2f ms\n",
              timer_global.getElapsedMicros() / 1000.0);
-    return std::make_tuple(false, false);
+    return finish(false, false, "global_planning_failed");
   }
+  benchmark_data_.global_stage_ms = timer_global.getElapsedMicros() / 1000.0;
+  benchmark_data_.global_path_success = true;
+  benchmark_data_.global_path_points = global_path.size();
+  state benchmark_local_goal;
+  getG(benchmark_local_goal);
+  benchmark_data_.local_goal_x = benchmark_local_goal.pos.x();
+  benchmark_data_.local_goal_y = benchmark_local_goal.pos.y();
+  benchmark_data_.local_goal_z = benchmark_local_goal.pos.z();
   if (par_.debug_verbose)
     printf("[TIMING] Global Planning: %.2f ms\n", timer_global.getElapsedMicros() / 1000.0);
 
@@ -762,11 +926,13 @@ std::tuple<bool, bool> MIGHTY::replan(double last_replaning_computation_time, do
 
   MyTimer timer_local(true);
   if (!planLocalTrajectory(global_path)) {
+    benchmark_data_.local_stage_ms = timer_local.getElapsedMicros() / 1000.0;
     if (par_.debug_verbose)
       printf("[TIMING] Local Traj Opt (FAILED): %.2f ms\n",
              timer_local.getElapsedMicros() / 1000.0);
-    return std::make_tuple(false, true);
+    return finish(false, true);
   }
+  benchmark_data_.local_stage_ms = timer_local.getElapsedMicros() / 1000.0;
 
   /* -------------------- Append to Plan -------------------- */
 
@@ -777,11 +943,13 @@ std::tuple<bool, bool> MIGHTY::replan(double last_replaning_computation_time, do
   } else {
     MyTimer timer_append(true);
     if (!appendToPlan()) {
+      benchmark_data_.append_plan_ms = timer_append.getElapsedMicros() / 1000.0;
       if (par_.debug_verbose)
         std::cout << "Append to Plan: " << timer_append.getElapsedMicros() / 1000.0 << " ms"
                   << std::endl;
-      return std::make_tuple(false, true);
+      return finish(false, true, "append_plan_failed");
     }
+    benchmark_data_.append_plan_ms = timer_append.getElapsedMicros() / 1000.0;
     if (par_.debug_verbose)
       std::cout << "Append to Plan: " << timer_append.getElapsedMicros() / 1000.0 << " ms"
                 << std::endl;
@@ -796,11 +964,12 @@ std::tuple<bool, bool> MIGHTY::replan(double last_replaning_computation_time, do
 
   // Reset the replanning failure count
   replanning_failure_count_ = 0;
+  benchmark_data_.final_housekeeping_ms = timer_final.getElapsedMicros() / 1000.0;
   if (par_.debug_verbose)
     std::cout << "Final Housekeeping: " << timer_final.getElapsedMicros() / 1000.0 << " ms"
               << std::endl;
 
-  return std::make_tuple(true, true);
+  return finish(true, true, "success");
 }
 
 // ----------------------------------------------------------------------------
@@ -1085,6 +1254,7 @@ bool MIGHTY::planLocalTrajectory(vec_Vecf<3>& global_path) {
   if (global_path.empty() || global_path.size() < 2) {
     // std::cout << bold << red << "Global path's size is < 2 after trimming" << reset << std::endl;
     replanning_failure_count_++;
+    benchmark_data_.status = "local_path_too_short";
     return false;
   }
 
@@ -1109,6 +1279,8 @@ bool MIGHTY::planLocalTrajectory(vec_Vecf<3>& global_path) {
     if (par_.debug_verbose)
       printf("[TIMING]   Safe corridor (FAILED): %.2f ms\n", timer_sfc.getElapsedMicros() / 1000.0);
     replanning_failure_count_++;
+    if (benchmark_data_.status != "sc_seed_validation_failed")
+      benchmark_data_.status = "sc_generation_failed";
     return false;
   }
   if (par_.debug_verbose)
@@ -1144,6 +1316,70 @@ bool MIGHTY::planLocalTrajectory(vec_Vecf<3>& global_path) {
     whole_traj_solver_ptr_->getPieceWisePol(pwp_to_share_);
     whole_traj_solver_ptr_->getControlPoints(cps_);  // Bezier control points
 
+    if (detailed_benchmark_enabled_) {
+    MyTimer trajectory_validation_timer(true);
+    benchmark_data_.trajectory_validation_success =
+        pwp_to_share_.times.size() >= 2 &&
+        pwp_to_share_.coeff_x.size() == safe_corridor_polytopes_whole_.size();
+    benchmark_data_.planned_obstacle_validation_success = true;
+    benchmark_data_.trajectory_min_corridor_margin = std::numeric_limits<double>::infinity();
+    Eigen::Vector3d previous_sample = Eigen::Vector3d::Zero();
+    bool have_previous_sample = false;
+    constexpr int samples_per_segment = 11;
+    constexpr double trajectory_validation_tol = 1e-6;
+    const size_t timed_segments =
+        pwp_to_share_.times.size() > 1 ? pwp_to_share_.times.size() - 1 : 0;
+    const size_t trajectory_segments =
+        std::min({pwp_to_share_.coeff_x.size(), safe_corridor_polytopes_whole_.size(),
+                  timed_segments});
+    for (size_t i = 0; i < trajectory_segments; ++i) {
+      const double t0 = pwp_to_share_.times[i];
+      const double t1 = pwp_to_share_.times[i + 1];
+      const auto& cs = safe_corridor_polytopes_whole_[i];
+      for (int sample_index = 0; sample_index < samples_per_segment; ++sample_index) {
+        const double alpha = static_cast<double>(sample_index) / (samples_per_segment - 1);
+        const double t = t0 + alpha * (t1 - t0);
+        const Eigen::Vector3d position = pwp_to_share_.eval(t);
+        if (have_previous_sample)
+          benchmark_data_.planned_trajectory_length += (position - previous_sample).norm();
+        previous_sample = position;
+        have_previous_sample = true;
+        benchmark_data_.planned_max_velocity =
+            std::max(benchmark_data_.planned_max_velocity, pwp_to_share_.velocity(t).norm());
+        benchmark_data_.planned_max_acceleration =
+            std::max(benchmark_data_.planned_max_acceleration, pwp_to_share_.acceleration(t).norm());
+        benchmark_data_.planned_max_jerk =
+            std::max(benchmark_data_.planned_max_jerk, pwp_to_share_.jerk(t).norm());
+        benchmark_data_.trajectory_validation_samples++;
+        double occupied_distance = std::numeric_limits<double>::infinity();
+        for (const auto& obstacle : benchmark_obstacle_snapshot_)
+          occupied_distance = std::min(occupied_distance, (obstacle - position).norm());
+        benchmark_data_.planned_min_occupied_center_distance = std::min(
+            benchmark_data_.planned_min_occupied_center_distance, occupied_distance);
+        if (occupied_distance < benchmarkSafetyClearance()) {
+          benchmark_data_.planned_obstacle_validation_success = false;
+          ++benchmark_data_.planned_obstacle_violations;
+        }
+        if (cs.A_.rows() == 0 || cs.b_.size() != cs.A_.rows()) {
+          benchmark_data_.trajectory_validation_success = false;
+          continue;
+        }
+        const double margin = (cs.b_ - cs.A_ * position).minCoeff();
+        benchmark_data_.trajectory_min_corridor_margin =
+            std::min(benchmark_data_.trajectory_min_corridor_margin, margin);
+        if (margin < -trajectory_validation_tol)
+          benchmark_data_.trajectory_validation_success = false;
+      }
+    }
+    if (pwp_to_share_.times.size() >= 2)
+      benchmark_data_.planned_trajectory_duration =
+          pwp_to_share_.times.back() - pwp_to_share_.times.front();
+    benchmark_data_.trajectory_validation_ms =
+        trajectory_validation_timer.getElapsedMicros() / 1000.0;
+    }
+    // Baseline audit mode: record corridor-containment and direct obstacle
+    // violations without changing the original MIGHTY execution flow.
+
     // Get goal setpoints for suboptimal solutions for visualization
     if (par_.use_multiple_initial_guesses) {
       if (par_.debug_verbose)
@@ -1164,6 +1400,7 @@ bool MIGHTY::planLocalTrajectory(vec_Vecf<3>& global_path) {
     }
   } else {
     replanning_failure_count_++;
+    benchmark_data_.status = "trajectory_optimization_failed";
     return false;
   }
 
@@ -1248,9 +1485,9 @@ bool MIGHTY::generateLocalTrajectory(const state& local_A, double A_time, vec_Ve
 
   // Solve the optimiation problem.
   if (!par_.use_multiple_initial_guesses || size_of_list_z0 == 1) {
-    auto t_start = std::chrono::high_resolution_clock::now();
+    auto t_start = std::chrono::steady_clock::now();
     status = whole_traj_solver_ptr_->optimize(list_z0[0], zopt_, fopt_, lbfgs_params_);
-    auto t_end = std::chrono::high_resolution_clock::now();
+    auto t_end = std::chrono::steady_clock::now();
     local_traj_computation_time =
         std::chrono::duration<double, std::milli>(t_end - t_start).count();
     // std::cout << lbfgs::lbfgs_strerror(status) << std::endl;
@@ -1266,7 +1503,7 @@ bool MIGHTY::generateLocalTrajectory(const state& local_A, double A_time, vec_Ve
     std::vector<std::future<void>> futures;
     futures.reserve(size_of_list_z0);
 
-    auto t_start = std::chrono::high_resolution_clock::now();
+    auto t_start = std::chrono::steady_clock::now();
     for (size_t i = 0; i < size_of_list_z0; ++i) {
       futures.emplace_back(std::async(std::launch::async, [&, i]() {
         // make a fresh solver for thread-safety
@@ -1295,7 +1532,7 @@ bool MIGHTY::generateLocalTrajectory(const state& local_A, double A_time, vec_Ve
     // wait for all to finish
     for (auto& f : futures) f.get();
 
-    auto t_end = std::chrono::high_resolution_clock::now();
+    auto t_end = std::chrono::steady_clock::now();
     local_traj_computation_time =
         std::chrono::duration<double, std::milli>(t_end - t_start).count();
 

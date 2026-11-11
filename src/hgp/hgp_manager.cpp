@@ -436,15 +436,31 @@ bool HGPManager::cvxEllipsoidDecomp(EllipsoidDecomp3D& ellip, const vec_Vecf<3>&
                                     const vec_Vecf<3>& obst_bbox,
                                     const std::vector<double>& seg_end_times,
                                     std::vector<LinearConstraint3D>& l_constraints,
-                                    vec_E<Polyhedron<3>>& poly_out) {
-  if (path.size() < 2) return false;
+                                    vec_E<Polyhedron<3>>& poly_out,
+                                    CorridorDecompStats* stats) {
+  MyTimer total_timer(true);
+  if (stats) {
+    *stats = CorridorDecompStats{};
+    stats->input_obstacle_count = base_uo.size();
+  }
+  auto finish = [&](bool success, const std::string& reason = std::string()) {
+    if (stats) {
+      stats->success = success;
+      stats->failure_reason = reason;
+      stats->total_ms = total_timer.getElapsedMicros() / 1000.0;
+    }
+    return success;
+  };
+
+  if (path.size() < 2) return finish(false, "path_too_short");
 
   const size_t num_seg = path.size() - 1;
+  if (stats) stats->segment_count = num_seg;
 
   if (seg_end_times.size() != num_seg) {
     std::cout << "cvxEllipsoidDecomp: seg_end_times size mismatch. Expected " << num_seg << ", got "
               << seg_end_times.size() << std::endl;
-    return false;
+    return finish(false, "segment_time_size_mismatch");
   }
 
   // Configure ellipsoid-decomp settings on the per-worker instance
@@ -524,14 +540,16 @@ bool HGPManager::cvxEllipsoidDecomp(EllipsoidDecomp3D& ellip, const vec_Vecf<3>&
   seg_path.reserve(2);
 
   for (size_t i = 0; i < num_seg; ++i) {
+    MyTimer segment_timer(true);
     const double traj_max_time = seg_end_times[i];
     if (!(traj_max_time > 0.0)) {
       std::cout << "cvxEllipsoidDecomp: non-positive seg_end_times[" << i << "]=" << traj_max_time
                 << std::endl;
-      return false;
+      return finish(false, "non_positive_segment_time");
     }
 
     // Build per-segment obstacle set
+    MyTimer obstacle_copy_timer(true);
     vec_Vec3f vec_uo;
     if (is_ground_robot_ && !base_uo_2d.empty()) {
       vec_uo = base_uo_2d;
@@ -539,7 +557,9 @@ bool HGPManager::cvxEllipsoidDecomp(EllipsoidDecomp3D& ellip, const vec_Vecf<3>&
       vec_uo = base_uo;  // copy snapshot
       obstacle_to_vec(vec_uo, obst_pos, obst_bbox, traj_max_time);
     }
+    if (stats) stats->obstacle_copy_ms += obstacle_copy_timer.getElapsedMicros() / 1000.0;
 
+    MyTimer dilation_timer(true);
     ellip.set_obs(vec_uo);
 
     seg_path.clear();
@@ -556,18 +576,25 @@ bool HGPManager::cvxEllipsoidDecomp(EllipsoidDecomp3D& ellip, const vec_Vecf<3>&
     ellip.dilate(seg_path, ok);
     if (!ok) {
       std::cout << "cvxEllipsoidDecomp: dilate failed at segment " << i << std::endl;
-      return false;
+      if (stats) {
+        stats->dilation_ms += dilation_timer.getElapsedMicros() / 1000.0;
+        stats->segment_ms.push_back(segment_timer.getElapsedMicros() / 1000.0);
+      }
+      return finish(false, "dilate_failed");
     }
 
     if (use_shrinked_box_) ellip.shrink_polyhedrons(shrinked_box_size_);
 
     auto polys = ellip.get_polyhedrons();
+    if (stats) stats->dilation_ms += dilation_timer.getElapsedMicros() / 1000.0;
     if (polys.size() != 1) {
       std::cout << "cvxEllipsoidDecomp: expected 1 polyhedron for segment " << i << ", got "
                 << polys.size() << std::endl;
-      return false;
+      if (stats) stats->segment_ms.push_back(segment_timer.getElapsedMicros() / 1000.0);
+      return finish(false, "unexpected_polyhedron_count");
     }
 
+    MyTimer constraint_timer(true);
     poly_out[i] = polys[0];
 
     const auto pt_inside = (path[i] + path[i + 1]) / 2.0;
@@ -575,13 +602,23 @@ bool HGPManager::cvxEllipsoidDecomp(EllipsoidDecomp3D& ellip, const vec_Vecf<3>&
 
     if (cs.A_.hasNaN() || cs.b_.hasNaN()) {
       std::cout << "cvxEllipsoidDecomp: A_ or b_ has NaN at segment " << i << std::endl;
-      return false;
+      if (stats) {
+        stats->constraint_ms += constraint_timer.getElapsedMicros() / 1000.0;
+        stats->segment_ms.push_back(segment_timer.getElapsedMicros() / 1000.0);
+      }
+      return finish(false, "nan_constraint");
     }
 
     l_constraints[i] = cs;
+    if (stats) {
+      stats->constraint_ms += constraint_timer.getElapsedMicros() / 1000.0;
+      stats->total_hyperplanes += static_cast<size_t>(cs.A_.rows());
+      stats->completed_segment_count++;
+      stats->segment_ms.push_back(segment_timer.getElapsedMicros() / 1000.0);
+    }
   }
 
-  return true;
+  return finish(true);
 }
 
 // ----------------------------------------------------------------------------

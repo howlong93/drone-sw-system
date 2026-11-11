@@ -27,6 +27,7 @@
 
 // Other includes
 #include <mutex>
+#include <string>
 
 #include <Eigen/Dense>
 
@@ -39,6 +40,21 @@ using namespace std::chrono_literals;
 using std::placeholders::_1;
 using std::placeholders::_2;
 using std::placeholders::_3;
+
+/** Detailed timing and geometry statistics for one corridor decomposition call. */
+struct CorridorDecompStats {
+  bool success = false;
+  size_t input_obstacle_count = 0;
+  size_t segment_count = 0;
+  size_t completed_segment_count = 0;
+  size_t total_hyperplanes = 0;
+  double total_ms = 0.0;
+  double obstacle_copy_ms = 0.0;
+  double dilation_ms = 0.0;
+  double constraint_ms = 0.0;
+  std::vector<double> segment_ms;
+  std::string failure_reason;
+};
 
 /** @brief Manages the voxel map, global planner, and convex decomposition for HGP.
  *
@@ -191,7 +207,7 @@ class HGPManager {
       const vec_Vec3f& base_uo,  // snapshot of (unknown+occupied) or (occupied-only)
       const vec_Vecf<3>& obst_pos, const vec_Vecf<3>& obst_bbox,
       const std::vector<double>& seg_end_times, std::vector<LinearConstraint3D>& l_constraints,
-      vec_E<Polyhedron<3>>& poly_out);
+      vec_E<Polyhedron<3>>& poly_out, CorridorDecompStats* stats = nullptr);
 
   /** @brief Compute time-layered convex decomposition for temporal safety corridors.
    *  @param ellip Per-worker ellipsoid decomposition utility.

@@ -11,6 +11,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <limits>
+#include <string>
 #include <vector>
 
 #include <Eigen/StdVector>
@@ -50,6 +52,66 @@ using ConstraintBlocks =
     std::vector<AlignedPlaneBlockVec, Eigen::aligned_allocator<AlignedPlaneBlockVec>>;
 
 enum DroneStatus { YAWING = 0, TRAVELING = 1, GOAL_SEEN = 2, GOAL_REACHED = 3 };
+
+/** One callback's benchmark snapshot. Idle callbacks are identified by attempted=false. */
+struct ReplanBenchmarkData {
+  bool attempted = false;
+  bool success = false;
+  bool global_path_success = false;
+  std::string status = "idle_not_ready";
+
+  double total_ms = 0.0;
+  double housekeeping_ms = 0.0;
+  double global_stage_ms = 0.0;
+  double local_stage_ms = 0.0;
+  double append_plan_ms = 0.0;
+  double final_housekeeping_ms = 0.0;
+
+  double current_x = 0.0, current_y = 0.0, current_z = 0.0;
+  double local_goal_x = 0.0, local_goal_y = 0.0, local_goal_z = 0.0;
+  double terminal_goal_x = 0.0, terminal_goal_y = 0.0, terminal_goal_z = 0.0;
+  size_t global_path_points = 0;
+
+  double sc_total_ms = 0.0;
+  double sc_input_prepare_ms = 0.0;
+  double sc_primary_ms = 0.0;
+  double sc_secondary_ms = 0.0;
+  double sc_validation_ms = 0.0;
+  bool sc_primary_success = false;
+  bool sc_secondary_success = false;
+  bool sc_seed_validation_success = false;
+  bool sc_obstacle_validation_success = false;
+  size_t sc_segment_count = 0;
+  size_t sc_primary_obstacle_count = 0;
+  size_t sc_secondary_obstacle_count = 0;
+  size_t sc_primary_hyperplanes = 0;
+  size_t sc_secondary_hyperplanes = 0;
+  size_t sc_obstacle_violations = 0;
+  double sc_max_obstacle_penetration = 0.0;
+  double sc_primary_obstacle_copy_ms = 0.0;
+  double sc_primary_dilation_ms = 0.0;
+  double sc_primary_constraint_ms = 0.0;
+  double sc_secondary_obstacle_copy_ms = 0.0;
+  double sc_secondary_dilation_ms = 0.0;
+  double sc_secondary_constraint_ms = 0.0;
+  std::vector<double> sc_primary_segment_ms;
+  std::vector<double> sc_secondary_segment_ms;
+  std::string sc_primary_failure_reason;
+  std::string sc_secondary_failure_reason;
+
+  bool trajectory_validation_success = false;
+  bool planned_obstacle_validation_success = false;
+  size_t trajectory_validation_samples = 0;
+  size_t planned_obstacle_violations = 0;
+  double trajectory_validation_ms = 0.0;
+  double trajectory_min_corridor_margin = std::numeric_limits<double>::quiet_NaN();
+  double planned_min_occupied_center_distance = std::numeric_limits<double>::infinity();
+  double planned_trajectory_length = 0.0;
+  double planned_trajectory_duration = 0.0;
+  double planned_max_velocity = 0.0;
+  double planned_max_acceleration = 0.0;
+  double planned_max_jerk = 0.0;
+};
 
 /** @brief Core trajectory planner using Hermite spline-based optimization.
  *
@@ -337,6 +399,23 @@ class MIGHTY {
                     double& safety_check_time, double& safe_paths_time, double& yaw_sequence_time,
                     double& yaw_fitting_time);
 
+  ReplanBenchmarkData getReplanBenchmarkData() const { return benchmark_data_; }
+
+  /** Enable expensive per-replan audit metrics. Mission/path logging does not require this. */
+  void setDetailedBenchmarkEnabled(bool enabled) { detailed_benchmark_enabled_ = enabled; }
+
+  /** Distance to the nearest occupied voxel center; infinity if no occupied points exist. */
+  double nearestOccupiedCenterDistance(const Eigen::Vector3d& point);
+
+  /** Validate a recorded flight path against one final occupied-map snapshot. */
+  void evaluateRecordedTrajectorySafety(const std::vector<Eigen::Vector3d>& positions,
+                                        double& min_center_distance,
+                                        uint64_t& occupied_samples,
+                                        uint64_t& clearance_violations);
+
+  /** Required center-to-center clearance: vehicle radius plus occupied voxel half diagonal. */
+  double benchmarkSafetyClearance() const;
+
   /** @brief Retrieve polytopes from the last safe corridor computation.
    *  @param poly_out_whole Output whole-trajectory polytopes.
    *  @param poly_out_safe Output safe-path polytopes.
@@ -498,6 +577,9 @@ class MIGHTY {
   double safety_check_time_ = 0.0;
   double yaw_sequence_time_ = 0.0;
   double yaw_fitting_time_ = 0.0;
+  ReplanBenchmarkData benchmark_data_;
+  vec_Vec3f benchmark_obstacle_snapshot_;
+  bool detailed_benchmark_enabled_ = false;
   vec_E<Polyhedron<3>> poly_out_whole_;
   vec_E<Polyhedron<3>> poly_out_safe_;
   std::vector<state> goal_setpoints_;

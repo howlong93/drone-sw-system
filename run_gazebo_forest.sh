@@ -2,11 +2,22 @@
 
 set -Eeuo pipefail
 
+REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+# User-facing default: one command launches a reproducible 20-run headless
+# benchmark. The batch runner invokes this script with explicit `0 0`, so the
+# branch cannot recurse. Set SINGLE_RUN=1 to retain the old no-argument GUI run.
+if (( $# == 0 )) && [[ "${SINGLE_RUN:-0}" != "1" ]]; then
+  export BATCH_ID="${BATCH_ID:-mighty_baseline_$(date +%Y%m%d_%H%M%S)}"
+  exec "${REPO_DIR}/run_benchmark_batch_drone.sh" "${BENCHMARK_COUNT:-1}"
+fi
+
 usage() {
   cat <<'EOF'
 Usage: ./run_gazebo_forest.sh [RVIZ_GUI] [GAZEBO_GUI]
 
-Run the README "Single UAV through a Gazebo forest" scenario in Docker.
+With no arguments, run 20 headless benchmark trials and archive all results.
+With GUI arguments, run one README "Single UAV through a Gazebo forest" trial.
 
   RVIZ_GUI=1    Show RViz (default: 1).
   RVIZ_GUI=0    Do not start RViz.
@@ -14,7 +25,8 @@ Run the README "Single UAV through a Gazebo forest" scenario in Docker.
   GAZEBO_GUI=0  Run Gazebo server-only.
 
 Examples:
-  ./run_gazebo_forest.sh        # RViz on, Gazebo GUI off
+  ./run_gazebo_forest.sh        # 20-run headless benchmark
+  SINGLE_RUN=1 ./run_gazebo_forest.sh  # one run: RViz on, Gazebo GUI off
   ./run_gazebo_forest.sh 1 1    # RViz and Gazebo GUI on
   ./run_gazebo_forest.sh 0 1    # Gazebo GUI only
   ./run_gazebo_forest.sh 0 0    # Fully headless
@@ -25,7 +37,15 @@ Optional environment variables:
   GOAL_X/Y/Z     Goal components (default selected by run_sim.py: 305 0 3)
   GPU            Set to 0 to omit Docker GPU access (default: 1)
   DEV            Set to 1 to mount the current source/config/launch/rviz (default: 0)
+  AUTO_EXIT_DELAY Seconds to wait after reaching the goal before exiting
+                  (default: 3; 0 exits immediately; -1 disables auto-exit)
+  BENCHMARK       Set to 1 to save planner timing data (default: 0)
+  BENCHMARK_RUN_ID Identifier used for the output folder and CSV filename
+  BENCHMARK_RUN_DIR Host output directory; defaults to statistics/<run-id>
+  CONTAINER_NAME  Docker container name (default: mighty-gazebo-forest)
   DRY_RUN        Set to 1 to print the Docker command without running it
+  BENCHMARK_COUNT Number of trials for no-argument batch mode (default: 20)
+  SINGLE_RUN      Set to 1 to make a no-argument invocation run one GUI trial
 EOF
 }
 
@@ -57,11 +77,13 @@ else
   X11_ENABLED=0
 fi
 
-REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 IMAGE="${MIGHTY_IMAGE:-mighty:latest}"
 WORLD="${ENV:-hard_forest}"
 GPU="${GPU:-1}"
 DEV="${DEV:-0}"
+AUTO_EXIT_DELAY="${AUTO_EXIT_DELAY:-3}"
+BENCHMARK="${BENCHMARK:-0}"
+CONTAINER_NAME="${CONTAINER_NAME:-mighty-gazebo-forest}"
 
 if [[ "${GPU}" != "0" && "${GPU}" != "1" ]]; then
   echo "[ERROR] GPU must be 0 or 1 (received: ${GPU})." >&2
@@ -70,6 +92,22 @@ fi
 
 if [[ "${DEV}" != "0" && "${DEV}" != "1" ]]; then
   echo "[ERROR] DEV must be 0 or 1 (received: ${DEV})." >&2
+  exit 2
+fi
+
+if [[ "${BENCHMARK}" != "0" && "${BENCHMARK}" != "1" ]]; then
+  echo "[ERROR] BENCHMARK must be 0 or 1 (received: ${BENCHMARK})." >&2
+  exit 2
+fi
+
+if [[ ! "${CONTAINER_NAME}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+  echo "[ERROR] CONTAINER_NAME contains unsupported characters: ${CONTAINER_NAME}" >&2
+  exit 2
+fi
+
+if [[ ! "${AUTO_EXIT_DELAY}" =~ ^-?[0-9]+([.][0-9]+)?$ ]] ||
+   ! awk -v value="${AUTO_EXIT_DELAY}" 'BEGIN { exit !(value >= -1 && (value == -1 || value >= 0)) }'; then
+  echo "[ERROR] AUTO_EXIT_DELAY must be -1 or a non-negative number (received: ${AUTO_EXIT_DELAY})." >&2
   exit 2
 fi
 
@@ -84,10 +122,33 @@ if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
   exit 1
 fi
 
+BENCHMARK_RUN_ID="${BENCHMARK_RUN_ID:-}"
+BENCHMARK_RUN_DIR="${BENCHMARK_RUN_DIR:-}"
+BENCHMARK_HOST_FILE=""
+BENCHMARK_CONTAINER_FILE=""
+BENCHMARK_TRAJECTORY_FILE=""
+BENCHMARK_SUMMARY_FILE=""
+BENCHMARK_GROUND_TRUTH_FILE=""
+if [[ "${BENCHMARK}" == "1" ]]; then
+  BENCHMARK_RUN_ID="${BENCHMARK_RUN_ID:-forest_$(date +%Y%m%d_%H%M%S)_run_001}"
+  if [[ ! "${BENCHMARK_RUN_ID}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+    echo "[ERROR] BENCHMARK_RUN_ID contains unsupported characters: ${BENCHMARK_RUN_ID}" >&2
+    exit 2
+  fi
+  BENCHMARK_RUN_DIR="${BENCHMARK_RUN_DIR:-${REPO_DIR}/statistics/${BENCHMARK_RUN_ID}}"
+  mkdir -p "${BENCHMARK_RUN_DIR}"
+  BENCHMARK_RUN_DIR="$(cd -- "${BENCHMARK_RUN_DIR}" && pwd)"
+  BENCHMARK_HOST_FILE="${BENCHMARK_RUN_DIR}/${BENCHMARK_RUN_ID}_planner.csv"
+  BENCHMARK_CONTAINER_FILE="/mighty_statistics/${BENCHMARK_RUN_ID}_planner.csv"
+  BENCHMARK_TRAJECTORY_FILE="${BENCHMARK_RUN_DIR}/${BENCHMARK_RUN_ID}_planner_trajectory.csv"
+  BENCHMARK_SUMMARY_FILE="${BENCHMARK_RUN_DIR}/${BENCHMARK_RUN_ID}_planner_summary.csv"
+  BENCHMARK_GROUND_TRUTH_FILE="${BENCHMARK_RUN_DIR}/${BENCHMARK_RUN_ID}_ground_truth_summary.csv"
+fi
+
 docker_args=(
   run
   --rm
-  --name mighty-gazebo-forest
+  --name "${CONTAINER_NAME}"
   --interactive
   --privileged
   --network=host
@@ -96,8 +157,14 @@ docker_args=(
   --env "ENV=${WORLD}"
   --env "USE_RVIZ=$([[ "${RVIZ_GUI}" == "1" ]] && echo true || echo false)"
   --env "USE_GAZEBO_GUI=$([[ "${GAZEBO_GUI}" == "1" ]] && echo true || echo false)"
+  --env "AUTO_EXIT_DELAY=${AUTO_EXIT_DELAY}"
+  --env "BENCHMARK_FILE=${BENCHMARK_CONTAINER_FILE}"
   --env "QT_X11_NO_MITSHM=1"
 )
+
+if [[ "${BENCHMARK}" == "1" ]]; then
+  docker_args+=(--volume "${BENCHMARK_RUN_DIR}:/mighty_statistics:rw")
+fi
 
 if [[ -t 0 && -t 1 ]]; then
   docker_args+=(--tty)
@@ -164,7 +231,10 @@ if [[ "${USE_RVIZ}" == "true" || "${USE_GAZEBO_GUI}" == "true" ]]; then
   echo "[MIGHTY] X11 preflight passed for DISPLAY=${DISPLAY}."
 fi
 
-args=(--mode gazebo -s /home/kkondo/code/mighty_ws/install/setup.bash --env "${ENV}")
+args=(--mode gazebo -s /home/kkondo/code/mighty_ws/install/setup.bash --env "${ENV}" --auto-exit-delay "${AUTO_EXIT_DELAY}")
+if [[ -n "${BENCHMARK_FILE}" ]]; then
+  args+=(--benchmark-file "${BENCHMARK_FILE}")
+fi
 if [[ "${USE_RVIZ}" != "true" ]]; then
   args+=(--no-rviz)
 fi
@@ -192,6 +262,11 @@ command=(docker "${docker_args[@]}" --entrypoint bash "${IMAGE}" "${container_co
 echo "[MIGHTY] World: ${WORLD}"
 echo "[MIGHTY] RViz GUI: ${RVIZ_GUI}"
 echo "[MIGHTY] Gazebo GUI: ${GAZEBO_GUI}"
+echo "[MIGHTY] Auto-exit delay: ${AUTO_EXIT_DELAY} second(s)"
+echo "[MIGHTY] Benchmark: ${BENCHMARK}"
+if [[ "${BENCHMARK}" == "1" ]]; then
+  echo "[MIGHTY] Benchmark output: ${BENCHMARK_RUN_DIR}"
+fi
 echo "[MIGHTY] Image: ${IMAGE}"
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
@@ -201,4 +276,57 @@ if [[ "${DRY_RUN:-0}" == "1" ]]; then
   exit 0
 fi
 
-exec "${command[@]}"
+if [[ "${BENCHMARK}" != "1" ]]; then
+  exec "${command[@]}"
+fi
+
+started_at="$(date --iso-8601=seconds)"
+started_epoch="$(date +%s)"
+set +e
+"${command[@]}"
+status=$?
+set -e
+ended_at="$(date --iso-8601=seconds)"
+ended_epoch="$(date +%s)"
+duration_s=$((ended_epoch - started_epoch))
+
+ground_truth_generated=0
+if [[ -s "${BENCHMARK_TRAJECTORY_FILE}" ]]; then
+  world_file="${REPO_DIR}/worlds/${WORLD}.world"
+  if [[ -f "${world_file}" ]] && python3 "${REPO_DIR}/scripts/validate_trajectory_ground_truth.py" \
+      --trajectory "${BENCHMARK_TRAJECTORY_FILE}" \
+      --world "${world_file}" \
+      --config "${REPO_DIR}/config/mighty.yaml" \
+      --output "${BENCHMARK_GROUND_TRUTH_FILE}" \
+      --mission-summary "${BENCHMARK_SUMMARY_FILE}"; then
+    ground_truth_generated=1
+  else
+    echo "[WARN] Ground-truth trajectory validation did not complete." >&2
+  fi
+fi
+
+benchmark_generated=0
+if [[ -s "${BENCHMARK_HOST_FILE}" ]]; then
+  benchmark_generated=1
+elif (( status == 0 )); then
+  echo "[ERROR] Simulation exited successfully but no benchmark CSV was generated." >&2
+  status=3
+fi
+
+{
+  printf 'run_id=%s\n' "${BENCHMARK_RUN_ID}"
+  printf 'started_at=%s\n' "${started_at}"
+  printf 'ended_at=%s\n' "${ended_at}"
+  printf 'duration_s=%s\n' "${duration_s}"
+  printf 'exit_code=%s\n' "${status}"
+  printf 'benchmark_generated=%s\n' "${benchmark_generated}"
+  printf 'ground_truth_generated=%s\n' "${ground_truth_generated}"
+  printf 'world=%s\n' "${WORLD}"
+  printf 'goal_x=%s\n' "${GOAL_X:-default}"
+  printf 'goal_y=%s\n' "${GOAL_Y:-default}"
+  printf 'goal_z=%s\n' "${GOAL_Z:-default}"
+  printf 'auto_exit_delay=%s\n' "${AUTO_EXIT_DELAY}"
+  printf 'image=%s\n' "${IMAGE}"
+} > "${BENCHMARK_RUN_DIR}/${BENCHMARK_RUN_ID}_metadata.env"
+
+exit "${status}"

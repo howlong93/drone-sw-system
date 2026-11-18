@@ -1534,8 +1534,16 @@ void MIGHTY_NODE::stateCallback(const dynus_interfaces::msg::State::SharedPtr ms
     const double now_s = this->now().seconds();
     if (now_s - benchmark_last_clearance_sample_time_ >= 0.1) {
       benchmark_last_clearance_sample_time_ = now_s;
-      benchmark_safety_positions_.push_back(position);
-      benchmark_trajectory_elapsed_s_.push_back(now_s - benchmark_flight_start_time_s_);
+      bool flush_trajectory = false;
+      {
+        std::lock_guard<std::mutex> lock(benchmark_trajectory_mutex_);
+        benchmark_safety_positions_.push_back(position);
+        benchmark_trajectory_elapsed_s_.push_back(now_s - benchmark_flight_start_time_s_);
+        flush_trajectory = benchmark_safety_positions_.size() % 100 == 0;
+      }
+      // Append once per ~10 seconds. This keeps timeout data recoverable while
+      // avoiding per-sample filesystem activity in the state callback.
+      if (flush_trajectory) logTrajectoryData();
     }
   }
 
@@ -1695,8 +1703,22 @@ void MIGHTY_NODE::replanCallback() {
     if (use_benchmark_ && benchmark_goal_active_) {
       benchmark_flight_start_time_s_ = this->now().seconds();
       benchmark_have_previous_state_ = false;
-      benchmark_safety_positions_.clear();
-      benchmark_trajectory_elapsed_s_.clear();
+      {
+        std::lock_guard<std::mutex> lock(benchmark_trajectory_mutex_);
+        benchmark_safety_positions_.clear();
+        benchmark_trajectory_elapsed_s_.clear();
+        benchmark_trajectory_rows_flushed_ = 0;
+      }
+      if (!file_path_.empty()) {
+        std::string marker_path = file_path_;
+        const auto extension = marker_path.rfind(".csv");
+        if (extension != std::string::npos)
+          marker_path.replace(extension, 4, "_flight_started.marker");
+        else
+          marker_path += "_flight_started.marker";
+        std::ofstream marker(marker_path, std::ios::trunc);
+        if (marker.is_open()) marker << this->now().seconds() << '\n';
+      }
       benchmark_last_clearance_sample_time_ = -std::numeric_limits<double>::infinity();
     }
     std_msgs::msg::Float64 time_msg;
@@ -1768,6 +1790,19 @@ void MIGHTY_NODE::replanCallback() {
     } else if (benchmark_sample.status == "idle_no_replan") {
       ++benchmark_idle_no_replan_;
     }
+  }
+
+  if (use_benchmark_ && benchmark_goal_active_ && benchmark_sample.attempted) {
+    benchmark_local_goal_occupied_ += benchmark_sample.local_goal_occupied;
+    benchmark_local_goal_relocated_ += benchmark_sample.local_goal_relocated;
+    benchmark_local_goal_relocation_failed_ += benchmark_sample.local_goal_relocation_failed;
+    benchmark_local_goal_retry_attempted_ += benchmark_sample.local_goal_retry_attempted;
+    benchmark_local_goal_retry_succeeded_ += benchmark_sample.local_goal_retry_succeeded;
+    benchmark_planned_trajectory_rejections_ += benchmark_sample.planned_trajectory_rejected;
+    benchmark_planned_trajectory_safety_retries_ +=
+        benchmark_sample.planned_trajectory_safety_retry_attempted;
+    benchmark_planned_trajectory_safety_retry_successes_ +=
+        benchmark_sample.planned_trajectory_safety_retry_succeeded;
   }
 
   // Usually this is done is goal callback but becuase we don't call that in push path test, we need
@@ -1853,12 +1888,24 @@ void MIGHTY_NODE::terminalGoalCallbackImpl(const geometry_msgs::msg::PoseStamped
       benchmark_idle_no_replan_ = 0;
       benchmark_logged_ = false;
       benchmark_rows_flushed_ = 0;
+      benchmark_trajectory_rows_flushed_ = 0;
       benchmark_goal_active_ = true;
       benchmark_have_previous_state_ = false;
-      benchmark_safety_positions_.clear();
-      benchmark_safety_positions_.reserve(4096);
-      benchmark_trajectory_elapsed_s_.clear();
-      benchmark_trajectory_elapsed_s_.reserve(4096);
+      {
+        std::lock_guard<std::mutex> lock(benchmark_trajectory_mutex_);
+        benchmark_safety_positions_.clear();
+        benchmark_safety_positions_.reserve(4096);
+        benchmark_trajectory_elapsed_s_.clear();
+        benchmark_trajectory_elapsed_s_.reserve(4096);
+      }
+      benchmark_local_goal_occupied_ = 0;
+      benchmark_local_goal_relocated_ = 0;
+      benchmark_local_goal_relocation_failed_ = 0;
+      benchmark_local_goal_retry_attempted_ = 0;
+      benchmark_local_goal_retry_succeeded_ = 0;
+      benchmark_planned_trajectory_rejections_ = 0;
+      benchmark_planned_trajectory_safety_retries_ = 0;
+      benchmark_planned_trajectory_safety_retry_successes_ = 0;
       benchmark_executed_path_length_ = 0.0;
       benchmark_max_executed_velocity_ = 0.0;
       benchmark_min_occupied_center_distance_ = std::numeric_limits<double>::infinity();
@@ -2473,6 +2520,8 @@ void MIGHTY_NODE::logData(bool final) {
       << "replan_id,timestamp_s,planner,status,success,global_path_success,cost,"
          "current_x,current_y,current_z,local_goal_x,local_goal_y,local_goal_z,"
          "terminal_goal_x,terminal_goal_y,terminal_goal_z,global_path_points,"
+         "local_goal_occupied,local_goal_relocated,local_goal_relocation_failed,"
+         "local_goal_retry_attempted,local_goal_retry_succeeded,"
          "total_ms,housekeeping_ms,global_stage_ms,global_planner_core_ms,local_stage_ms,"
          "append_plan_ms,final_housekeeping_ms,initial_guess_ms,optimizer_ms,"
          "sc_total_ms,sc_input_prepare_ms,sc_primary_ms,sc_secondary_ms,sc_validation_ms,"
@@ -2483,7 +2532,10 @@ void MIGHTY_NODE::logData(bool final) {
          "sc_primary_dilation_ms,sc_primary_constraint_ms,sc_secondary_obstacle_copy_ms,"
          "sc_secondary_dilation_ms,sc_secondary_constraint_ms,sc_primary_segment_ms,"
          "sc_secondary_segment_ms,sc_primary_failure_reason,sc_secondary_failure_reason,"
-         "trajectory_valid,planned_obstacle_safe,trajectory_validation_samples,"
+         "trajectory_valid,planned_obstacle_safe,planned_trajectory_rejected,"
+         "planned_trajectory_safety_retry_attempted,"
+         "planned_trajectory_safety_retry_succeeded,"
+         "trajectory_validation_samples,"
          "planned_obstacle_violations,trajectory_validation_ms,"
          "trajectory_min_corridor_margin,planned_min_occupied_center_distance_m,"
          "planned_length_m,planned_duration_s,"
@@ -2499,7 +2551,10 @@ void MIGHTY_NODE::logData(bool final) {
              << ',' << s.current_x << ',' << s.current_y << ',' << s.current_z << ','
              << s.local_goal_x << ',' << s.local_goal_y << ',' << s.local_goal_z << ','
              << s.terminal_goal_x << ',' << s.terminal_goal_y << ',' << s.terminal_goal_z << ','
-             << s.global_path_points << ',' << s.total_ms << ',' << s.housekeeping_ms << ','
+             << s.global_path_points << ',' << s.local_goal_occupied << ','
+             << s.local_goal_relocated << ',' << s.local_goal_relocation_failed << ','
+             << s.local_goal_retry_attempted << ',' << s.local_goal_retry_succeeded << ','
+             << s.total_ms << ',' << s.housekeeping_ms << ','
              << s.global_stage_ms << ',' << row.global_planning_ms << ',' << s.local_stage_ms << ','
              << s.append_plan_ms << ',' << s.final_housekeeping_ms << ',' << row.initial_guess_ms
              << ',' << row.optimizer_ms << ',' << s.sc_total_ms << ',' << s.sc_input_prepare_ms
@@ -2517,6 +2572,9 @@ void MIGHTY_NODE::logData(bool final) {
              << encode_times(s.sc_secondary_segment_ms) << "\"," << s.sc_primary_failure_reason
              << ',' << s.sc_secondary_failure_reason << ',' << s.trajectory_validation_success
              << ',' << s.planned_obstacle_validation_success << ','
+             << s.planned_trajectory_rejected << ','
+             << s.planned_trajectory_safety_retry_attempted << ','
+             << s.planned_trajectory_safety_retry_succeeded << ','
              << s.trajectory_validation_samples << ',' << s.planned_obstacle_violations << ','
              << s.trajectory_validation_ms << ',' << s.trajectory_min_corridor_margin << ','
              << s.planned_min_occupied_center_distance << ',' << s.planned_trajectory_length << ','
@@ -2537,25 +2595,14 @@ void MIGHTY_NODE::logData(bool final) {
   else
     summary_path += "_summary.csv";
 
-  // Persist the raw executed path first. Collision checking is deliberately
-  // performed by the host after Gazebo exits, against the SDF world geometry;
-  // it must never delay planning callbacks or the goal-reached notification.
-  std::string trajectory_path = file_path_;
-  const auto trajectory_extension = trajectory_path.rfind(".csv");
-  if (trajectory_extension != std::string::npos)
-    trajectory_path.replace(trajectory_extension, 4, "_trajectory.csv");
-  else
-    trajectory_path += "_trajectory.csv";
-  std::ofstream trajectory_file(trajectory_path);
-  if (trajectory_file.is_open()) {
-    trajectory_file << "elapsed_from_flight_start_s,x_m,y_m,z_m\n";
-    const size_t sample_count =
-        std::min(benchmark_safety_positions_.size(), benchmark_trajectory_elapsed_s_.size());
-    for (size_t i = 0; i < sample_count; ++i) {
-      const auto& position = benchmark_safety_positions_[i];
-      trajectory_file << benchmark_trajectory_elapsed_s_[i] << ',' << position.x() << ','
-                      << position.y() << ',' << position.z() << '\n';
-    }
+  // Flush any remaining executed-path rows. Ground-truth validation remains
+  // host-side after Gazebo exits and therefore cannot perturb replanning.
+  logTrajectoryData();
+
+  size_t trajectory_sample_count = 0;
+  {
+    std::lock_guard<std::mutex> lock(benchmark_trajectory_mutex_);
+    trajectory_sample_count = benchmark_safety_positions_.size();
   }
 
   size_t successes = 0;
@@ -2604,7 +2651,7 @@ void MIGHTY_NODE::logData(bool final) {
                  << "mission_goal_to_reached_ms," << benchmark_goal_to_reached_ms_ << '\n'
                  << "flight_start_to_reached_ms," << benchmark_flight_start_to_reached_ms_ << '\n'
                  << "command_to_first_trajectory_ms," << benchmark_command_to_execution_ms_ << '\n'
-                 << "trajectory_samples_recorded," << benchmark_safety_positions_.size() << '\n'
+                 << "trajectory_samples_recorded," << trajectory_sample_count << '\n'
                  << "executed_path_length_m," << benchmark_executed_path_length_ << '\n'
                  << "max_executed_velocity," << benchmark_max_executed_velocity_ << '\n'
                  << "min_occupied_center_distance_m,nan\n"
@@ -2614,6 +2661,18 @@ void MIGHTY_NODE::logData(bool final) {
                  << "replan_attempts," << global_path_benchmark_.size() << '\n'
                  << "replan_successes," << successes << '\n'
                  << "replan_failures," << global_path_benchmark_.size() - successes << '\n'
+                 << "local_goal_occupied_events," << benchmark_local_goal_occupied_ << '\n'
+                 << "local_goal_relocations," << benchmark_local_goal_relocated_ << '\n'
+                 << "local_goal_relocation_failures,"
+                 << benchmark_local_goal_relocation_failed_ << '\n'
+                 << "local_goal_retry_attempts," << benchmark_local_goal_retry_attempted_ << '\n'
+                 << "local_goal_retry_successes," << benchmark_local_goal_retry_succeeded_ << '\n'
+                 << "planned_trajectory_occupied_rejections,"
+                 << benchmark_planned_trajectory_rejections_ << '\n'
+                 << "planned_trajectory_safety_retries,"
+                 << benchmark_planned_trajectory_safety_retries_ << '\n'
+                 << "planned_trajectory_safety_retry_successes,"
+                 << benchmark_planned_trajectory_safety_retry_successes_ << '\n'
                  << "idle_not_ready_callbacks," << benchmark_idle_not_ready_ << '\n'
                  << "idle_no_replan_callbacks," << benchmark_idle_no_replan_ << '\n'
                  << "sc_primary_failures," << sc_failures << '\n'
@@ -2627,6 +2686,37 @@ void MIGHTY_NODE::logData(bool final) {
       summary_file << "status_" << status << ',' << count << '\n';
   }
   benchmark_logged_ = true;
+}
+
+// ----------------------------------------------------------------------------
+
+void MIGHTY_NODE::logTrajectoryData() {
+  if (file_path_.empty()) return;
+
+  std::lock_guard<std::mutex> lock(benchmark_trajectory_mutex_);
+  const size_t sample_count =
+      std::min(benchmark_safety_positions_.size(), benchmark_trajectory_elapsed_s_.size());
+  if (benchmark_trajectory_rows_flushed_ >= sample_count) return;
+
+  std::string trajectory_path = file_path_;
+  const auto extension = trajectory_path.rfind(".csv");
+  if (extension != std::string::npos)
+    trajectory_path.replace(extension, 4, "_trajectory.csv");
+  else
+    trajectory_path += "_trajectory.csv";
+
+  const bool write_header = benchmark_trajectory_rows_flushed_ == 0;
+  std::ofstream trajectory_file(
+      trajectory_path, write_header ? std::ios::trunc : std::ios::app);
+  if (!trajectory_file.is_open()) return;
+  if (write_header) trajectory_file << "elapsed_from_flight_start_s,x_m,y_m,z_m\n";
+  for (size_t i = benchmark_trajectory_rows_flushed_; i < sample_count; ++i) {
+    const auto& position = benchmark_safety_positions_[i];
+    trajectory_file << benchmark_trajectory_elapsed_s_[i] << ',' << position.x() << ','
+                    << position.y() << ',' << position.z() << '\n';
+  }
+  trajectory_file.flush();
+  benchmark_trajectory_rows_flushed_ = sample_count;
 }
 
 // ----------------------------------------------------------------------------

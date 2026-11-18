@@ -560,14 +560,16 @@ bool MIGHTY::getSafeCorridor(const vec_Vecf<3>& global_path, const state& A) {
   ellip.set_local_bbox(
       Vec3f(par_.local_box_size[0], par_.local_box_size[1], par_.local_box_size[2]));
   ellip.set_z_min_and_max(par_.z_min, par_.z_max);
-  ellip.set_inflate_distance(par_.drone_radius);
+  // The planning map is already inflated for the vehicle.  Only account for
+  // the geometric extent of a voxel around its published center here; using
+  // drone_radius again would double-count the vehicle safety margin.
+  const double planning_voxel_radius = 0.5 * std::sqrt(3.0) * par_.res;
+  ellip.set_inflate_distance(planning_voxel_radius);
 
   // Get obstacle points for decomposition
   vec_Vec3f base_uo;
-  if (par_.sfc_use_unknown_as_obstacle)
-    hgp_manager_.getVecUnknownOccupied(base_uo);
-  else
-    hgp_manager_.getVecOccupied(base_uo);
+  hgp_manager_.getPlanningObstacleCloud(global_path, par_.local_box_size,
+                                        par_.sfc_use_unknown_as_obstacle, base_uo);
   if (detailed_benchmark_enabled_) benchmark_obstacle_snapshot_ = base_uo;
 
   // Empty obstacle arrays (dynamic obstacles handled via heat map, not corridors)
@@ -654,10 +656,10 @@ bool MIGHTY::getSafeCorridor(const vec_Vecf<3>& global_path, const state& A) {
     ellip_safe.set_local_bbox(
         Vec3f(par_.local_box_size[0], par_.local_box_size[1], par_.local_box_size[2]));
     ellip_safe.set_z_min_and_max(par_.z_min, par_.z_max);
-    ellip_safe.set_inflate_distance(par_.drone_radius);
+    ellip_safe.set_inflate_distance(planning_voxel_radius);
 
     vec_Vec3f base_uo_safe;
-    hgp_manager_.getVecUnknownOccupied(base_uo_safe);
+    hgp_manager_.getPlanningObstacleCloud(global_path, par_.local_box_size, true, base_uo_safe);
     benchmark_data_.sc_secondary_obstacle_count = base_uo_safe.size();
 
     std::vector<LinearConstraint3D> safe_constraints;
@@ -1103,9 +1105,22 @@ bool MIGHTY::generateGlobalPath(vec_Vecf<3>& global_path, double current_time,
     }
   }
   if (!reused_route) {
-    if (!hgp_manager_.solveHGP(local_A.pos, start_dir_hint, local_G.pos, final_g_,
-                               par_.global_planner_heuristic_weight, A_time, global_path,
-                               raw_global_path)) {
+    const bool hgp_success = hgp_manager_.solveHGP(
+        local_A.pos, start_dir_hint, local_G.pos, final_g_,
+        par_.global_planner_heuristic_weight, A_time, global_path, raw_global_path);
+    const auto& recovery = hgp_manager_.getLastLocalGoalRecoveryInfo();
+    benchmark_data_.local_goal_occupied = recovery.occupied_detected;
+    benchmark_data_.local_goal_relocated = recovery.relocated;
+    benchmark_data_.local_goal_relocation_failed = recovery.relocation_failed;
+    benchmark_data_.local_goal_retry_attempted = recovery.retry_attempted;
+    benchmark_data_.local_goal_retry_succeeded = recovery.retry_succeeded;
+    if (recovery.relocated) {
+      const Eigen::Vector3d yaw_direction = local_G_term.pos - local_G.pos;
+      if (yaw_direction.head<2>().norm() > 1e-6)
+        local_G.yaw = std::atan2(yaw_direction.y(), yaw_direction.x());
+      setG(local_G);
+    }
+    if (!hgp_success) {
       if (par_.debug_verbose)
         printf("[TIMING]   HGP solve (FAILED): %.2f ms\n", timer_solve.getElapsedMicros() / 1000.0);
       hgp_failure_count_++;
@@ -1307,14 +1322,104 @@ bool MIGHTY::planLocalTrajectory(vec_Vecf<3>& global_path) {
   }
 
   if (optimization_succeeded) {
-    // For the optimal solution
-    whole_traj_solver_ptr_->reconstructPVATCPopt(
-        zopt_);  // First recover the final control points and times from z_opt
-    whole_traj_solver_ptr_->getGoalSetpoints(goal_setpoints_);
+    auto reconstruct_solution = [&]() {
+      whole_traj_solver_ptr_->reconstructPVATCPopt(zopt_);
+      whole_traj_solver_ptr_->getGoalSetpoints(goal_setpoints_);
+      whole_traj_solver_ptr_->getPieceWisePol(pwp_to_share_);
+      whole_traj_solver_ptr_->getControlPoints(cps_);
+    };
+    reconstruct_solution();
 
-    // print out the goal setpoints
-    whole_traj_solver_ptr_->getPieceWisePol(pwp_to_share_);
-    whole_traj_solver_ptr_->getControlPoints(cps_);  // Bezier control points
+    // Observe planned-trajectory occupancy for benchmark diagnostics only.
+    // The HGP map has already been inflated, so a direct occupied-voxel test
+    // avoids double-counting the vehicle radius.  This audit must not select a
+    // different optimizer result, retry optimization, or prevent publication:
+    // mission completion is currently the execution priority and safety is
+    // evaluated after the run.
+    constexpr double validation_dt = 0.05;
+    std::string validation_failure_reason;
+    Eigen::Vector3d first_occupied_position = Eigen::Vector3d::Constant(
+        std::numeric_limits<double>::quiet_NaN());
+    size_t first_occupied_segment = std::numeric_limits<size_t>::max();
+    double first_occupied_corridor_max_plane = std::numeric_limits<double>::quiet_NaN();
+    double first_occupied_distance_from_start = std::numeric_limits<double>::quiet_NaN();
+    auto validate_planned_trajectory = [&]() {
+      validation_failure_reason.clear();
+      first_occupied_position.setConstant(std::numeric_limits<double>::quiet_NaN());
+      first_occupied_segment = std::numeric_limits<size_t>::max();
+      first_occupied_corridor_max_plane = std::numeric_limits<double>::quiet_NaN();
+      first_occupied_distance_from_start = std::numeric_limits<double>::quiet_NaN();
+      bool safe = pwp_to_share_.times.size() >= 2;
+      if (!safe) validation_failure_reason = "invalid_piecewise_times";
+      bool reached_free_space = false;
+      bool have_previous_position = false;
+      double distance_from_start = 0.0;
+      Eigen::Vector3d previous_position = Eigen::Vector3d::Zero();
+      const double max_initial_escape_distance =
+          par_.inflation_hgp + std::sqrt(3.0) * par_.res;
+      for (size_t i = 0; safe && i + 1 < pwp_to_share_.times.size(); ++i) {
+        const double t0 = pwp_to_share_.times[i];
+        const double t1 = pwp_to_share_.times[i + 1];
+        if (!std::isfinite(t0) || !std::isfinite(t1) || t1 < t0) {
+          validation_failure_reason = "invalid_segment_time";
+          return false;
+        }
+        const int sample_count =
+            std::max(1, static_cast<int>(std::ceil((t1 - t0) / validation_dt)));
+        for (int sample_index = 0; sample_index <= sample_count; ++sample_index) {
+          const double alpha = static_cast<double>(sample_index) / sample_count;
+          const Eigen::Vector3d position = pwp_to_share_.eval(t0 + alpha * (t1 - t0));
+          ++benchmark_data_.trajectory_validation_samples;
+          if (!position.allFinite()) {
+            validation_failure_reason = "nonfinite_position";
+            return false;
+          }
+          if (have_previous_position) distance_from_start += (position - previous_position).norm();
+          previous_position = position;
+          have_previous_position = true;
+          const bool occupied = hgp_manager_.checkIfPointOccupied(position);
+          if (!occupied) {
+            reached_free_space = true;
+          } else if (reached_free_space || distance_from_start > max_initial_escape_distance) {
+            validation_failure_reason = reached_free_space ? "occupied_after_free" : "escape_too_long";
+            first_occupied_position = position;
+            first_occupied_segment = i;
+            first_occupied_distance_from_start = distance_from_start;
+            if (i < safe_corridor_polytopes_whole_.size()) {
+              const auto& corridor = safe_corridor_polytopes_whole_[i];
+              if (corridor.A_.rows() > 0 && corridor.b_.size() == corridor.A_.rows()) {
+                first_occupied_corridor_max_plane =
+                    (corridor.A_ * position - corridor.b_).maxCoeff();
+              }
+            }
+            ++benchmark_data_.planned_obstacle_violations;
+            safe = false;
+            break;
+          }
+        }
+      }
+      if (safe && !reached_free_space) validation_failure_reason = "never_reached_free";
+      return safe && reached_free_space;
+    };
+
+    MyTimer mandatory_trajectory_validation_timer(true);
+    benchmark_data_.trajectory_validation_success = validate_planned_trajectory();
+    benchmark_data_.planned_obstacle_validation_success =
+        benchmark_data_.trajectory_validation_success;
+    benchmark_data_.trajectory_validation_ms =
+        mandatory_trajectory_validation_timer.getElapsedMicros() / 1000.0;
+    if (!benchmark_data_.trajectory_validation_success) {
+      if (!std::isfinite(last_safety_rejection_log_time_) ||
+          A_time - last_safety_rejection_log_time_ >= 1.0) {
+        std::cerr << "[SafetyAudit] observed reason=" << validation_failure_reason
+                  << " first_occupied=" << first_occupied_position.transpose()
+                  << " pwp_segment=" << first_occupied_segment
+                  << " corridor_max_plane=" << first_occupied_corridor_max_plane
+                  << " distance_from_start=" << first_occupied_distance_from_start
+                  << " corridors=" << safe_corridor_polytopes_whole_.size() << std::endl;
+        last_safety_rejection_log_time_ = A_time;
+      }
+    }
 
     if (detailed_benchmark_enabled_) {
     MyTimer trajectory_validation_timer(true);

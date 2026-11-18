@@ -27,6 +27,7 @@
 
 // Other includes
 #include <mutex>
+#include <limits>
 #include <string>
 
 #include <Eigen/Dense>
@@ -54,6 +55,18 @@ struct CorridorDecompStats {
   double constraint_ms = 0.0;
   std::vector<double> segment_ms;
   std::string failure_reason;
+};
+
+/** Result of validating and, when needed, relocating one horizon-local goal. */
+struct LocalGoalRecoveryInfo {
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+  bool occupied_detected = false;
+  bool relocated = false;
+  bool relocation_failed = false;
+  bool retry_attempted = false;
+  bool retry_succeeded = false;
+  Vec3f original_goal = Vec3f::Zero();
+  Vec3f final_goal = Vec3f::Zero();
 };
 
 /** @brief Manages the voxel map, global planner, and convex decomposition for HGP.
@@ -168,9 +181,14 @@ class HGPManager {
    *  @param raw_path Output raw path before simplification.
    *  @return True if a valid path was found.
    */
-  bool solveHGP(const Vec3f& start_sent, const Vec3f& start_vel, const Vec3f& goal_sent,
+  bool solveHGP(const Vec3f& start_sent, const Vec3f& start_vel, Vec3f& goal_sent,
                 double& final_g, double weight, double current_time, vec_Vecf<3>& path,
                 vec_Vecf<3>& raw_path);
+
+  /** Return diagnostics from the most recent solveHGP local-goal check. */
+  const LocalGoalRecoveryInfo& getLastLocalGoalRecoveryInfo() const {
+    return last_local_goal_recovery_;
+  }
 
   /** @brief Truncate a path to include only waypoints in free space.
    *  @param path Input path to check.
@@ -305,6 +323,15 @@ class HGPManager {
    */
   void getVecOccupied(vec_Vec3f& vec_o);
 
+  /** Get obstacle voxel centers from the exact post-inflation planning-map
+   * snapshot used by the latest HGP solve, restricted to the path vicinity.
+   * This keeps safe-corridor generation and trajectory validation on the same
+   * occupancy representation.
+   */
+  void getPlanningObstacleCloud(const vec_Vecf<3>& path,
+                                const std::vector<double>& local_box_size,
+                                bool include_unknown, vec_Vec3f& obstacles);
+
   /** @brief Update the internal occupied point vector (thread-safe).
    *  @param vec_o New occupied point vector.
    */
@@ -375,6 +402,9 @@ class HGPManager {
   // Flags
   bool map_initialized_ = false;
   bool is_ground_robot_ = false;
+  LocalGoalRecoveryInfo last_local_goal_recovery_;
+  double last_local_goal_recovery_log_time_ =
+      -std::numeric_limits<double>::infinity();
 
   // ESDF for ground robot A* cost
   std::shared_ptr<const EsdfGrid2D> esdf_grid_;

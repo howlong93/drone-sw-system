@@ -22,6 +22,18 @@ class Cylinder:
     length: float
 
 
+@dataclass(frozen=True)
+class ClearanceSample:
+    segment_index: int
+    elapsed: float
+    x: float
+    y: float
+    z: float
+    clearance: float
+    collision: bool
+    nearest_obstacle: str
+
+
 def pose_xyz(element: ET.Element | None) -> tuple[float, float, float]:
     if element is None or not (element.text or "").strip():
         return 0.0, 0.0, 0.0
@@ -139,6 +151,128 @@ def update_mission_summary(path: Path, metrics: dict[str, object]) -> None:
         writer.writerows(updated)
 
 
+def write_clearance_samples(path: Path, samples: list[ClearanceSample]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(
+            (
+                "segment_index",
+                "elapsed_from_flight_start_s",
+                "x_m",
+                "y_m",
+                "z_m",
+                "surface_clearance_m",
+                "collision",
+                "nearest_obstacle",
+            )
+        )
+        for sample in samples:
+            writer.writerow(
+                (
+                    sample.segment_index,
+                    sample.elapsed,
+                    sample.x,
+                    sample.y,
+                    sample.z,
+                    sample.clearance,
+                    int(sample.collision),
+                    sample.nearest_obstacle,
+                )
+            )
+
+
+def plot_ground_truth_path(
+    path: Path,
+    trajectory: list[tuple[float, float, float, float]],
+    cylinders: list[Cylinder],
+    collision_segments: set[int],
+    horizontal_radius: float,
+    goal: tuple[float, float, float],
+    metrics: dict[str, object],
+) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.collections import LineCollection, PatchCollection
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Circle
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig, axis = plt.subplots(figsize=(24, 5), dpi=160)
+    fig.patch.set_facecolor("#080808")
+    axis.set_facecolor("#080808")
+
+    inflated = [
+        Circle((item.x, item.y), item.radius + horizontal_radius)
+        for item in cylinders
+    ]
+    physical = [Circle((item.x, item.y), item.radius) for item in cylinders]
+    axis.add_collection(
+        PatchCollection(inflated, facecolor="#747474", edgecolor="none", alpha=0.28)
+    )
+    axis.add_collection(
+        PatchCollection(
+            physical, facecolor="#E8E8E8", edgecolor="#FFFFFF", linewidth=0.25, alpha=0.9
+        )
+    )
+
+    if len(trajectory) >= 2:
+        points = [(row[1], row[2]) for row in trajectory]
+        segments = [[points[index - 1], points[index]] for index in range(1, len(points))]
+        colors = [
+            "#FF2D2D" if index in collision_segments else "#00D5FF"
+            for index in range(1, len(points))
+        ]
+        axis.add_collection(LineCollection(segments, colors=colors, linewidths=2.0, zorder=5))
+
+    if trajectory:
+        axis.scatter(
+            trajectory[0][1], trajectory[0][2], s=85, c="#20E070", edgecolors="white",
+            linewidths=0.5, zorder=7
+        )
+    axis.scatter(
+        goal[0], goal[1], s=95, c="#2166F3", edgecolors="white", linewidths=0.5, zorder=7
+    )
+
+    all_x = [item.x for item in cylinders] + [row[1] for row in trajectory] + [goal[0]]
+    all_y = [item.y for item in cylinders] + [row[2] for row in trajectory] + [goal[1]]
+    if all_x and all_y:
+        xmin, xmax = min(all_x), max(all_x)
+        ymin, ymax = min(all_y), max(all_y)
+        axis.set_xlim(xmin - 2.0, xmax + 2.0)
+        axis.set_ylim(ymin - 2.0, ymax + 2.0)
+    axis.set_aspect("equal", adjustable="box")
+    axis.set_xlabel("x (m)", color="white")
+    axis.set_ylabel("y (m)", color="white")
+    axis.tick_params(colors="white", labelsize=8)
+    for spine in axis.spines.values():
+        spine.set_color("#777777")
+    axis.grid(color="#333333", linewidth=0.35, alpha=0.45)
+
+    safe = int(metrics["ground_truth_collision_free"])
+    duration = trajectory[-1][0] if trajectory else math.nan
+    axis.set_title(
+        "Executed trajectory over Gazebo ground truth  |  "
+        f"collision_free={safe}  duration={duration:.1f}s  "
+        f"min_clearance={float(metrics['ground_truth_min_surface_clearance_m']):.3f}m",
+        color="white",
+        fontsize=11,
+    )
+    legend = [
+        Line2D([0], [0], color="#00D5FF", lw=2, label="collision-free trajectory"),
+        Line2D([0], [0], color="#FF2D2D", lw=2, label="collision segment"),
+        Line2D([0], [0], marker="o", color="none", markerfacecolor="#20E070", label="start"),
+        Line2D([0], [0], marker="o", color="none", markerfacecolor="#2166F3", label="goal"),
+        Line2D([0], [0], marker="o", color="none", markerfacecolor="#E8E8E8", label="obstacle"),
+    ]
+    axis.legend(handles=legend, loc="upper center", ncol=5, frameon=False, labelcolor="white")
+    fig.tight_layout()
+    fig.savefig(path, facecolor=fig.get_facecolor(), bbox_inches="tight")
+    plt.close(fig)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--trajectory", type=Path, required=True)
@@ -146,6 +280,11 @@ def main() -> int:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--mission-summary", type=Path)
+    parser.add_argument("--plot-output", type=Path)
+    parser.add_argument("--clearance-output", type=Path)
+    parser.add_argument("--goal-x", type=float, default=305.0)
+    parser.add_argument("--goal-y", type=float, default=0.0)
+    parser.add_argument("--goal-z", type=float, default=3.0)
     parser.add_argument("--sample-spacing", type=float, default=0.05)
     args = parser.parse_args()
 
@@ -160,6 +299,7 @@ def main() -> int:
     min_clearance = math.inf
     first_collision_time = math.nan
     first_collision_obstacle = ""
+    clearance_samples: list[ClearanceSample] = []
     for segment_index, point in interpolate_path(trajectory, args.sample_spacing):
         elapsed, x, y, z = point
         validation_samples += 1
@@ -173,7 +313,20 @@ def main() -> int:
                 nearest_clearance = clearance
                 nearest_name = cylinder.name
         min_clearance = min(min_clearance, nearest_clearance)
-        if nearest_clearance <= 0.0:
+        collision = nearest_clearance <= 0.0
+        clearance_samples.append(
+            ClearanceSample(
+                segment_index,
+                elapsed,
+                x,
+                y,
+                z,
+                nearest_clearance,
+                collision,
+                nearest_name,
+            )
+        )
+        if collision:
             collision_samples += 1
             collision_segments.add(segment_index)
             if math.isnan(first_collision_time):
@@ -198,6 +351,8 @@ def main() -> int:
         "drone_half_extent_y_m": half_y,
         "drone_half_extent_z_m": half_z,
         "ground_truth_world_file": args.world,
+        "ground_truth_path_plot": args.plot_output or "",
+        "ground_truth_clearance_file": args.clearance_output or "",
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w", newline="", encoding="utf-8") as stream:
@@ -206,6 +361,18 @@ def main() -> int:
         writer.writerows(metrics.items())
     if args.mission_summary:
         update_mission_summary(args.mission_summary, metrics)
+    if args.clearance_output:
+        write_clearance_samples(args.clearance_output, clearance_samples)
+    if args.plot_output:
+        plot_ground_truth_path(
+            args.plot_output,
+            trajectory,
+            cylinders,
+            collision_segments,
+            horizontal_radius,
+            (args.goal_x, args.goal_y, args.goal_z),
+            metrics,
+        )
     print(
         f"[GROUND TRUTH] collision_free={int(collision_free)} "
         f"collision_samples={collision_samples} min_clearance_m={min_clearance:.6f}"

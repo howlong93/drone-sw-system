@@ -5,9 +5,10 @@ set -uo pipefail
 REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "${REPO_DIR}"
 
-COUNT="${1:-20}"
+COUNT="${1:-30}"
 WORLD="${ENV:-hard_forest}"
-TIMEOUT_S="${TIMEOUT_S:-240}"
+TIMEOUT_S="${TIMEOUT_S:-330}"
+FLIGHT_TIMEOUT_S="${FLIGHT_TIMEOUT_S:-270}"
 AUTO_EXIT_DELAY="${AUTO_EXIT_DELAY:-3}"
 INTER_RUN_DELAY="${INTER_RUN_DELAY:-2}"
 GPU="${GPU:-1}"
@@ -17,6 +18,7 @@ STATISTICS_DIR="${STATISTICS_DIR:-${REPO_DIR}/statistics}"
 
 [[ "${COUNT}" =~ ^[1-9][0-9]*$ ]] || { echo "[ERROR] count must be a positive integer." >&2; exit 2; }
 [[ "${TIMEOUT_S}" =~ ^[1-9][0-9]*([.][0-9]+)?$ ]] || { echo "[ERROR] TIMEOUT_S must be positive." >&2; exit 2; }
+[[ "${FLIGHT_TIMEOUT_S}" =~ ^[1-9][0-9]*([.][0-9]+)?$ ]] || { echo "[ERROR] FLIGHT_TIMEOUT_S must be positive." >&2; exit 2; }
 [[ "${AUTO_EXIT_DELAY}" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "[ERROR] AUTO_EXIT_DELAY must be non-negative for batch runs." >&2; exit 2; }
 [[ "${INTER_RUN_DELAY}" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "[ERROR] INTER_RUN_DELAY must be non-negative." >&2; exit 2; }
 [[ "${GPU}" == "0" || "${GPU}" == "1" ]] || { echo "[ERROR] GPU must be 0 or 1." >&2; exit 2; }
@@ -40,16 +42,18 @@ STATISTICS_DIR="$(cd -- "${STATISTICS_DIR}" && pwd)"
 BATCH_DIR="${STATISTICS_DIR}/${BATCH_ID}"
 mkdir -p "${BATCH_DIR}"
 SUMMARY_FILE="${BATCH_DIR}/${BATCH_ID}_batch_summary.csv"
-printf 'run_index,run_id,started_at,ended_at,duration_s,exit_code,result,mission_success,planner_rows,run_directory\n' > "${SUMMARY_FILE}"
+printf 'run_index,run_id,started_at,ended_at,duration_s,exit_code,result,mission_result,safety_result,timeout_scope,mission_success,planner_rows,run_directory\n' > "${SUMMARY_FILE}"
 
 echo "Batch configuration:"
 echo "  Runs            : ${COUNT}"
 echo "  World           : ${WORLD}"
 echo "  Timeout/run     : ${TIMEOUT_S} second(s)"
+echo "  Flight timeout  : ${FLIGHT_TIMEOUT_S} second(s) after first trajectory"
 echo "  Auto-exit delay : ${AUTO_EXIT_DELAY} second(s)"
 echo "  Output          : ${BATCH_DIR}"
 
 failures=0
+safety_failures=0
 for ((index = 1; index <= COUNT; index++)); do
   printf -v padded_index '%03d' "${index}"
   run_id="${BATCH_ID}_run_${padded_index}"
@@ -82,6 +86,7 @@ for ((index = 1; index <= COUNT; index++)); do
 
   resource_file="${run_dir}/${run_id}_resources.csv"
   gpu_resource_file="${run_dir}/${run_id}_gpu_resources.csv"
+  flight_marker="${run_dir}/${run_id}_planner_flight_started.marker"
   printf 'timestamp,cpu_percent,memory_usage,memory_percent,pids,network_io,block_io\n' > "${resource_file}"
   printf 'timestamp,gpu_utilization_percent,gpu_memory_used_mib\n' > "${gpu_resource_file}"
 
@@ -89,66 +94,152 @@ for ((index = 1; index <= COUNT; index++)); do
     script --quiet --return --command "${run_command}" "${run_dir}/${run_id}_console.log" &
   runner_pid=$!
 
+  flight_started_epoch=""
+  flight_timeout=0
+  resource_sample_due=0
   while kill -0 "${runner_pid}" >/dev/null 2>&1; do
-    sample_time="$(date --iso-8601=seconds)"
-    if docker container inspect "${container_name}" >/dev/null 2>&1; then
-      docker stats --no-stream \
-        --format "${sample_time},{{.CPUPerc}},{{.MemUsage}},{{.MemPerc}},{{.PIDs}},{{.NetIO}},{{.BlockIO}}" \
-        "${container_name}" >> "${resource_file}" 2>/dev/null || true
+    now_epoch="$(date +%s)"
+    if [[ -z "${flight_started_epoch}" && -s "${flight_marker}" ]]; then
+      flight_started_epoch="${now_epoch}"
+      echo "[BATCH] Flight timer started for ${run_id}."
     fi
-    if [[ "${GPU}" == "1" ]] && command -v nvidia-smi >/dev/null 2>&1; then
-      gpu_sample="$(nvidia-smi --query-gpu=utilization.gpu,memory.used \
-        --format=csv,noheader,nounits 2>/dev/null | head -n 1 | tr -d ' ')"
-      [[ -n "${gpu_sample}" ]] && printf '%s,%s\n' "${sample_time}" "${gpu_sample}" >> "${gpu_resource_file}"
+    if [[ -n "${flight_started_epoch}" ]] &&
+       awk -v now="${now_epoch}" -v start="${flight_started_epoch}" -v limit="${FLIGHT_TIMEOUT_S}" \
+         'BEGIN { exit !((now - start) >= limit) }'; then
+      flight_timeout=1
+      echo "[WARN] Flight timeout reached for ${run_id}; requesting graceful shutdown." >&2
+      docker kill --signal=SIGINT "${container_name}" >/dev/null 2>&1 || true
+      kill -INT "${runner_pid}" >/dev/null 2>&1 || true
+      break
+    fi
+
+    if (( resource_sample_due <= now_epoch )); then
+      sample_time="$(date --iso-8601=seconds)"
+      if docker container inspect "${container_name}" >/dev/null 2>&1; then
+        docker stats --no-stream \
+          --format "${sample_time},{{.CPUPerc}},{{.MemUsage}},{{.MemPerc}},{{.PIDs}},{{.NetIO}},{{.BlockIO}}" \
+          "${container_name}" >> "${resource_file}" 2>/dev/null || true
+      fi
+      if [[ "${GPU}" == "1" ]] && command -v nvidia-smi >/dev/null 2>&1; then
+        gpu_sample="$(nvidia-smi --query-gpu=utilization.gpu,memory.used \
+          --format=csv,noheader,nounits 2>/dev/null | head -n 1 | tr -d ' ')"
+        [[ -n "${gpu_sample}" ]] && printf '%s,%s\n' "${sample_time}" "${gpu_sample}" >> "${gpu_resource_file}"
+      fi
+      resource_sample_due=$((now_epoch + 5))
     fi
     sleep 1
   done
-  wait "${runner_pid}"
+  wait "${runner_pid}" 2>/dev/null
   status=$?
 
+  timeout_scope="none"
+  if (( flight_timeout == 1 )); then
+    timeout_scope="flight"
+    status=124
+  elif (( status == 124 )); then
+    timeout_scope="outer"
+  fi
+
   if docker container inspect "${container_name}" >/dev/null 2>&1; then
-    echo "[WARN] Removing leftover container ${container_name}." >&2
-    docker rm --force "${container_name}" >/dev/null
+    echo "[WARN] Requesting final graceful shutdown for leftover container ${container_name}." >&2
+    docker kill --signal=SIGINT "${container_name}" >/dev/null 2>&1 || true
+    for _ in {1..10}; do
+      docker container inspect "${container_name}" >/dev/null 2>&1 || break
+      sleep 1
+    done
+    if docker container inspect "${container_name}" >/dev/null 2>&1; then
+      echo "[WARN] Force-removing unresponsive container ${container_name}." >&2
+      docker rm --force "${container_name}" >/dev/null
+    fi
   fi
 
   ended_at="$(date --iso-8601=seconds)"
   ended_epoch="$(date +%s)"
   duration_s=$((ended_epoch - started_epoch))
   planner_file="${run_dir}/${run_id}_planner.csv"
+  planner_summary_file="${run_dir}/${run_id}_planner_summary.csv"
+  trajectory_file="${run_dir}/${run_id}_planner_trajectory.csv"
+  ground_truth_file="${run_dir}/${run_id}_ground_truth_summary.csv"
+  overlay_file="${run_dir}/${run_id}_ground_truth_path.png"
+  clearance_file="${run_dir}/${run_id}_trajectory_clearance.csv"
   planner_rows=0
   if [[ -s "${planner_file}" ]]; then
     planner_rows=$(( $(wc -l < "${planner_file}") - 1 ))
     (( planner_rows < 0 )) && planner_rows=0
   fi
 
+  mission_success="0"
+  if [[ -s "${planner_summary_file}" ]]; then
+    mission_success="$(awk -F, '$1 == "mission_success" { gsub(/\r/, "", $2); print $2; exit }' "${planner_summary_file}")"
+  else
+    printf 'metric,value\nmission_success,0\n' > "${planner_summary_file}"
+  fi
+
+  if [[ -s "${trajectory_file}" ]]; then
+    goal_args=()
+    [[ -n "${GOAL_X:-}" ]] && goal_args+=(--goal-x "${GOAL_X}")
+    [[ -n "${GOAL_Y:-}" ]] && goal_args+=(--goal-y "${GOAL_Y}")
+    [[ -n "${GOAL_Z:-}" ]] && goal_args+=(--goal-z "${GOAL_Z}")
+    python3 "${REPO_DIR}/scripts/validate_trajectory_ground_truth.py" \
+      --trajectory "${trajectory_file}" \
+      --world "${REPO_DIR}/worlds/${WORLD}.world" \
+      --config "${REPO_DIR}/config/mighty.yaml" \
+      --output "${ground_truth_file}" \
+      --mission-summary "${planner_summary_file}" \
+      --plot-output "${overlay_file}" \
+      --clearance-output "${clearance_file}" \
+      "${goal_args[@]}" || \
+      echo "[WARN] Ground-truth validation/plot failed for ${run_id}." >&2
+  fi
+
   python3 "${REPO_DIR}/scripts/summarize_benchmark.py" \
     --run-dir "${run_dir}" --run-id "${run_id}" || \
     echo "[WARN] Could not generate aggregate statistics for ${run_id}." >&2
 
-  mission_success="0"
-  planner_summary_file="${run_dir}/${run_id}_planner_summary.csv"
-  if [[ -s "${planner_summary_file}" ]]; then
-    mission_success="$(awk -F, '$1 == "mission_success" { print $2; exit }' "${planner_summary_file}")"
+  ground_truth_collision_free=""
+  if [[ -s "${ground_truth_file}" ]]; then
+    ground_truth_collision_free="$(awk -F, '$1 == "ground_truth_collision_free" { gsub(/\r/, "", $2); print $2; exit }' "${ground_truth_file}")"
+  fi
+
+  mission_result="mission_failed"
+  if [[ "${mission_success}" == "1" ]]; then
+    mission_result="reached"
+  elif [[ "${timeout_scope}" == "flight" ]]; then
+    mission_result="flight_timeout"
+  elif [[ "${timeout_scope}" == "outer" ]]; then
+    mission_result="outer_timeout"
+  elif (( status != 0 )); then
+    mission_result="runtime_error"
+  fi
+
+  safety_result="not_validated"
+  if [[ "${ground_truth_collision_free}" == "1" ]]; then
+    safety_result="safe"
+  elif [[ "${ground_truth_collision_free}" == "0" ]]; then
+    safety_result="collision"
+    safety_failures=$((safety_failures + 1))
   fi
 
   result="success"
-  if (( status != 0 )) || (( planner_rows == 0 )) || [[ "${mission_success}" != "1" ]]; then
+  if [[ "${mission_success}" != "1" ]]; then
     result="failed"
     failures=$((failures + 1))
-    echo "===== Failed ${run_id}: exit=${status}, planner_rows=${planner_rows}, mission_success=${mission_success} =====" >&2
+    echo "===== Mission failed ${run_id}: ${mission_result}, exit=${status} =====" >&2
   else
-    echo "===== Completed ${run_id}: planner_rows=${planner_rows} ====="
+    echo "===== Mission reached ${run_id}: safety=${safety_result}, planner_rows=${planner_rows} ====="
   fi
 
-  printf '%d,%s,%s,%s,%d,%d,%s,%s,%d,%s\n' \
+  printf '%d,%s,%s,%s,%d,%d,%s,%s,%s,%s,%s,%d,%s\n' \
     "${index}" "${run_id}" "${started_at}" "${ended_at}" "${duration_s}" \
-    "${status}" "${result}" "${mission_success}" "${planner_rows}" "${run_dir}" >> "${SUMMARY_FILE}"
+    "${status}" "${result}" "${mission_result}" "${safety_result}" "${timeout_scope}" \
+    "${mission_success}" "${planner_rows}" "${run_dir}" >> "${SUMMARY_FILE}"
 
   if (( index < COUNT )) && [[ "${INTER_RUN_DELAY}" != "0" ]]; then
     sleep "${INTER_RUN_DELAY}"
   fi
 done
 
-printf '\nBatch finished: %d requested, %d failed.\n' "${COUNT}" "${failures}"
+printf '\nBatch finished: %d requested, %d mission failures, %d safety failures.\n' \
+  "${COUNT}" "${failures}" "${safety_failures}"
 echo "Summary: ${SUMMARY_FILE}"
 (( failures == 0 ))

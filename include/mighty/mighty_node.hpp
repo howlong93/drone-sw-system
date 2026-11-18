@@ -156,6 +156,7 @@ class MIGHTY_NODE : public rclcpp::Node {
   void printComputationTime(bool result);
   void recordData(const ReplanBenchmarkData& sample, double timestamp);
   void logData(bool final = true);
+  void logTrajectoryData();
   void setComputationTimesToZero();
   void constructFOVMarker();
   void retrieveData();
@@ -411,6 +412,7 @@ class MIGHTY_NODE : public rclcpp::Node {
   uint64_t benchmark_idle_no_replan_ = 0;
   bool benchmark_logged_ = false;
   size_t benchmark_rows_flushed_ = 0;
+  size_t benchmark_trajectory_rows_flushed_ = 0;
 
   // Mission-level benchmark state.
   bool benchmark_goal_active_ = false;
@@ -420,6 +422,15 @@ class MIGHTY_NODE : public rclcpp::Node {
   // deferred until logData(), after the mission has stopped.
   std::vector<Eigen::Vector3d> benchmark_safety_positions_;
   std::vector<double> benchmark_trajectory_elapsed_s_;
+  std::mutex benchmark_trajectory_mutex_;
+  uint64_t benchmark_local_goal_occupied_ = 0;
+  uint64_t benchmark_local_goal_relocated_ = 0;
+  uint64_t benchmark_local_goal_relocation_failed_ = 0;
+  uint64_t benchmark_local_goal_retry_attempted_ = 0;
+  uint64_t benchmark_local_goal_retry_succeeded_ = 0;
+  uint64_t benchmark_planned_trajectory_rejections_ = 0;
+  uint64_t benchmark_planned_trajectory_safety_retries_ = 0;
+  uint64_t benchmark_planned_trajectory_safety_retry_successes_ = 0;
   double benchmark_executed_path_length_ = 0.0;
   double benchmark_max_executed_velocity_ = 0.0;
   double benchmark_min_occupied_center_distance_ = std::numeric_limits<double>::infinity();

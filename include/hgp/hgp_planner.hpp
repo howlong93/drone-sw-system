@@ -49,6 +49,13 @@ class HGPPlanner {
    *  @param map_util Shared pointer to a 3D voxel map utility.
    */
   void setMapUtil(const std::shared_ptr<mighty::MapUtil<3>>& map_util);
+
+  /** Find a forward-progressing non-occupied replacement for a rejected goal.
+   *  This intentionally queries the planner's private map copy, so recovery
+   *  uses exactly the same occupancy snapshot as plan().
+   */
+  bool findRecoverableGoal(const Vecf<3>& start, const Vecf<3>& rejected_goal,
+                           Vecf<3>& recovered_goal);
   /**
    * @brief Status of the planner
    *

@@ -256,11 +256,80 @@ inline void collapseIntoLongSegments(const mighty::VoxelMapUtil& map, double res
   path_inout.swap(simplified);
 }
 
-bool HGPManager::solveHGP(const Vec3f& start_sent, const Vec3f& start_vel, const Vec3f& goal_sent,
+bool HGPManager::solveHGP(const Vec3f& start_sent, const Vec3f& start_vel, Vec3f& goal_sent,
                           double& final_g, double weight, double current_time, vec_Vecf<3>& path,
                           vec_Vecf<3>& raw_path) {
   // map_util_for_planning_ was already copied in setupHGPPlanner() and modified by
   // freeStart/freeGoal — do NOT re-copy here or those freeings are lost.
+
+  last_local_goal_recovery_ = LocalGoalRecoveryInfo{};
+  last_local_goal_recovery_.original_goal = goal_sent;
+  last_local_goal_recovery_.final_goal = goal_sent;
+
+  // Keep one shared_ptr snapshot from validation through planner execution. The
+  // base map may update concurrently, but this exact inflated planning map is
+  // immutable for the duration of the solve.
+  const auto planning_map = map_util_for_planning_;
+  if (!planning_map) return false;
+
+  auto relocate_occupied_goal = [&](Vec3f& goal) {
+    const Veci<3> original_int = planning_map->floatToInt(goal);
+    if (planning_map->useSoftCostObstacles() || !planning_map->isOccupied(original_int))
+      return true;
+
+    last_local_goal_recovery_.occupied_detected = true;
+    const Vec3f original = goal;
+    Vec3f candidate = original;
+    planning_map->findClosestNonOccupiedPoint(original, candidate);
+
+    Vec3f forward = original - start_sent;
+    const double forward_norm = forward.norm();
+    if (forward_norm > 1e-6) forward /= forward_norm;
+    const double min_progress = std::max(0.05, res_);
+    auto usable = [&](const Vec3f& point) {
+      const Veci<3> point_int = planning_map->floatToInt(point);
+      if (planning_map->isOutside(point_int) || planning_map->isOccupied(point_int)) return false;
+      return forward_norm <= 1e-6 || (point - start_sent).dot(forward) >= min_progress;
+    };
+
+    bool found = (candidate - original).norm() > 1e-6 && usable(candidate);
+    if (!found && forward_norm > 1e-6) {
+      // A line-seeded fallback is deterministic and cannot move the goal
+      // behind the planning start. Search backward from G toward A.
+      const double step = std::max(0.05, res_ * 0.5);
+      for (double offset = step; offset < forward_norm; offset += step) {
+        const Vec3f point = original - forward * offset;
+        if (usable(point)) {
+          candidate = point;
+          found = true;
+          break;
+        }
+      }
+    }
+
+    if (!found) {
+      last_local_goal_recovery_.relocation_failed = true;
+      if (current_time - last_local_goal_recovery_log_time_ >= 2.0) {
+        printf("[HGP] Local goal occupied at (%.2f,%.2f,%.2f); relocation failed.\n",
+               original.x(), original.y(), original.z());
+        last_local_goal_recovery_log_time_ = current_time;
+      }
+      return false;
+    }
+
+    goal = candidate;
+    goal_sent = candidate;
+    last_local_goal_recovery_.relocated = true;
+    last_local_goal_recovery_.final_goal = candidate;
+    if (current_time - last_local_goal_recovery_log_time_ >= 2.0) {
+      printf("[HGP] Local goal relocated from (%.2f,%.2f,%.2f) to "
+             "(%.2f,%.2f,%.2f) on the planning-map snapshot.\n",
+             original.x(), original.y(), original.z(), candidate.x(), candidate.y(),
+             candidate.z());
+      last_local_goal_recovery_log_time_ = current_time;
+    }
+    return true;
+  };
 
   // Set start and goal — in 2D mode, force z to default_goal_z for the search reference plane
   Vec3f start_for_search = start_sent;
@@ -280,17 +349,48 @@ bool HGPManager::solveHGP(const Vec3f& start_sent, const Vec3f& start_vel, const
     }
   }
 
+  if (!relocate_occupied_goal(goal_for_search)) return false;
+
   Eigen::Vector3d start(start_for_search(0), start_for_search(1), start_for_search(2));
   Eigen::Vector3d goal(goal_for_search(0), goal_for_search(1), goal_for_search(2));
 
   // Set collision checking function
-  planner_ptr_->setMapUtil(map_util_for_planning_);
+  planner_ptr_->setMapUtil(planning_map);
 
   // HGP Plan
   bool result = false;
 
   // Attempt to plan
   result = planner_ptr_->plan(start, start_vel, goal, final_g, current_time, weight);
+
+  // Defensive bounded retry. The planner owns a deep copy of the planning
+  // map, so use its status and its exact copy for recovery. This also handles
+  // the case where the manager-side precheck and plan() disagree at a voxel
+  // boundary. Never repeat the identical rejected goal indefinitely.
+  if (!result && !planning_map->useSoftCostObstacles() && planner_ptr_->status() == 2) {
+    last_local_goal_recovery_.retry_attempted = true;
+    last_local_goal_recovery_.occupied_detected = true;
+    Vec3f recovered_goal;
+    if (planner_ptr_->findRecoverableGoal(start_for_search, goal_for_search, recovered_goal)) {
+      const Vec3f rejected_goal = goal_for_search;
+      goal_for_search = recovered_goal;
+      goal_sent = recovered_goal;
+      last_local_goal_recovery_.relocated = true;
+      last_local_goal_recovery_.final_goal = recovered_goal;
+      goal = recovered_goal.cast<double>();
+      if (current_time - last_local_goal_recovery_log_time_ >= 2.0) {
+        printf("[HGP] Planner-map recovery relocated local goal from "
+               "(%.2f,%.2f,%.2f) to (%.2f,%.2f,%.2f).\n",
+               rejected_goal.x(), rejected_goal.y(), rejected_goal.z(), recovered_goal.x(),
+               recovered_goal.y(), recovered_goal.z());
+        last_local_goal_recovery_log_time_ = current_time;
+      }
+      result = planner_ptr_->plan(start, start_vel, goal, final_g, current_time, weight);
+      last_local_goal_recovery_.retry_succeeded = result;
+    } else {
+      last_local_goal_recovery_.relocation_failed = true;
+    }
+  }
 
   // If there is a solution
   if (result) {
@@ -409,6 +509,21 @@ void HGPManager::getComputationTime(double& global_planning_time, double& hgp_st
 void HGPManager::getVecOccupied(vec_Vec3f& vec_o) {
   std::lock_guard<std::mutex> lock(mtx_vec_o_);
   vec_o = vec_o_;
+}
+
+void HGPManager::getPlanningObstacleCloud(const vec_Vecf<3>& path,
+                                          const std::vector<double>& local_box_size,
+                                          bool include_unknown, vec_Vec3f& obstacles) {
+  std::lock_guard<std::mutex> lock(mtx_map_util_);
+  const auto& map = map_util_for_planning_ ? map_util_for_planning_ : map_util_;
+  if (!map) {
+    obstacles.clear();
+    return;
+  }
+  const std::vector<float> local_box_size_f(local_box_size.begin(), local_box_size.end());
+  obstacles = include_unknown
+                  ? map->getOccupiedCloudWithUnknownAsOccupied(path, local_box_size_f)
+                  : map->getOccupiedCloud(path, local_box_size_f);
 }
 
 void HGPManager::updateVecOccupied(const vec_Vec3f& vec_o) {

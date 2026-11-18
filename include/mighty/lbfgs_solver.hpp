@@ -104,6 +104,9 @@ class SolverLBFGS {
   /** @brief Destructor. */
   ~SolverLBFGS();
 
+  /** Temporarily adjust the static-corridor penalty for a bounded safety retry. */
+  void setStaticWeight(double weight) { stat_weight_ = weight; }
+
   // -----------------------------------------------------------------------------
 
   // ------------------------------

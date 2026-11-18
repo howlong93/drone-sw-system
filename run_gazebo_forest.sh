@@ -4,19 +4,19 @@ set -Eeuo pipefail
 
 REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-# User-facing default: one command launches a reproducible 20-run headless
+# User-facing default: one command launches a reproducible 30-run headless
 # benchmark. The batch runner invokes this script with explicit `0 0`, so the
 # branch cannot recurse. Set SINGLE_RUN=1 to retain the old no-argument GUI run.
 if (( $# == 0 )) && [[ "${SINGLE_RUN:-0}" != "1" ]]; then
   export BATCH_ID="${BATCH_ID:-mighty_baseline_$(date +%Y%m%d_%H%M%S)}"
-  exec "${REPO_DIR}/run_benchmark_batch_drone.sh" "${BENCHMARK_COUNT:-1}"
+  exec "${REPO_DIR}/run_benchmark_batch_drone.sh" "${BENCHMARK_COUNT:-30}"
 fi
 
 usage() {
   cat <<'EOF'
 Usage: ./run_gazebo_forest.sh [RVIZ_GUI] [GAZEBO_GUI]
 
-With no arguments, run 20 headless benchmark trials and archive all results.
+With no arguments, run 30 headless benchmark trials and archive all results.
 With GUI arguments, run one README "Single UAV through a Gazebo forest" trial.
 
   RVIZ_GUI=1    Show RViz (default: 1).
@@ -25,7 +25,7 @@ With GUI arguments, run one README "Single UAV through a Gazebo forest" trial.
   GAZEBO_GUI=0  Run Gazebo server-only.
 
 Examples:
-  ./run_gazebo_forest.sh        # 20-run headless benchmark
+  ./run_gazebo_forest.sh        # 30-run headless benchmark
   SINGLE_RUN=1 ./run_gazebo_forest.sh  # one run: RViz on, Gazebo GUI off
   ./run_gazebo_forest.sh 1 1    # RViz and Gazebo GUI on
   ./run_gazebo_forest.sh 0 1    # Gazebo GUI only
@@ -44,7 +44,7 @@ Optional environment variables:
   BENCHMARK_RUN_DIR Host output directory; defaults to statistics/<run-id>
   CONTAINER_NAME  Docker container name (default: mighty-gazebo-forest)
   DRY_RUN        Set to 1 to print the Docker command without running it
-  BENCHMARK_COUNT Number of trials for no-argument batch mode (default: 20)
+  BENCHMARK_COUNT Number of trials for no-argument batch mode (default: 30)
   SINGLE_RUN      Set to 1 to make a no-argument invocation run one GUI trial
 EOF
 }
@@ -129,6 +129,8 @@ BENCHMARK_CONTAINER_FILE=""
 BENCHMARK_TRAJECTORY_FILE=""
 BENCHMARK_SUMMARY_FILE=""
 BENCHMARK_GROUND_TRUTH_FILE=""
+BENCHMARK_OVERLAY_FILE=""
+BENCHMARK_CLEARANCE_FILE=""
 if [[ "${BENCHMARK}" == "1" ]]; then
   BENCHMARK_RUN_ID="${BENCHMARK_RUN_ID:-forest_$(date +%Y%m%d_%H%M%S)_run_001}"
   if [[ ! "${BENCHMARK_RUN_ID}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
@@ -143,6 +145,8 @@ if [[ "${BENCHMARK}" == "1" ]]; then
   BENCHMARK_TRAJECTORY_FILE="${BENCHMARK_RUN_DIR}/${BENCHMARK_RUN_ID}_planner_trajectory.csv"
   BENCHMARK_SUMMARY_FILE="${BENCHMARK_RUN_DIR}/${BENCHMARK_RUN_ID}_planner_summary.csv"
   BENCHMARK_GROUND_TRUTH_FILE="${BENCHMARK_RUN_DIR}/${BENCHMARK_RUN_ID}_ground_truth_summary.csv"
+  BENCHMARK_OVERLAY_FILE="${BENCHMARK_RUN_DIR}/${BENCHMARK_RUN_ID}_ground_truth_path.png"
+  BENCHMARK_CLEARANCE_FILE="${BENCHMARK_RUN_DIR}/${BENCHMARK_RUN_ID}_trajectory_clearance.csv"
 fi
 
 docker_args=(
@@ -293,12 +297,19 @@ duration_s=$((ended_epoch - started_epoch))
 ground_truth_generated=0
 if [[ -s "${BENCHMARK_TRAJECTORY_FILE}" ]]; then
   world_file="${REPO_DIR}/worlds/${WORLD}.world"
+  goal_args=()
+  [[ -n "${GOAL_X:-}" ]] && goal_args+=(--goal-x "${GOAL_X}")
+  [[ -n "${GOAL_Y:-}" ]] && goal_args+=(--goal-y "${GOAL_Y}")
+  [[ -n "${GOAL_Z:-}" ]] && goal_args+=(--goal-z "${GOAL_Z}")
   if [[ -f "${world_file}" ]] && python3 "${REPO_DIR}/scripts/validate_trajectory_ground_truth.py" \
       --trajectory "${BENCHMARK_TRAJECTORY_FILE}" \
       --world "${world_file}" \
       --config "${REPO_DIR}/config/mighty.yaml" \
       --output "${BENCHMARK_GROUND_TRUTH_FILE}" \
-      --mission-summary "${BENCHMARK_SUMMARY_FILE}"; then
+      --mission-summary "${BENCHMARK_SUMMARY_FILE}" \
+      --plot-output "${BENCHMARK_OVERLAY_FILE}" \
+      --clearance-output "${BENCHMARK_CLEARANCE_FILE}" \
+      "${goal_args[@]}"; then
     ground_truth_generated=1
   else
     echo "[WARN] Ground-truth trajectory validation did not complete." >&2

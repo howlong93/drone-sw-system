@@ -72,6 +72,12 @@ struct ReplanBenchmarkData {
   double terminal_goal_x = 0.0, terminal_goal_y = 0.0, terminal_goal_z = 0.0;
   size_t global_path_points = 0;
 
+  bool local_goal_occupied = false;
+  bool local_goal_relocated = false;
+  bool local_goal_relocation_failed = false;
+  bool local_goal_retry_attempted = false;
+  bool local_goal_retry_succeeded = false;
+
   double sc_total_ms = 0.0;
   double sc_input_prepare_ms = 0.0;
   double sc_primary_ms = 0.0;
@@ -101,6 +107,9 @@ struct ReplanBenchmarkData {
 
   bool trajectory_validation_success = false;
   bool planned_obstacle_validation_success = false;
+  bool planned_trajectory_rejected = false;
+  bool planned_trajectory_safety_retry_attempted = false;
+  bool planned_trajectory_safety_retry_succeeded = false;
   size_t trajectory_validation_samples = 0;
   size_t planned_obstacle_violations = 0;
   double trajectory_validation_ms = 0.0;
@@ -650,6 +659,7 @@ class MIGHTY {
 
   // Counter for replanning failure
   int replanning_failure_count_ = 0;
+  double last_safety_rejection_log_time_ = -std::numeric_limits<double>::infinity();
 
   // Map size
   bool map_size_initialized_ = false;  // Map size initialized

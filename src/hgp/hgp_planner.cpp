@@ -156,6 +156,42 @@ void HGPPlanner::setMapUtil(const std::shared_ptr<mighty::MapUtil<3>>& map_util)
   map_util_ = std::make_shared<mighty::MapUtil<3>>(*map_util);
 }
 
+bool HGPPlanner::findRecoverableGoal(const Vecf<3>& start, const Vecf<3>& rejected_goal,
+                                     Vecf<3>& recovered_goal) {
+  if (!map_util_) return false;
+
+  Vecf<3> forward = rejected_goal - start;
+  const double forward_norm = forward.norm();
+  if (forward_norm > 1e-6) forward /= forward_norm;
+  const double min_progress = std::max(0.05, static_cast<double>(map_util_->getRes()));
+  auto usable = [&](const Vecf<3>& point) {
+    const Veci<3> point_int = map_util_->floatToInt(point);
+    if (map_util_->isOutside(point_int) || map_util_->isOccupied(point_int)) return false;
+    return forward_norm <= 1e-6 || (point - start).dot(forward) >= min_progress;
+  };
+
+  Vecf<3> candidate = rejected_goal;
+  map_util_->findClosestNonOccupiedPoint(rejected_goal, candidate);
+  if ((candidate - rejected_goal).norm() > 1e-6 && usable(candidate)) {
+    recovered_goal = candidate;
+    return true;
+  }
+
+  // Deterministic fallback: move the horizon goal back toward the planning
+  // start until the exact map used by plan() reports a usable voxel.
+  if (forward_norm > 1e-6) {
+    const double step = std::max(0.05, 0.5 * static_cast<double>(map_util_->getRes()));
+    for (double offset = step; offset < forward_norm; offset += step) {
+      candidate = rejected_goal - forward * offset;
+      if (usable(candidate)) {
+        recovered_goal = candidate;
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 int HGPPlanner::status() { return status_; }
 
 vec_Vecf<3> HGPPlanner::getPath() { return path_; }

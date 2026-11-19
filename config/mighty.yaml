@@ -110,7 +110,7 @@ mighty_node:
         dyn_constr_vel_weight: 1e+3                     # [-] Velocity constraint violation weight
         dyn_constr_acc_weight: 1e+3                     # [-] Acceleration constraint violation weight
         dyn_constr_jerk_weight: 1e+3                    # [-] Jerk constraint violation weight
-        planner_Co: 0.0                                 # [m] Planning map/corridor already include vehicle inflation
+        planner_Co: 0.1                                 # [m] Additional static-obstacle clearance in trajectory optimization
         planner_Cw: 1.3                                 # [m] Collision clearance for dynamic obstacles
 
         # --- Safety Corridors ---

@@ -2,31 +2,46 @@
 
 set -Eeuo pipefail
 
+# =============================================================================
+# User configuration (edit these values for the next test batch)
+# =============================================================================
+TEST_RUN_COUNT="${TEST_RUN_COUNT:-10}"  # Number of simulation runs
+RVIZ_GUI_DEFAULT="${RVIZ_GUI_DEFAULT:-1}"  # 1: enable RViz, 0: disable
+GAZEBO_GUI_DEFAULT="${GAZEBO_GUI_DEFAULT:-0}"  # 1: enable Gazebo GUI, 0: disable
+RECORD_STATISTICS="${RECORD_STATISTICS:-0}"  # 1: record benchmark data, 0: disable
+STATISTICS_FOLDER_NAME="${STATISTICS_FOLDER_NAME:-fixed_$(date +%Y%m%d_%H%M%S)}"
+RUN_TIMEOUT_SECONDS="${RUN_TIMEOUT_SECONDS:-350}"  # Overall timeout for each run
+FLIGHT_TIMEOUT_SECONDS="${FLIGHT_TIMEOUT_SECONDS:-300}"  # Timeout after flight starts
+
 REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-# User-facing default: one command launches a reproducible 30-run headless
-# benchmark. The batch runner invokes this script with explicit `0 0`, so the
-# branch cannot recurse. Set SINGLE_RUN=1 to retain the old no-argument GUI run.
-if (( $# == 0 )) && [[ "${SINGLE_RUN:-0}" != "1" ]]; then
-  export BATCH_ID="${BATCH_ID:-mighty_baseline_$(date +%Y%m%d_%H%M%S)}"
-  exec "${REPO_DIR}/run_benchmark_batch_drone.sh" "${BENCHMARK_COUNT:-30}"
+# With no arguments, launch the configured batch. Set TEST_RUN_COUNT=1 above
+# for a single trial. The batch runner calls this script with explicit GUI
+# arguments, so this branch cannot recurse.
+if (( $# == 0 )); then
+  export BATCH_ID="${BATCH_ID:-${STATISTICS_FOLDER_NAME}}"
+  export BATCH_RVIZ_GUI="${RVIZ_GUI_DEFAULT}"
+  export BATCH_GAZEBO_GUI="${GAZEBO_GUI_DEFAULT}"
+  export BATCH_RECORD_STATISTICS="${RECORD_STATISTICS}"
+  export TIMEOUT_S="${RUN_TIMEOUT_SECONDS}"
+  export FLIGHT_TIMEOUT_S="${FLIGHT_TIMEOUT_SECONDS}"
+  exec "${REPO_DIR}/run_benchmark_batch_drone.sh" "${TEST_RUN_COUNT}"
 fi
 
 usage() {
   cat <<'EOF'
 Usage: ./run_gazebo_forest.sh [RVIZ_GUI] [GAZEBO_GUI]
 
-With no arguments, run 30 headless benchmark trials and archive all results.
+With no arguments, run the benchmark batch configured at the top of this file.
 With GUI arguments, run one README "Single UAV through a Gazebo forest" trial.
 
-  RVIZ_GUI=1    Show RViz (default: 1).
+  RVIZ_GUI=1    Show RViz (default is configured at the top of this file).
   RVIZ_GUI=0    Do not start RViz.
-  GAZEBO_GUI=1  Show the Gazebo client (default: 0).
+  GAZEBO_GUI=1  Show the Gazebo client (default is configured at the top of this file).
   GAZEBO_GUI=0  Run Gazebo server-only.
 
 Examples:
-  ./run_gazebo_forest.sh        # 30-run headless benchmark
-  SINGLE_RUN=1 ./run_gazebo_forest.sh  # one run: RViz on, Gazebo GUI off
+  ./run_gazebo_forest.sh        # configured benchmark batch
   ./run_gazebo_forest.sh 1 1    # RViz and Gazebo GUI on
   ./run_gazebo_forest.sh 0 1    # Gazebo GUI only
   ./run_gazebo_forest.sh 0 0    # Fully headless
@@ -39,18 +54,16 @@ Optional environment variables:
   DEV            Set to 1 to mount the current source/config/launch/rviz (default: 0)
   AUTO_EXIT_DELAY Seconds to wait after reaching the goal before exiting
                   (default: 3; 0 exits immediately; -1 disables auto-exit)
-  BENCHMARK       Set to 1 to save planner timing data (default: 0)
+  BENCHMARK       Override RECORD_STATISTICS for this invocation
   BENCHMARK_RUN_ID Identifier used for the output folder and CSV filename
   BENCHMARK_RUN_DIR Host output directory; defaults to statistics/<run-id>
   CONTAINER_NAME  Docker container name (default: mighty-gazebo-forest)
   DRY_RUN        Set to 1 to print the Docker command without running it
-  BENCHMARK_COUNT Number of trials for no-argument batch mode (default: 30)
-  SINGLE_RUN      Set to 1 to make a no-argument invocation run one GUI trial
 EOF
 }
 
-RVIZ_GUI="${1:-1}"
-GAZEBO_GUI="${2:-0}"
+RVIZ_GUI="${1:-${RVIZ_GUI_DEFAULT}}"
+GAZEBO_GUI="${2:-${GAZEBO_GUI_DEFAULT}}"
 
 if [[ "${RVIZ_GUI}" == "-h" || "${RVIZ_GUI}" == "--help" ]]; then
   usage
@@ -71,6 +84,28 @@ for variable in RVIZ_GUI GAZEBO_GUI; do
   fi
 done
 
+if [[ ! "${TEST_RUN_COUNT}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "[ERROR] TEST_RUN_COUNT must be a positive integer (received: ${TEST_RUN_COUNT})." >&2
+  exit 2
+fi
+
+if [[ "${RECORD_STATISTICS}" != "0" && "${RECORD_STATISTICS}" != "1" ]]; then
+  echo "[ERROR] RECORD_STATISTICS must be 0 or 1 (received: ${RECORD_STATISTICS})." >&2
+  exit 2
+fi
+
+if [[ ! "${STATISTICS_FOLDER_NAME}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+  echo "[ERROR] STATISTICS_FOLDER_NAME contains unsupported characters: ${STATISTICS_FOLDER_NAME}" >&2
+  exit 2
+fi
+
+for timeout_setting in RUN_TIMEOUT_SECONDS FLIGHT_TIMEOUT_SECONDS; do
+  if [[ ! "${!timeout_setting}" =~ ^[1-9][0-9]*([.][0-9]+)?$ ]]; then
+    echo "[ERROR] ${timeout_setting} must be a positive number (received: ${!timeout_setting})." >&2
+    exit 2
+  fi
+done
+
 if [[ "${RVIZ_GUI}" == "1" || "${GAZEBO_GUI}" == "1" ]]; then
   X11_ENABLED=1
 else
@@ -82,7 +117,7 @@ WORLD="${ENV:-hard_forest}"
 GPU="${GPU:-1}"
 DEV="${DEV:-0}"
 AUTO_EXIT_DELAY="${AUTO_EXIT_DELAY:-3}"
-BENCHMARK="${BENCHMARK:-0}"
+BENCHMARK="${BENCHMARK:-${RECORD_STATISTICS}}"
 CONTAINER_NAME="${CONTAINER_NAME:-mighty-gazebo-forest}"
 
 if [[ "${GPU}" != "0" && "${GPU}" != "1" ]]; then
@@ -132,7 +167,7 @@ BENCHMARK_GROUND_TRUTH_FILE=""
 BENCHMARK_OVERLAY_FILE=""
 BENCHMARK_CLEARANCE_FILE=""
 if [[ "${BENCHMARK}" == "1" ]]; then
-  BENCHMARK_RUN_ID="${BENCHMARK_RUN_ID:-forest_$(date +%Y%m%d_%H%M%S)_run_001}"
+  BENCHMARK_RUN_ID="${BENCHMARK_RUN_ID:-${STATISTICS_FOLDER_NAME}}"
   if [[ ! "${BENCHMARK_RUN_ID}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
     echo "[ERROR] BENCHMARK_RUN_ID contains unsupported characters: ${BENCHMARK_RUN_ID}" >&2
     exit 2

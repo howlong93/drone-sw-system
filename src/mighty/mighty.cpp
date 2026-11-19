@@ -560,11 +560,9 @@ bool MIGHTY::getSafeCorridor(const vec_Vecf<3>& global_path, const state& A) {
   ellip.set_local_bbox(
       Vec3f(par_.local_box_size[0], par_.local_box_size[1], par_.local_box_size[2]));
   ellip.set_z_min_and_max(par_.z_min, par_.z_max);
-  // The planning map is already inflated for the vehicle.  Only account for
-  // the geometric extent of a voxel around its published center here; using
-  // drone_radius again would double-count the vehicle safety margin.
-  const double planning_voxel_radius = 0.5 * std::sqrt(3.0) * par_.res;
-  ellip.set_inflate_distance(planning_voxel_radius);
+  // Retain the inflated planning map and add the configured vehicle radius as
+  // an explicit corridor clearance margin.
+  ellip.set_inflate_distance(par_.drone_radius);
 
   // Get obstacle points for decomposition
   vec_Vec3f base_uo;
@@ -656,7 +654,7 @@ bool MIGHTY::getSafeCorridor(const vec_Vecf<3>& global_path, const state& A) {
     ellip_safe.set_local_bbox(
         Vec3f(par_.local_box_size[0], par_.local_box_size[1], par_.local_box_size[2]));
     ellip_safe.set_z_min_and_max(par_.z_min, par_.z_max);
-    ellip_safe.set_inflate_distance(planning_voxel_radius);
+    ellip_safe.set_inflate_distance(par_.drone_radius);
 
     vec_Vec3f base_uo_safe;
     hgp_manager_.getPlanningObstacleCloud(global_path, par_.local_box_size, true, base_uo_safe);

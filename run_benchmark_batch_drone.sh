@@ -6,6 +6,9 @@ REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "${REPO_DIR}"
 
 COUNT="${1:-30}"
+RVIZ_GUI="${BATCH_RVIZ_GUI:-0}"
+GAZEBO_GUI="${BATCH_GAZEBO_GUI:-0}"
+RECORD_STATISTICS="${BATCH_RECORD_STATISTICS:-1}"
 WORLD="${ENV:-hard_forest}"
 TIMEOUT_S="${TIMEOUT_S:-330}"
 FLIGHT_TIMEOUT_S="${FLIGHT_TIMEOUT_S:-270}"
@@ -17,6 +20,9 @@ BATCH_ID="${BATCH_ID:-$(date +%Y%m%d_%H%M%S)}"
 STATISTICS_DIR="${STATISTICS_DIR:-${REPO_DIR}/statistics}"
 
 [[ "${COUNT}" =~ ^[1-9][0-9]*$ ]] || { echo "[ERROR] count must be a positive integer." >&2; exit 2; }
+[[ "${RVIZ_GUI}" == "0" || "${RVIZ_GUI}" == "1" ]] || { echo "[ERROR] BATCH_RVIZ_GUI must be 0 or 1." >&2; exit 2; }
+[[ "${GAZEBO_GUI}" == "0" || "${GAZEBO_GUI}" == "1" ]] || { echo "[ERROR] BATCH_GAZEBO_GUI must be 0 or 1." >&2; exit 2; }
+[[ "${RECORD_STATISTICS}" == "0" || "${RECORD_STATISTICS}" == "1" ]] || { echo "[ERROR] BATCH_RECORD_STATISTICS must be 0 or 1." >&2; exit 2; }
 [[ "${TIMEOUT_S}" =~ ^[1-9][0-9]*([.][0-9]+)?$ ]] || { echo "[ERROR] TIMEOUT_S must be positive." >&2; exit 2; }
 [[ "${FLIGHT_TIMEOUT_S}" =~ ^[1-9][0-9]*([.][0-9]+)?$ ]] || { echo "[ERROR] FLIGHT_TIMEOUT_S must be positive." >&2; exit 2; }
 [[ "${AUTO_EXIT_DELAY}" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "[ERROR] AUTO_EXIT_DELAY must be non-negative for batch runs." >&2; exit 2; }
@@ -46,6 +52,10 @@ printf 'run_index,run_id,started_at,ended_at,duration_s,exit_code,result,mission
 
 echo "Batch configuration:"
 echo "  Runs            : ${COUNT}"
+echo "  RViz GUI        : ${RVIZ_GUI}"
+echo "  Gazebo GUI      : ${GAZEBO_GUI}"
+echo "  Statistics      : ${RECORD_STATISTICS}"
+echo "  Folder name     : ${BATCH_ID}"
 echo "  World           : ${WORLD}"
 echo "  Timeout/run     : ${TIMEOUT_S} second(s)"
 echo "  Flight timeout  : ${FLIGHT_TIMEOUT_S} second(s) after first trajectory"
@@ -67,7 +77,7 @@ for ((index = 1; index <= COUNT; index++)); do
 
   command_parts=(
     env
-    "BENCHMARK=1"
+    "BENCHMARK=${RECORD_STATISTICS}"
     "BENCHMARK_RUN_ID=${run_id}"
     "BENCHMARK_RUN_DIR=${run_dir}"
     "CONTAINER_NAME=${container_name}"
@@ -81,7 +91,7 @@ for ((index = 1; index <= COUNT; index++)); do
       command_parts+=("${coordinate_name}=${!coordinate_name}")
     fi
   done
-  command_parts+=("${REPO_DIR}/run_gazebo_forest.sh" 0 0)
+  command_parts+=("${REPO_DIR}/run_gazebo_forest.sh" "${RVIZ_GUI}" "${GAZEBO_GUI}")
   printf -v run_command '%q ' "${command_parts[@]}"
 
   resource_file="${run_dir}/${run_id}_resources.csv"
@@ -171,6 +181,11 @@ for ((index = 1; index <= COUNT; index++)); do
   mission_success="0"
   if [[ -s "${planner_summary_file}" ]]; then
     mission_success="$(awk -F, '$1 == "mission_success" { gsub(/\r/, "", $2); print $2; exit }' "${planner_summary_file}")"
+  elif [[ "${RECORD_STATISTICS}" == "0" && "${status}" == "0" ]]; then
+    # Without planner benchmarking there is no planner summary. A clean
+    # auto-exit is the available mission-completion signal.
+    mission_success="1"
+    printf 'metric,value\nmission_success,1\n' > "${planner_summary_file}"
   else
     printf 'metric,value\nmission_success,0\n' > "${planner_summary_file}"
   fi
@@ -192,9 +207,11 @@ for ((index = 1; index <= COUNT; index++)); do
       echo "[WARN] Ground-truth validation/plot failed for ${run_id}." >&2
   fi
 
-  python3 "${REPO_DIR}/scripts/summarize_benchmark.py" \
-    --run-dir "${run_dir}" --run-id "${run_id}" || \
-    echo "[WARN] Could not generate aggregate statistics for ${run_id}." >&2
+  if [[ "${RECORD_STATISTICS}" == "1" ]]; then
+    python3 "${REPO_DIR}/scripts/summarize_benchmark.py" \
+      --run-dir "${run_dir}" --run-id "${run_id}" || \
+      echo "[WARN] Could not generate aggregate statistics for ${run_id}." >&2
+  fi
 
   ground_truth_collision_free=""
   if [[ -s "${ground_truth_file}" ]]; then

@@ -36,7 +36,7 @@ def generate_launch_description():
     yaw_arg = DeclareLaunchArgument('yaw', default_value='180', description='Initial yaw angle of the quadrotor')
     namespace_arg = DeclareLaunchArgument('namespace', default_value='NX01', description='Namespace of the nodes') # namespace
     data_file_arg = DeclareLaunchArgument('data_file', default_value='', description='File name to store data')
-    global_planner_arg = DeclareLaunchArgument('global_planner', default_value='sjps', description='Global planner to use') # global planner
+    global_planner_arg = DeclareLaunchArgument('global_planner', default_value='astar_heat', description='Global planner to use') # global planner
     use_benchmark_arg = DeclareLaunchArgument('use_benchmark', default_value='false', description='Flag to indicate whether to use the global planner benchmark') # global planner benchmark
     use_hardware_arg = DeclareLaunchArgument('use_hardware', default_value='false', description='Flag to indicate whether to use hardware or simulation') # flag to indicte if this is hardware or simulation
     publish_odom_arg  = DeclareLaunchArgument('publish_odom', default_value='true')

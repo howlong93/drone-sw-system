@@ -25,7 +25,6 @@ std::ofstream& hgp_debug_log() {
     if (s.is_open()) {
       s << std::fixed << std::setprecision(4);
       s << "# event | start_w | goal_w | start_int | goal_int_orig | goal_int_clamped | dim | origin | path_size | path_front_w | path_back_w\n";
-      s.flush();
     }
   }
   return s;
@@ -571,7 +570,7 @@ bool HGPPlanner::plan(const Vecf<3>& start, const Vecf<3>& start_vel, const Vecf
 
   // Debug log: dump full HGP plan call (input start/goal voxels, clamping,
   // raw_path size, processed path size, path endpoints, map metadata).
-  if (auto& s = hgp_debug_log(); s.is_open()) {
+  if (planner_verbose_) if (auto& s = hgp_debug_log(); s.is_open()) {
     auto fmtv = [](const Vecf<3>& v) {
       std::ostringstream o;
       o << std::fixed << std::setprecision(3)
@@ -598,7 +597,6 @@ bool HGPPlanner::plan(const Vecf<3>& start, const Vecf<3>& start_vel, const Vecf
         << " back=" << fmtv(path_.back());
     }
     s << "\n";
-    s.flush();
   }
 
   return true;

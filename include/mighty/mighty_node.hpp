@@ -157,6 +157,7 @@ class MIGHTY_NODE : public rclcpp::Node {
   void recordData(const ReplanBenchmarkData& sample, double timestamp);
   void logData(bool final = true);
   void logTrajectoryData();
+  void updateHoverMonitor(double now_s, const Eigen::Vector3d& position, double speed);
   void setComputationTimesToZero();
   void constructFOVMarker();
   void retrieveData();
@@ -404,6 +405,43 @@ class MIGHTY_NODE : public rclcpp::Node {
     double hgp_recover_path_ms = 0.0;
   };
 
+  struct HoverEvent {
+    double start_elapsed_s = 0.0;
+    double duration_s = 0.0;
+    Eigen::Vector3d start_position{0.0, 0.0, 0.0};
+    Eigen::Vector3d end_position{0.0, 0.0, 0.0};
+    double min_speed_mps = std::numeric_limits<double>::infinity();
+    size_t plan_points_start = 0;
+    size_t plan_points_end = 0;
+    double last_replan_age_s = std::numeric_limits<double>::quiet_NaN();
+    bool last_replan_success = false;
+    bool last_hgp_success = false;
+    std::string last_replan_status = "none";
+    uint64_t replan_attempts_during = 0;
+    uint64_t replan_failures_during = 0;
+  };
+
+  struct PlanBufferEvent {
+    uint64_t replan_id = 0;
+    double start_elapsed_s = std::numeric_limits<double>::quiet_NaN();
+    double callback_wall_ms = 0.0;
+    double callback_gap_ms = std::numeric_limits<double>::quiet_NaN();
+    std::string status = "none";
+    bool success = false;
+    bool hgp_success = false;
+    size_t plan_points_start = 0;
+    size_t plan_points_at_k_selection = 0;
+    int k_value_selected = -1;
+    bool append_attempted = false;
+    bool append_inserted = false;
+    bool append_splice_expired = false;
+    size_t plan_points_at_append = 0;
+    size_t generated_plan_points = 0;
+    size_t plan_points_after_append = 0;
+    size_t plan_points_finish = 0;
+    size_t min_plan_points = 0;
+  };
+
   // Global Path Benchmarking
   std::string file_path_;
   std::vector<BenchmarkRow> global_path_benchmark_;
@@ -423,6 +461,33 @@ class MIGHTY_NODE : public rclcpp::Node {
   std::vector<Eigen::Vector3d> benchmark_safety_positions_;
   std::vector<double> benchmark_trajectory_elapsed_s_;
   std::mutex benchmark_trajectory_mutex_;
+  std::mutex benchmark_hover_mutex_;
+  std::vector<HoverEvent> benchmark_hover_events_;
+  std::mutex benchmark_plan_buffer_mutex_;
+  std::vector<PlanBufferEvent> benchmark_plan_buffer_events_;
+  uint64_t benchmark_plan_buffer_replan_id_ = 0;
+  bool benchmark_have_last_replan_end_wall_ = false;
+  double benchmark_last_replan_end_wall_s_ = 0.0;
+  bool benchmark_hover_active_ = false;
+  double benchmark_hover_start_time_s_ = 0.0;
+  Eigen::Vector3d benchmark_hover_start_position_{0.0, 0.0, 0.0};
+  Eigen::Vector3d benchmark_hover_last_position_{0.0, 0.0, 0.0};
+  double benchmark_hover_min_speed_mps_ = std::numeric_limits<double>::infinity();
+  size_t benchmark_hover_plan_points_start_ = 0;
+  double benchmark_hover_last_replan_age_s_ = std::numeric_limits<double>::quiet_NaN();
+  bool benchmark_hover_last_replan_success_ = false;
+  bool benchmark_hover_last_hgp_success_ = false;
+  std::string benchmark_hover_last_replan_status_ = "none";
+  uint64_t benchmark_hover_replan_attempts_start_ = 0;
+  uint64_t benchmark_hover_replan_failures_start_ = 0;
+  uint64_t benchmark_replan_attempts_total_ = 0;
+  uint64_t benchmark_replan_failures_total_ = 0;
+  double benchmark_latest_replan_time_s_ = std::numeric_limits<double>::quiet_NaN();
+  bool benchmark_latest_replan_success_ = false;
+  bool benchmark_latest_hgp_success_ = false;
+  std::string benchmark_latest_replan_status_ = "none";
+  double benchmark_hover_speed_threshold_mps_ = 0.1;
+  double benchmark_hover_min_duration_s_ = 0.3;
   uint64_t benchmark_local_goal_occupied_ = 0;
   uint64_t benchmark_local_goal_relocated_ = 0;
   uint64_t benchmark_local_goal_relocation_failed_ = 0;
@@ -490,6 +555,8 @@ class MIGHTY_NODE : public rclcpp::Node {
   bool replan_timer_started_ = false;        // Replan timer started
   bool use_benchmark_ = false;               // Use benchmark
   bool benchmark_replan_details_ = false;    // Expensive per-replan audit metrics
+  // Hover monitoring is sampled with the 10 Hz trajectory recorder.
+  // It never writes from stateCallback.
 
   // Actual-trajectory history for visualization (sando-style: a single
   // persistent LINE_STRIP marker built from a bounded history of past states,

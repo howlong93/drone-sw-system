@@ -67,6 +67,18 @@ struct ReplanBenchmarkData {
   double append_plan_ms = 0.0;
   double final_housekeeping_ms = 0.0;
 
+  // Lightweight trajectory-buffer diagnostics. These remain enabled when the
+  // expensive per-replan benchmark details are disabled.
+  size_t plan_points_start = 0;
+  size_t plan_points_at_k_selection = 0;
+  int k_value_selected = -1;
+  bool append_attempted = false;
+  bool append_inserted = false;
+  bool append_splice_expired = false;
+  size_t plan_points_at_append = 0;
+  size_t generated_plan_points = 0;
+  size_t plan_points_after_append = 0;
+
   double current_x = 0.0, current_y = 0.0, current_z = 0.0;
   double local_goal_x = 0.0, local_goal_y = 0.0, local_goal_z = 0.0;
   double terminal_goal_x = 0.0, terminal_goal_y = 0.0, terminal_goal_z = 0.0;
@@ -435,6 +447,9 @@ class MIGHTY {
    *  @param goal_setpoints Output vector of goal states.
    */
   void retrieveGoalSetpoints(std::vector<state>& goal_setpoints);
+
+  /** @brief Return the number of setpoints currently buffered for execution. */
+  size_t getPlanSize();
 
   /** @brief Retrieve sub-optimal goal setpoint lists from multi-initial-guess optimization.
    *  @param list_subopt_goal_setpoints Output list of sub-optimal goal state vectors.

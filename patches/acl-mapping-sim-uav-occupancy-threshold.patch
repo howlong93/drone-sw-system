@@ -1,0 +1,11 @@
+diff --git a/global_mapper_ros/cfg/sim_uav.yaml b/global_mapper_ros/cfg/sim_uav.yaml
+index bf278d7..bcdf193 100644
+--- a/global_mapper_ros/cfg/sim_uav.yaml
++++ b/global_mapper_ros/cfg/sim_uav.yaml
+@@ -27,3 +27,5 @@
+           miss_inc: -0.4
+-          occupancy_threshold: 0.6  # [0.0, 1.0]
++          # OccupancyGrid uses value > threshold. From init=-1 with hit=+0.4,
++          # 0.1 makes the third uninterrupted hit occupied.
++          occupancy_threshold: 0.1  # [0.0, 1.0]
+           publish_occupancy_grid: true

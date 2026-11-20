@@ -234,6 +234,11 @@ RUN if [ "${MIGHTY_SOURCE}" = "local" ]; then \
         "Updating existing checkouts to the pinned versions is the whole point of" \
         "building from the local tree, so pay the extra fetch." && \
       vcs import ${MIGHTY_WS}/src < ${MIGHTY_WS}/src/mighty/mighty.repos && \
+      : "Apply MIGHTY-owned parameter overrides to pinned third-party sources" \
+        "before rebuilding, so the runtime install and the source-controlled" \
+        "experiment definition cannot drift apart." && \
+      git -C ${MIGHTY_WS}/src/acl-mapping apply \
+        ${MIGHTY_WS}/src/mighty/patches/acl-mapping-sim-uav-occupancy-threshold.patch && \
       : "vcs re-clones the three deps that were MOVED to their own workspaces" \
         "above (they are absent from mighty_ws/src, so --skip-existing does not" \
         "skip them). Drop the copies again, or colcon tries to build them here" \

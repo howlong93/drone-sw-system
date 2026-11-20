@@ -38,8 +38,8 @@ for coordinate_name in GOAL_X GOAL_Y GOAL_Z; do
   fi
 done
 
-if ! command -v script >/dev/null 2>&1 || ! command -v timeout >/dev/null 2>&1; then
-  echo "[ERROR] This runner requires util-linux 'script' and GNU 'timeout'." >&2
+if ! command -v timeout >/dev/null 2>&1; then
+  echo "[ERROR] This runner requires GNU 'timeout'." >&2
   exit 1
 fi
 
@@ -85,6 +85,7 @@ for ((index = 1; index <= COUNT; index++)); do
     "AUTO_EXIT_DELAY=${AUTO_EXIT_DELAY}"
     "GPU=${GPU}"
     "MIGHTY_IMAGE=${MIGHTY_IMAGE}"
+    "FORCE_TTY=1"
   )
   for coordinate_name in GOAL_X GOAL_Y GOAL_Z; do
     if [[ -n "${!coordinate_name:-}" ]]; then
@@ -92,21 +93,18 @@ for ((index = 1; index <= COUNT; index++)); do
     fi
   done
   command_parts+=("${REPO_DIR}/run_gazebo_forest.sh" "${RVIZ_GUI}" "${GAZEBO_GUI}")
-  printf -v run_command '%q ' "${command_parts[@]}"
 
-  resource_file="${run_dir}/${run_id}_resources.csv"
-  gpu_resource_file="${run_dir}/${run_id}_gpu_resources.csv"
   flight_marker="${run_dir}/${run_id}_planner_flight_started.marker"
-  printf 'timestamp,cpu_percent,memory_usage,memory_percent,pids,network_io,block_io\n' > "${resource_file}"
-  printf 'timestamp,gpu_utilization_percent,gpu_memory_used_mib\n' > "${gpu_resource_file}"
 
+  # Minimal benchmark mode: avoid a PTY, full console capture, and resource
+  # polling during flight. Normal output is discarded; rare stderr output is
+  # retained for diagnosis. Flight metrics remain in memory until finalization.
   timeout --signal=INT --kill-after=30 "${TIMEOUT_S}" \
-    script --quiet --return --command "${run_command}" "${run_dir}/${run_id}_console.log" &
+    "${command_parts[@]}" >/dev/null 2>"${run_dir}/${run_id}_errors.log" &
   runner_pid=$!
 
   flight_started_epoch=""
   flight_timeout=0
-  resource_sample_due=0
   while kill -0 "${runner_pid}" >/dev/null 2>&1; do
     now_epoch="$(date +%s)"
     if [[ -z "${flight_started_epoch}" && -s "${flight_marker}" ]]; then
@@ -117,25 +115,38 @@ for ((index = 1; index <= COUNT; index++)); do
        awk -v now="${now_epoch}" -v start="${flight_started_epoch}" -v limit="${FLIGHT_TIMEOUT_S}" \
          'BEGIN { exit !((now - start) >= limit) }'; then
       flight_timeout=1
-      echo "[WARN] Flight timeout reached for ${run_id}; requesting graceful shutdown." >&2
+      echo "[WARN] Flight timeout reached for ${run_id}; finalizing benchmark data." >&2
+
+      # Stop the planner node first, rather than stopping Docker's PID 1
+      # immediately. MIGHTY writes the in-memory executed trajectory and
+      # summary from its destructor, allowing the host-side ground-truth
+      # validator to produce an overlay even for timed-out missions. This is a
+      # one-time timeout operation and adds no I/O to the flight loop.
+      docker exec "${container_name}" pkill --signal SIGINT --exact mighty \
+        >/dev/null 2>&1 || true
+
+      if [[ "${RECORD_STATISTICS}" == "1" ]]; then
+        timeout_finalize_complete=0
+        for _ in {1..20}; do
+          if [[ -s "${run_dir}/${run_id}_planner_trajectory.csv" &&
+                -s "${run_dir}/${run_id}_planner_summary.csv" ]]; then
+            timeout_finalize_complete=1
+            break
+          fi
+          sleep 1
+        done
+        if (( timeout_finalize_complete == 0 )); then
+          echo "[WARN] Timed-out planner did not finish benchmark finalization within 20 seconds." >&2
+        fi
+      else
+        # Give rclcpp a short grace period even when no statistics are enabled.
+        sleep 2
+      fi
+
+      echo "[WARN] Benchmark finalization requested; stopping the simulation container." >&2
       docker kill --signal=SIGINT "${container_name}" >/dev/null 2>&1 || true
       kill -INT "${runner_pid}" >/dev/null 2>&1 || true
       break
-    fi
-
-    if (( resource_sample_due <= now_epoch )); then
-      sample_time="$(date --iso-8601=seconds)"
-      if docker container inspect "${container_name}" >/dev/null 2>&1; then
-        docker stats --no-stream \
-          --format "${sample_time},{{.CPUPerc}},{{.MemUsage}},{{.MemPerc}},{{.PIDs}},{{.NetIO}},{{.BlockIO}}" \
-          "${container_name}" >> "${resource_file}" 2>/dev/null || true
-      fi
-      if [[ "${GPU}" == "1" ]] && command -v nvidia-smi >/dev/null 2>&1; then
-        gpu_sample="$(nvidia-smi --query-gpu=utilization.gpu,memory.used \
-          --format=csv,noheader,nounits 2>/dev/null | head -n 1 | tr -d ' ')"
-        [[ -n "${gpu_sample}" ]] && printf '%s,%s\n' "${sample_time}" "${gpu_sample}" >> "${gpu_resource_file}"
-      fi
-      resource_sample_due=$((now_epoch + 5))
     fi
     sleep 1
   done

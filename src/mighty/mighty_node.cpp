@@ -13,6 +13,7 @@
 #include <mighty/frontier_manager.hpp>
 #include <mighty/visited_map.hpp>
 
+#include <chrono>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
@@ -23,7 +24,7 @@ namespace mighty {
 
 // Debug log: writes every published /goal and every received /term_goal to a
 // file so the dip-toward-origin bug can be analyzed offline. Set debug_log_file
-// to "" in the YAML to disable.
+// to "" in the YAML to disable. Writes are buffered; no control callback flushes.
 namespace {
 double& debug_log_t0() {
   static double t0 = 0.0;
@@ -41,7 +42,6 @@ void debug_log_open(const std::string& path) {
     if (s.is_open()) {
       s << std::fixed << std::setprecision(4);
       s << "# t_rel_sec | event | px | py | pz | extra\n";
-      s.flush();
     }
   }
 }
@@ -529,6 +529,8 @@ void MIGHTY_NODE::declareParameters() {
   this->declare_parameter("file_path", "/home/kkondo/code/dynus_ws/src/dynus/data/data.txt");
   this->declare_parameter("use_benchmark", false);
   this->declare_parameter("benchmark_replan_details", false);
+  this->declare_parameter("benchmark_hover_speed_threshold_mps", 0.1);
+  this->declare_parameter("benchmark_hover_min_duration_s", 0.3);
   this->declare_parameter("start_yaw", -90.0);
   this->declare_parameter("global_planner", "sjps");
   this->declare_parameter("global_planner_verbose", false);
@@ -883,6 +885,10 @@ void MIGHTY_NODE::setParameters() {
   file_path_ = this->get_parameter("file_path").as_string();
   use_benchmark_ = this->get_parameter("use_benchmark").as_bool();
   benchmark_replan_details_ = this->get_parameter("benchmark_replan_details").as_bool();
+  benchmark_hover_speed_threshold_mps_ =
+      this->get_parameter("benchmark_hover_speed_threshold_mps").as_double();
+  benchmark_hover_min_duration_s_ =
+      this->get_parameter("benchmark_hover_min_duration_s").as_double();
   par_.global_planner = this->get_parameter("global_planner").as_string();
   par_.global_planner_verbose = this->get_parameter("global_planner_verbose").as_bool();
   par_.global_planner_heuristic_weight =
@@ -1534,16 +1540,12 @@ void MIGHTY_NODE::stateCallback(const dynus_interfaces::msg::State::SharedPtr ms
     const double now_s = this->now().seconds();
     if (now_s - benchmark_last_clearance_sample_time_ >= 0.1) {
       benchmark_last_clearance_sample_time_ = now_s;
-      bool flush_trajectory = false;
       {
         std::lock_guard<std::mutex> lock(benchmark_trajectory_mutex_);
         benchmark_safety_positions_.push_back(position);
         benchmark_trajectory_elapsed_s_.push_back(now_s - benchmark_flight_start_time_s_);
-        flush_trajectory = benchmark_safety_positions_.size() % 100 == 0;
       }
-      // Append once per ~10 seconds. This keeps timeout data recoverable while
-      // avoiding per-sample filesystem activity in the state callback.
-      if (flush_trajectory) logTrajectoryData();
+      updateHoverMonitor(now_s, position, velocity.norm());
     }
   }
 
@@ -1600,6 +1602,16 @@ void MIGHTY_NODE::stateCallback(const dynus_interfaces::msg::State::SharedPtr ms
  * @brief Callback function for replanning
  */
 void MIGHTY_NODE::replanCallback() {
+  const double callback_wall_start_s =
+      std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+  double callback_gap_ms = std::numeric_limits<double>::quiet_NaN();
+  if (use_benchmark_ && benchmark_goal_active_) {
+    std::lock_guard<std::mutex> lock(benchmark_plan_buffer_mutex_);
+    if (benchmark_have_last_replan_end_wall_)
+      callback_gap_ms =
+          (callback_wall_start_s - benchmark_last_replan_end_wall_s_) * 1000.0;
+  }
+
   // Get the current time as double
   double current_time = this->now().seconds();
 
@@ -1615,6 +1627,42 @@ void MIGHTY_NODE::replanCallback() {
   auto [replanning_result, hgp_result] =
       mighty_ptr_->replan(replanning_computation_time_, current_time);
   const ReplanBenchmarkData benchmark_sample = mighty_ptr_->getReplanBenchmarkData();
+  const double callback_wall_end_s =
+      std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+
+  if (use_benchmark_ && benchmark_goal_active_ && benchmark_sample.attempted) {
+    PlanBufferEvent event;
+    if (std::isfinite(benchmark_flight_start_time_s_))
+      event.start_elapsed_s = current_time - benchmark_flight_start_time_s_;
+    event.callback_wall_ms = (callback_wall_end_s - callback_wall_start_s) * 1000.0;
+    event.callback_gap_ms = callback_gap_ms;
+    event.status = benchmark_sample.status;
+    event.success = replanning_result;
+    event.hgp_success = hgp_result;
+    event.plan_points_start = benchmark_sample.plan_points_start;
+    event.plan_points_at_k_selection = benchmark_sample.plan_points_at_k_selection;
+    event.k_value_selected = benchmark_sample.k_value_selected;
+    event.append_attempted = benchmark_sample.append_attempted;
+    event.append_inserted = benchmark_sample.append_inserted;
+    event.append_splice_expired = benchmark_sample.append_splice_expired;
+    event.plan_points_at_append = benchmark_sample.plan_points_at_append;
+    event.generated_plan_points = benchmark_sample.generated_plan_points;
+    event.plan_points_after_append = benchmark_sample.plan_points_after_append;
+    event.plan_points_finish = mighty_ptr_->getPlanSize();
+    event.min_plan_points = std::min(event.plan_points_start, event.plan_points_finish);
+    if (event.append_attempted)
+      event.min_plan_points = std::min(event.min_plan_points, event.plan_points_at_append);
+    {
+      std::lock_guard<std::mutex> lock(benchmark_plan_buffer_mutex_);
+      event.replan_id = ++benchmark_plan_buffer_replan_id_;
+      benchmark_plan_buffer_events_.push_back(std::move(event));
+    }
+  }
+  if (use_benchmark_ && benchmark_goal_active_) {
+    std::lock_guard<std::mutex> lock(benchmark_plan_buffer_mutex_);
+    benchmark_have_last_replan_end_wall_ = true;
+    benchmark_last_replan_end_wall_s_ = callback_wall_end_s;
+  }
 
   // Republish the terminal goal marker so RViz tracks any in-replan
   // relocation done by sanitizeTerminalGoal (e.g. when an obstacle gets
@@ -1659,7 +1707,6 @@ void MIGHTY_NODE::replanCallback() {
       if (gp.size() >= 4) dump(gp.size() - 1);
       s << "\n";
     }
-    s.flush();
   }
 
   // Frontier-unreachable detection: if the global planner consistently fails
@@ -1726,6 +1773,16 @@ void MIGHTY_NODE::replanCallback() {
     pub_command_to_exec_time_->publish(time_msg);
     waiting_for_first_traj_ = false;
     RCLCPP_INFO(this->get_logger(), "Command to execution time: %.2f ms", command_to_exec_time_ms);
+  }
+
+  if (use_benchmark_ && benchmark_goal_active_ && benchmark_sample.attempted) {
+    std::lock_guard<std::mutex> lock(benchmark_hover_mutex_);
+    benchmark_latest_replan_time_s_ = current_time;
+    benchmark_latest_replan_success_ = replanning_result;
+    benchmark_latest_hgp_success_ = hgp_result;
+    benchmark_latest_replan_status_ = benchmark_sample.status;
+    ++benchmark_replan_attempts_total_;
+    if (!replanning_result) ++benchmark_replan_failures_total_;
   }
 
   // Throttle the visualization block to ~20 Hz. The replan loop is 100 Hz
@@ -1868,7 +1925,6 @@ void MIGHTY_NODE::terminalGoalCallbackImpl(const geometry_msgs::msg::PoseStamped
       << " from_user=" << (from_user ? 1 : 0)
       << " frame=" << msg.header.frame_id
       << "\n";
-    s.flush();
   }
 
   if (from_user) {
@@ -1897,6 +1953,27 @@ void MIGHTY_NODE::terminalGoalCallbackImpl(const geometry_msgs::msg::PoseStamped
         benchmark_safety_positions_.reserve(4096);
         benchmark_trajectory_elapsed_s_.clear();
         benchmark_trajectory_elapsed_s_.reserve(4096);
+      }
+      {
+        std::lock_guard<std::mutex> lock(benchmark_hover_mutex_);
+        benchmark_hover_events_.clear();
+        benchmark_hover_events_.reserve(128);
+        benchmark_hover_active_ = false;
+        benchmark_hover_min_speed_mps_ = std::numeric_limits<double>::infinity();
+        benchmark_replan_attempts_total_ = 0;
+        benchmark_replan_failures_total_ = 0;
+        benchmark_latest_replan_time_s_ = std::numeric_limits<double>::quiet_NaN();
+        benchmark_latest_replan_success_ = false;
+        benchmark_latest_hgp_success_ = false;
+        benchmark_latest_replan_status_ = "none";
+      }
+      {
+        std::lock_guard<std::mutex> lock(benchmark_plan_buffer_mutex_);
+        benchmark_plan_buffer_events_.clear();
+        benchmark_plan_buffer_events_.reserve(4096);
+        benchmark_plan_buffer_replan_id_ = 0;
+        benchmark_have_last_replan_end_wall_ = false;
+        benchmark_last_replan_end_wall_s_ = 0.0;
       }
       benchmark_local_goal_occupied_ = 0;
       benchmark_local_goal_relocated_ = 0;
@@ -2423,7 +2500,8 @@ void MIGHTY_NODE::setComputationTimesToZero() {
   safety_check_time_ = 0.0;
   yaw_sequence_time_ = 0.0;
   yaw_fitting_time_ = 0.0;
-  replanning_computation_time_ = 0.0;
+  // Keep replanning_computation_time_: it is the previous callback's duration
+  // and is required across replans by adaptive k-value buffer reservation.
 }
 
 // ----------------------------------------------------------------------------
@@ -2599,6 +2677,40 @@ void MIGHTY_NODE::logData(bool final) {
   // host-side after Gazebo exits and therefore cannot perturb replanning.
   logTrajectoryData();
 
+  std::vector<HoverEvent> hover_events;
+  {
+    std::lock_guard<std::mutex> lock(benchmark_hover_mutex_);
+    if (benchmark_hover_active_) {
+      const double now_s = this->now().seconds();
+      const double duration_s = now_s - benchmark_hover_start_time_s_;
+      if (duration_s >= benchmark_hover_min_duration_s_) {
+        HoverEvent event;
+        event.start_elapsed_s = benchmark_hover_start_time_s_ - benchmark_flight_start_time_s_;
+        event.duration_s = duration_s;
+        event.start_position = benchmark_hover_start_position_;
+        event.end_position = benchmark_hover_last_position_;
+        event.min_speed_mps = benchmark_hover_min_speed_mps_;
+        event.plan_points_start = benchmark_hover_plan_points_start_;
+        event.plan_points_end = mighty_ptr_->getPlanSize();
+        event.last_replan_age_s = benchmark_hover_last_replan_age_s_;
+        event.last_replan_success = benchmark_hover_last_replan_success_;
+        event.last_hgp_success = benchmark_hover_last_hgp_success_;
+        event.last_replan_status = benchmark_hover_last_replan_status_;
+        event.replan_attempts_during = benchmark_replan_attempts_total_ - benchmark_hover_replan_attempts_start_;
+        event.replan_failures_during = benchmark_replan_failures_total_ - benchmark_hover_replan_failures_start_;
+        benchmark_hover_events_.push_back(event);
+      }
+      benchmark_hover_active_ = false;
+    }
+    hover_events = benchmark_hover_events_;
+  }
+
+  std::vector<PlanBufferEvent> plan_buffer_events;
+  {
+    std::lock_guard<std::mutex> lock(benchmark_plan_buffer_mutex_);
+    plan_buffer_events = benchmark_plan_buffer_events_;
+  }
+
   size_t trajectory_sample_count = 0;
   {
     std::lock_guard<std::mutex> lock(benchmark_trajectory_mutex_);
@@ -2631,6 +2743,20 @@ void MIGHTY_NODE::logData(bool final) {
   std::ofstream summary_file(summary_path);
   if (summary_file.is_open()) {
     const bool mission_success = std::isfinite(benchmark_goal_to_reached_ms_);
+    double hover_total_duration_s = 0.0;
+    double hover_max_duration_s = 0.0;
+    for (const auto& event : hover_events) {
+      hover_total_duration_s += event.duration_s;
+      hover_max_duration_s = std::max(hover_max_duration_s, event.duration_s);
+    }
+    size_t append_inserted_count = 0;
+    size_t append_splice_expired_count = 0;
+    size_t min_plan_points = std::numeric_limits<size_t>::max();
+    for (const auto& event : plan_buffer_events) {
+      append_inserted_count += event.append_inserted;
+      append_splice_expired_count += event.append_splice_expired;
+      min_plan_points = std::min(min_plan_points, event.min_plan_points);
+    }
     const int corridor_safe = benchmark_replan_details_
                                   ? (successes > 0 && accepted_corridor_violations == 0)
                                   : -1;
@@ -2647,10 +2773,18 @@ void MIGHTY_NODE::logData(bool final) {
                  << "executed_trajectory_safe,-1\n"
                  << "collision_validation_source,external_gazebo_world_ground_truth\n"
                  << "replan_details_enabled," << benchmark_replan_details_ << '\n'
+                 << "plan_buffer_events," << plan_buffer_events.size() << '\n'
+                 << "plan_append_inserted," << append_inserted_count << '\n'
+                 << "plan_append_splice_expired," << append_splice_expired_count << '\n'
+                 << "plan_buffer_min_points,"
+                 << (plan_buffer_events.empty() ? 0 : min_plan_points) << '\n'
                  << "required_center_clearance_m," << mighty_ptr_->benchmarkSafetyClearance() << '\n'
                  << "mission_goal_to_reached_ms," << benchmark_goal_to_reached_ms_ << '\n'
                  << "flight_start_to_reached_ms," << benchmark_flight_start_to_reached_ms_ << '\n'
                  << "command_to_first_trajectory_ms," << benchmark_command_to_execution_ms_ << '\n'
+                 << "hover_event_count," << hover_events.size() << '\n'
+                 << "hover_total_duration_s," << hover_total_duration_s << '\n'
+                 << "hover_max_duration_s," << hover_max_duration_s << '\n'
                  << "trajectory_samples_recorded," << trajectory_sample_count << '\n'
                  << "executed_path_length_m," << benchmark_executed_path_length_ << '\n'
                  << "max_executed_velocity," << benchmark_max_executed_velocity_ << '\n'
@@ -2685,7 +2819,114 @@ void MIGHTY_NODE::logData(bool final) {
     for (const auto& [status, count] : status_counts)
       summary_file << "status_" << status << ',' << count << '\n';
   }
+
+  std::string hover_path = file_path_;
+  const auto hover_extension = hover_path.rfind(".csv");
+  if (hover_extension != std::string::npos)
+    hover_path.replace(hover_extension, 4, "_hover_events.csv");
+  else
+    hover_path += "_hover_events.csv";
+  std::ofstream hover_file(hover_path, std::ios::trunc);
+  if (hover_file.is_open()) {
+    hover_file << "event_index,start_elapsed_s,duration_s,start_x_m,start_y_m,start_z_m,"
+                  "end_x_m,end_y_m,end_z_m,min_speed_mps,plan_points_start,plan_points_end,"
+                  "last_replan_age_s,last_replan_success,last_hgp_success,last_replan_status,"
+                  "replan_attempts_during,replan_failures_during\n";
+    for (size_t i = 0; i < hover_events.size(); ++i) {
+      const auto& e = hover_events[i];
+      hover_file << (i + 1) << ',' << e.start_elapsed_s << ',' << e.duration_s << ','
+                 << e.start_position.x() << ',' << e.start_position.y() << ','
+                 << e.start_position.z() << ',' << e.end_position.x() << ','
+                 << e.end_position.y() << ',' << e.end_position.z() << ','
+                 << e.min_speed_mps << ',' << e.plan_points_start << ',' << e.plan_points_end
+                 << ',' << e.last_replan_age_s << ',' << e.last_replan_success << ','
+                 << e.last_hgp_success << ',' << e.last_replan_status << ','
+                 << e.replan_attempts_during << ',' << e.replan_failures_during << '\n';
+    }
+  }
+
+  std::string buffer_path = file_path_;
+  const auto buffer_extension = buffer_path.rfind(".csv");
+  if (buffer_extension != std::string::npos)
+    buffer_path.replace(buffer_extension, 4, "_buffer_events.csv");
+  else
+    buffer_path += "_buffer_events.csv";
+  std::ofstream buffer_file(buffer_path, std::ios::trunc);
+  if (buffer_file.is_open()) {
+    buffer_file
+        << "replan_id,start_elapsed_s,callback_wall_ms,callback_gap_ms,status,success,"
+           "hgp_success,plan_points_start,plan_points_at_k_selection,k_value_selected,"
+           "append_attempted,append_inserted,append_splice_expired,plan_points_at_append,"
+           "generated_plan_points,plan_points_after_append,plan_points_finish,min_plan_points\n";
+    for (const auto& event : plan_buffer_events) {
+      buffer_file << event.replan_id << ',' << event.start_elapsed_s << ','
+                  << event.callback_wall_ms << ',' << event.callback_gap_ms << ','
+                  << event.status << ',' << event.success << ',' << event.hgp_success << ','
+                  << event.plan_points_start << ',' << event.plan_points_at_k_selection << ','
+                  << event.k_value_selected << ',' << event.append_attempted << ','
+                  << event.append_inserted << ',' << event.append_splice_expired << ','
+                  << event.plan_points_at_append << ',' << event.generated_plan_points << ','
+                  << event.plan_points_after_append << ',' << event.plan_points_finish << ','
+                  << event.min_plan_points << '\n';
+    }
+  }
   benchmark_logged_ = true;
+}
+
+// ----------------------------------------------------------------------------
+
+void MIGHTY_NODE::updateHoverMonitor(double now_s, const Eigen::Vector3d& position,
+                                     double speed) {
+  state terminal_goal;
+  mighty_ptr_->getGterm(terminal_goal);
+  const bool away_from_goal = (position - terminal_goal.pos).norm() > par_.goal_radius;
+  const bool below_speed = speed <= benchmark_hover_speed_threshold_mps_;
+
+  std::lock_guard<std::mutex> lock(benchmark_hover_mutex_);
+  if (below_speed && away_from_goal) {
+    if (!benchmark_hover_active_) {
+      benchmark_hover_active_ = true;
+      benchmark_hover_start_time_s_ = now_s;
+      benchmark_hover_start_position_ = position;
+      benchmark_hover_min_speed_mps_ = speed;
+      benchmark_hover_plan_points_start_ = mighty_ptr_->getPlanSize();
+      benchmark_hover_last_replan_age_s_ =
+          std::isfinite(benchmark_latest_replan_time_s_)
+              ? now_s - benchmark_latest_replan_time_s_
+              : std::numeric_limits<double>::quiet_NaN();
+      benchmark_hover_last_replan_success_ = benchmark_latest_replan_success_;
+      benchmark_hover_last_hgp_success_ = benchmark_latest_hgp_success_;
+      benchmark_hover_last_replan_status_ = benchmark_latest_replan_status_;
+      benchmark_hover_replan_attempts_start_ = benchmark_replan_attempts_total_;
+      benchmark_hover_replan_failures_start_ = benchmark_replan_failures_total_;
+    }
+    benchmark_hover_last_position_ = position;
+    benchmark_hover_min_speed_mps_ = std::min(benchmark_hover_min_speed_mps_, speed);
+    return;
+  }
+
+  if (!benchmark_hover_active_) return;
+  const double duration_s = now_s - benchmark_hover_start_time_s_;
+  if (duration_s >= benchmark_hover_min_duration_s_) {
+    HoverEvent event;
+    event.start_elapsed_s = benchmark_hover_start_time_s_ - benchmark_flight_start_time_s_;
+    event.duration_s = duration_s;
+    event.start_position = benchmark_hover_start_position_;
+    event.end_position = benchmark_hover_last_position_;
+    event.min_speed_mps = benchmark_hover_min_speed_mps_;
+    event.plan_points_start = benchmark_hover_plan_points_start_;
+    event.plan_points_end = mighty_ptr_->getPlanSize();
+    event.last_replan_age_s = benchmark_hover_last_replan_age_s_;
+    event.last_replan_success = benchmark_hover_last_replan_success_;
+    event.last_hgp_success = benchmark_hover_last_hgp_success_;
+    event.last_replan_status = benchmark_hover_last_replan_status_;
+    event.replan_attempts_during =
+        benchmark_replan_attempts_total_ - benchmark_hover_replan_attempts_start_;
+    event.replan_failures_during =
+        benchmark_replan_failures_total_ - benchmark_hover_replan_failures_start_;
+    benchmark_hover_events_.push_back(event);
+  }
+  benchmark_hover_active_ = false;
 }
 
 // ----------------------------------------------------------------------------
@@ -2715,7 +2956,6 @@ void MIGHTY_NODE::logTrajectoryData() {
     trajectory_file << benchmark_trajectory_elapsed_s_[i] << ',' << position.x() << ','
                     << position.y() << ',' << position.z() << '\n';
   }
-  trajectory_file.flush();
   benchmark_trajectory_rows_flushed_ = sample_count;
 }
 
@@ -3019,7 +3259,6 @@ void MIGHTY_NODE::publishGoal() {
         << " G=" << gsub.pos.x() << "," << gsub.pos.y() << "," << gsub.pos.z()
         << " Gterm=" << gterm.pos.x() << "," << gterm.pos.y() << "," << gterm.pos.z()
         << "\n";
-      s.flush();
     }
 
     // Publish the goal (setpoint) for visualization

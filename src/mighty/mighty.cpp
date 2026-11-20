@@ -437,6 +437,9 @@ bool MIGHTY::findAandAtime(state& A, double& A_time, double current_time,
           plan_size - 1;  // If k_value_ is larger than the plan size, we set it to the last state
     }
 
+    benchmark_data_.plan_points_at_k_selection = static_cast<size_t>(plan_size);
+    benchmark_data_.k_value_selected = k_value_;
+
     // Get A
     {
       std::lock_guard<std::mutex> lock(mtx_plan_);
@@ -825,6 +828,13 @@ void MIGHTY::retrieveGoalSetpoints(std::vector<state>& goal_setpoints) {
 
 // ----------------------------------------------------------------------------
 
+size_t MIGHTY::getPlanSize() {
+  std::lock_guard<std::mutex> lock(mtx_plan_);
+  return plan_.size();
+}
+
+// ----------------------------------------------------------------------------
+
 void MIGHTY::retrieveListSubOptGoalSetpoints(
     std::vector<std::vector<state>>& list_subopt_goal_setpoints) {
   list_subopt_goal_setpoints = list_subopt_goal_setpoints_;
@@ -867,6 +877,7 @@ std::tuple<bool, bool> MIGHTY::replan(double last_replaning_computation_time, do
   getState(local_state);
   getGterm(local_G_term);
   getLastPlanState(last_plan_state);
+  benchmark_data_.plan_points_start = getPlanSize();
   benchmark_data_.current_x = local_state.pos.x();
   benchmark_data_.current_y = local_state.pos.y();
   benchmark_data_.current_z = local_state.pos.z();
@@ -1719,12 +1730,17 @@ bool MIGHTY::appendToPlan() {
   {
     std::lock_guard<std::mutex> lock(mtx_plan_);
 
+    benchmark_data_.append_attempted = true;
+    benchmark_data_.generated_plan_points = goal_setpoints_.size();
+
     // get the size of the plan and plan_safe_paths
     int plan_size = plan_.size();
+    benchmark_data_.plan_points_at_append = static_cast<size_t>(plan_size);
 
     // If the plan size is less than k_value_, which means we already passed point A, we cannot use
     // this plan
     if (plan_size < k_value_) {
+      benchmark_data_.append_splice_expired = true;
       if (par_.debug_verbose)
         std::cout << bold << red << "(plan_size - k_value_) = " << (plan_size - k_value_) << " < 0"
                   << reset << std::endl;
@@ -1734,7 +1750,9 @@ bool MIGHTY::appendToPlan() {
     {
       plan_.erase(plan_.end() - k_value_, plan_.end());
       plan_.insert(plan_.end(), goal_setpoints_.begin(), goal_setpoints_.end());
+      benchmark_data_.append_inserted = true;
     }
+    benchmark_data_.plan_points_after_append = plan_.size();
   }
 
   // k_value adaptation initialization

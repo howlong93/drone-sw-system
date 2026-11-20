@@ -295,7 +295,7 @@ mighty_node:
         debug_verbose: false                            # [-] General debug output
         closed_form_traj_verbose: false                 # [-] Closed-form trajectory debug
         verbose_computation_time: false                 # [-] Print computation times
-        debug_log_file: "/tmp/mighty_debug.log"         # [path] dump every published goal & received term_goal here ("" disables)
+        debug_log_file: ""                              # [path] empty disables high-rate debug I/O
 
         # --- Paper Visualization (development only) ---
         use_state_update: true                          # [-] Use state update (false = freeze agent for viz)
@@ -305,6 +305,8 @@ mighty_node:
         # --- Benchmarking ---
         use_benchmark: true                             # [-] Enable benchmarking data logging
         benchmark_replan_details: false                 # [-] Optional heavy per-replan audit metrics
+        benchmark_hover_speed_threshold_mps: 0.1        # [m/s] low-speed threshold for hover events
+        benchmark_hover_min_duration_s: 0.3             # [s] minimum low-speed duration recorded as a hover
         file_path: ""                                   # Path to save benchmark CSV
         use_only_global_planner: false                  # [-] Use only global planner for benchmarking
 

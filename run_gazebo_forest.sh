@@ -6,10 +6,10 @@ set -Eeuo pipefail
 # User configuration (edit these values for the next test batch)
 # =============================================================================
 TEST_RUN_COUNT="${TEST_RUN_COUNT:-10}"  # Number of simulation runs
-RVIZ_GUI_DEFAULT="${RVIZ_GUI_DEFAULT:-1}"  # 1: enable RViz, 0: disable
+RVIZ_GUI_DEFAULT="${RVIZ_GUI_DEFAULT:-0}"  # 1: enable RViz, 0: disable
 GAZEBO_GUI_DEFAULT="${GAZEBO_GUI_DEFAULT:-0}"  # 1: enable Gazebo GUI, 0: disable
-RECORD_STATISTICS="${RECORD_STATISTICS:-0}"  # 1: record benchmark data, 0: disable
-STATISTICS_FOLDER_NAME="${STATISTICS_FOLDER_NAME:-fixed_$(date +%Y%m%d_%H%M%S)}"
+RECORD_STATISTICS="${RECORD_STATISTICS:-1}"  # 1: record benchmark data, 0: disable
+STATISTICS_FOLDER_NAME="${STATISTICS_FOLDER_NAME:-mighty_$(date +%Y%m%d_%H%M%S)}"
 RUN_TIMEOUT_SECONDS="${RUN_TIMEOUT_SECONDS:-350}"  # Overall timeout for each run
 FLIGHT_TIMEOUT_SECONDS="${FLIGHT_TIMEOUT_SECONDS:-300}"  # Timeout after flight starts
 
@@ -117,11 +117,17 @@ WORLD="${ENV:-hard_forest}"
 GPU="${GPU:-1}"
 DEV="${DEV:-0}"
 AUTO_EXIT_DELAY="${AUTO_EXIT_DELAY:-3}"
+FORCE_TTY="${FORCE_TTY:-0}"
 BENCHMARK="${BENCHMARK:-${RECORD_STATISTICS}}"
 CONTAINER_NAME="${CONTAINER_NAME:-mighty-gazebo-forest}"
 
 if [[ "${GPU}" != "0" && "${GPU}" != "1" ]]; then
   echo "[ERROR] GPU must be 0 or 1 (received: ${GPU})." >&2
+  exit 2
+fi
+
+if [[ "${FORCE_TTY}" != "0" && "${FORCE_TTY}" != "1" ]]; then
+  echo "[ERROR] FORCE_TTY must be 0 or 1 (received: ${FORCE_TTY})." >&2
   exit 2
 fi
 
@@ -188,7 +194,6 @@ docker_args=(
   run
   --rm
   --name "${CONTAINER_NAME}"
-  --interactive
   --privileged
   --network=host
   --hostname "$(hostname)"
@@ -205,7 +210,11 @@ if [[ "${BENCHMARK}" == "1" ]]; then
   docker_args+=(--volume "${BENCHMARK_RUN_DIR}:/mighty_statistics:rw")
 fi
 
-if [[ -t 0 && -t 1 ]]; then
+if [[ "${FORCE_TTY}" != "1" ]]; then
+  docker_args+=(--interactive)
+fi
+
+if [[ "${FORCE_TTY}" == "1" || ( -t 0 && -t 1 ) ]]; then
   docker_args+=(--tty)
 fi
 

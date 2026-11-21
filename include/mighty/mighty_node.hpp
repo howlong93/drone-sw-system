@@ -440,6 +440,50 @@ class MIGHTY_NODE : public rclcpp::Node {
     size_t plan_points_after_append = 0;
     size_t plan_points_finish = 0;
     size_t min_plan_points = 0;
+    double housekeeping_ms = 0.0;
+    double global_stage_ms = 0.0;
+    double global_planner_core_ms = 0.0;
+    double local_stage_ms = 0.0;
+    double append_plan_ms = 0.0;
+    double initial_guess_ms = 0.0;
+    double optimizer_ms = 0.0;
+    double sc_total_ms = 0.0;
+    double sc_input_prepare_ms = 0.0;
+    double sc_primary_ms = 0.0;
+    double sc_secondary_ms = 0.0;
+    double sc_validation_ms = 0.0;
+    std::string sc_method = "ellipsoid";
+    bool sc_primary_success = false;
+    bool sc_secondary_success = false;
+    size_t sc_segments = 0;
+    size_t sc_primary_obstacles = 0;
+    size_t sc_primary_hyperplanes = 0;
+    size_t sc_secondary_obstacles = 0;
+    size_t sc_secondary_hyperplanes = 0;
+    std::string sc_primary_failure_reason;
+    std::string sc_secondary_failure_reason;
+    double hgp_static_jps_ms = 0.0;
+    double hgp_check_path_ms = 0.0;
+    double hgp_dynamic_astar_ms = 0.0;
+    double hgp_recover_path_ms = 0.0;
+    bool candidate_safety_checked = false;
+    bool candidate_safety_unsafe_detected = false;
+    bool candidate_safety_rejected = false;
+    bool safety_gate_enabled = true;
+    bool safety_recovery_forced_fresh_hgp = false;
+    std::string candidate_safety_failure_reason;
+    bool candidate_corridor_diagnostic_valid = true;
+    size_t candidate_corridor_violation_samples = 0;
+    double candidate_corridor_max_violation = 0.0;
+    double first_unsafe_x = std::numeric_limits<double>::quiet_NaN();
+    double first_unsafe_y = std::numeric_limits<double>::quiet_NaN();
+    double first_unsafe_z = std::numeric_limits<double>::quiet_NaN();
+    int first_unsafe_segment = -1;
+    double first_unsafe_corridor_max_plane = std::numeric_limits<double>::quiet_NaN();
+    double first_unsafe_distance_from_start = std::numeric_limits<double>::quiet_NaN();
+    size_t safety_rejection_buffer_points = 0;
+    uint64_t consecutive_safety_rejections = 0;
+    size_t trajectory_validation_samples = 0;
   };
 
   // Global Path Benchmarking
@@ -459,8 +503,22 @@ class MIGHTY_NODE : public rclcpp::Node {
   // Flight-time collection must remain constant-time. Safety evaluation is
   // deferred until logData(), after the mission has stopped.
   std::vector<Eigen::Vector3d> benchmark_safety_positions_;
+  std::vector<Eigen::Vector3d> benchmark_actual_velocities_;
+  std::vector<Eigen::Vector3d> benchmark_actual_accelerations_;
+  std::vector<Eigen::Vector3d> benchmark_actual_jerks_;
+  std::vector<Eigen::Vector3d> benchmark_setpoint_positions_;
+  std::vector<Eigen::Vector3d> benchmark_setpoint_velocities_;
+  std::vector<Eigen::Vector3d> benchmark_setpoint_accelerations_;
+  std::vector<Eigen::Vector3d> benchmark_setpoint_jerks_;
   std::vector<double> benchmark_trajectory_elapsed_s_;
   std::mutex benchmark_trajectory_mutex_;
+  std::mutex benchmark_setpoint_mutex_;
+  state benchmark_latest_setpoint_;
+  bool benchmark_have_latest_setpoint_ = false;
+  bool benchmark_have_previous_kinematic_sample_ = false;
+  Eigen::Vector3d benchmark_previous_velocity_{0.0, 0.0, 0.0};
+  Eigen::Vector3d benchmark_previous_acceleration_{0.0, 0.0, 0.0};
+  double benchmark_previous_kinematic_time_s_ = 0.0;
   std::mutex benchmark_hover_mutex_;
   std::vector<HoverEvent> benchmark_hover_events_;
   std::mutex benchmark_plan_buffer_mutex_;
@@ -555,6 +613,7 @@ class MIGHTY_NODE : public rclcpp::Node {
   bool replan_timer_started_ = false;        // Replan timer started
   bool use_benchmark_ = false;               // Use benchmark
   bool benchmark_replan_details_ = false;    // Expensive per-replan audit metrics
+  bool enable_safety_gate_ = true;            // Reject unsafe candidate trajectories
   // Hover monitoring is sampled with the 10 Hz trajectory recorder.
   // It never writes from stateCallback.
 

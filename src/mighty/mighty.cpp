@@ -865,6 +865,15 @@ std::tuple<bool, bool> MIGHTY::replan(double last_replaning_computation_time, do
     benchmark_data_.success = success;
     benchmark_data_.global_path_success = global_path_success;
     if (!status.empty()) benchmark_data_.status = status;
+    // Copy already-computed scalar timings into the lightweight snapshot.
+    // This does not run validation or alter planner state/decisions.
+    benchmark_data_.global_planner_core_ms = global_planning_time_;
+    benchmark_data_.initial_guess_ms = initial_guess_computation_time_;
+    benchmark_data_.optimizer_ms = local_traj_computation_time_;
+    benchmark_data_.hgp_static_jps_ms = hgp_static_jps_time_;
+    benchmark_data_.hgp_check_path_ms = hgp_check_path_time_;
+    benchmark_data_.hgp_dynamic_astar_ms = hgp_dynamic_astar_time_;
+    benchmark_data_.hgp_recover_path_ms = hgp_recover_path_time_;
     benchmark_data_.total_ms = timer_total.getElapsedMicros() / 1000.0;
     return std::make_tuple(success, global_path_success);
   };
@@ -1339,12 +1348,13 @@ bool MIGHTY::planLocalTrajectory(vec_Vecf<3>& global_path) {
     };
     reconstruct_solution();
 
-    // Observe planned-trajectory occupancy for benchmark diagnostics only.
-    // The HGP map has already been inflated, so a direct occupied-voxel test
-    // avoids double-counting the vehicle radius.  This audit must not select a
-    // different optimizer result, retry optimization, or prevent publication:
-    // mission completion is currently the execution priority and safety is
-    // evaluated after the run.
+    // Publication gate for the newly optimized candidate. The HGP manager
+    // queries the same post-inflation planning-map snapshot used by corridor
+    // generation, so no additional vehicle-radius/Co margin is applied here.
+    // UNKNOWN remains traversable. Only an invalid polynomial or OCCUPIED
+    // voxel rejects the candidate; safe-corridor containment is diagnostic
+    // because MIGHTY's optimizer currently treats it as a soft condition.
+    // The already committed plan_ is not modified.
     constexpr double validation_dt = 0.05;
     std::string validation_failure_reason;
     Eigen::Vector3d first_occupied_position = Eigen::Vector3d::Constant(
@@ -1360,6 +1370,10 @@ bool MIGHTY::planLocalTrajectory(vec_Vecf<3>& global_path) {
       first_occupied_distance_from_start = std::numeric_limits<double>::quiet_NaN();
       bool safe = pwp_to_share_.times.size() >= 2;
       if (!safe) validation_failure_reason = "invalid_piecewise_times";
+      if (safe && pwp_to_share_.coeff_x.size() + 1 != pwp_to_share_.times.size()) {
+        validation_failure_reason = "polynomial_segment_count_mismatch";
+        safe = false;
+      }
       bool reached_free_space = false;
       bool have_previous_position = false;
       double distance_from_start = 0.0;
@@ -1381,11 +1395,33 @@ bool MIGHTY::planLocalTrajectory(vec_Vecf<3>& global_path) {
           ++benchmark_data_.trajectory_validation_samples;
           if (!position.allFinite()) {
             validation_failure_reason = "nonfinite_position";
+            first_occupied_segment = i;
             return false;
           }
           if (have_previous_position) distance_from_start += (position - previous_position).norm();
           previous_position = position;
           have_previous_position = true;
+          constexpr double corridor_tolerance = 1e-6;
+          if (i >= safe_corridor_polytopes_whole_.size()) {
+            benchmark_data_.candidate_corridor_diagnostic_valid = false;
+          } else {
+            const auto& corridor = safe_corridor_polytopes_whole_[i];
+            if (corridor.A_.rows() == 0 || corridor.b_.size() != corridor.A_.rows() ||
+                !corridor.A_.allFinite() || !corridor.b_.allFinite()) {
+              benchmark_data_.candidate_corridor_diagnostic_valid = false;
+            } else {
+              const double corridor_max_plane =
+                  (corridor.A_ * position - corridor.b_).maxCoeff();
+              if (!std::isfinite(corridor_max_plane)) {
+                benchmark_data_.candidate_corridor_diagnostic_valid = false;
+              } else {
+                benchmark_data_.candidate_corridor_max_violation = std::max(
+                    benchmark_data_.candidate_corridor_max_violation, corridor_max_plane);
+                if (corridor_max_plane > corridor_tolerance)
+                  ++benchmark_data_.candidate_corridor_violation_samples;
+              }
+            }
+          }
           const bool occupied = hgp_manager_.checkIfPointOccupied(position);
           if (!occupied) {
             reached_free_space = true;
@@ -1407,7 +1443,13 @@ bool MIGHTY::planLocalTrajectory(vec_Vecf<3>& global_path) {
           }
         }
       }
-      if (safe && !reached_free_space) validation_failure_reason = "never_reached_free";
+      if (safe && !reached_free_space) {
+        validation_failure_reason = "never_reached_free";
+        first_occupied_position = previous_position;
+        first_occupied_distance_from_start = distance_from_start;
+        if (!pwp_to_share_.times.empty())
+          first_occupied_segment = static_cast<size_t>(pwp_to_share_.times.size() - 2);
+      }
       return safe && reached_free_space;
     };
 
@@ -1417,18 +1459,68 @@ bool MIGHTY::planLocalTrajectory(vec_Vecf<3>& global_path) {
         benchmark_data_.trajectory_validation_success;
     benchmark_data_.trajectory_validation_ms =
         mandatory_trajectory_validation_timer.getElapsedMicros() / 1000.0;
+    benchmark_data_.candidate_safety_checked = true;
+    benchmark_data_.safety_gate_enabled = safety_gate_enabled_;
     if (!benchmark_data_.trajectory_validation_success) {
-      if (!std::isfinite(last_safety_rejection_log_time_) ||
-          A_time - last_safety_rejection_log_time_ >= 1.0) {
-        std::cerr << "[SafetyAudit] observed reason=" << validation_failure_reason
-                  << " first_occupied=" << first_occupied_position.transpose()
-                  << " pwp_segment=" << first_occupied_segment
-                  << " corridor_max_plane=" << first_occupied_corridor_max_plane
-                  << " distance_from_start=" << first_occupied_distance_from_start
-                  << " corridors=" << safe_corridor_polytopes_whole_.size() << std::endl;
-        last_safety_rejection_log_time_ = A_time;
+      benchmark_data_.candidate_safety_unsafe_detected = true;
+      benchmark_data_.candidate_safety_failure_reason = validation_failure_reason;
+      benchmark_data_.first_unsafe_x = first_occupied_position.x();
+      benchmark_data_.first_unsafe_y = first_occupied_position.y();
+      benchmark_data_.first_unsafe_z = first_occupied_position.z();
+      benchmark_data_.first_unsafe_segment =
+          first_occupied_segment == std::numeric_limits<size_t>::max()
+              ? -1
+              : static_cast<int>(first_occupied_segment);
+      benchmark_data_.first_unsafe_corridor_max_plane =
+          first_occupied_corridor_max_plane;
+      benchmark_data_.first_unsafe_distance_from_start =
+          first_occupied_distance_from_start;
+
+      if (!safety_gate_enabled_) {
+        consecutive_safety_rejections_ = 0;
+        if (!std::isfinite(last_safety_rejection_log_time_) ||
+            A_time - last_safety_rejection_log_time_ >= 1.0) {
+          std::cerr << "[SafetyGate] observed gate_disabled reason="
+                    << validation_failure_reason
+                    << " first_occupied=" << first_occupied_position.transpose()
+                    << " pwp_segment=" << first_occupied_segment
+                    << " distance_from_start=" << first_occupied_distance_from_start
+                    << std::endl;
+          last_safety_rejection_log_time_ = A_time;
+        }
+      } else {
+        benchmark_data_.candidate_safety_rejected = true;
+        benchmark_data_.planned_trajectory_rejected = true;
+        benchmark_data_.status = "trajectory_safety_rejected";
+        benchmark_data_.safety_recovery_forced_fresh_hgp = true;
+        benchmark_data_.consecutive_safety_rejections = ++consecutive_safety_rejections_;
+
+      // A repeated optimization over an identical cached route is both
+      // deterministic and consumes the remaining execution buffer. Force the
+      // next callback through a fresh HGP solve instead. Do not clear plan_.
+        cached_route_.clear();
+        cached_route_time_ = -1.0;
+        ++replanning_failure_count_;
+        if (!std::isfinite(last_safety_rejection_log_time_) ||
+            A_time - last_safety_rejection_log_time_ >= 1.0) {
+          std::cerr << "[SafetyGate] rejected reason=" << validation_failure_reason
+                    << " first_occupied=" << first_occupied_position.transpose()
+                    << " pwp_segment=" << first_occupied_segment
+                    << " corridor_max_plane=" << first_occupied_corridor_max_plane
+                    << " distance_from_start=" << first_occupied_distance_from_start
+                    << " corridors=" << safe_corridor_polytopes_whole_.size() << std::endl;
+          last_safety_rejection_log_time_ = A_time;
+        }
+
+      // Prevent any later visualization/publication path from observing the
+      // rejected candidate. Existing committed setpoints remain in plan_.
+        goal_setpoints_.clear();
+        pwp_to_share_.clear();
+        cps_.clear();
+        return false;
       }
     }
+    consecutive_safety_rejections_ = 0;
 
     if (detailed_benchmark_enabled_) {
     MyTimer trajectory_validation_timer(true);

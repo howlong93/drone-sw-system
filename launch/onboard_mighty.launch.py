@@ -38,6 +38,12 @@ def generate_launch_description():
     data_file_arg = DeclareLaunchArgument('data_file', default_value='', description='File name to store data')
     global_planner_arg = DeclareLaunchArgument('global_planner', default_value='astar_heat', description='Global planner to use') # global planner
     use_benchmark_arg = DeclareLaunchArgument('use_benchmark', default_value='false', description='Flag to indicate whether to use the global planner benchmark') # global planner benchmark
+    benchmark_replan_details_arg = DeclareLaunchArgument(
+        'benchmark_replan_details', default_value='false',
+        description='Enable the optional heavy per-replan validation/audit metrics')
+    enable_safety_gate_arg = DeclareLaunchArgument(
+        'enable_safety_gate', default_value='true',
+        description='Reject unsafe candidate trajectories before publication')
     use_hardware_arg = DeclareLaunchArgument('use_hardware', default_value='false', description='Flag to indicate whether to use hardware or simulation') # flag to indicte if this is hardware or simulation
     publish_odom_arg  = DeclareLaunchArgument('publish_odom', default_value='true')
     odom_topic_arg    = DeclareLaunchArgument('odom_topic', default_value='visual_slam/odom')
@@ -99,6 +105,10 @@ def generate_launch_description():
         data_file = LaunchConfiguration('data_file').perform(context)
         global_planner = LaunchConfiguration('global_planner').perform(context)
         use_benchmark = convert_str_to_bool(LaunchConfiguration('use_benchmark').perform(context))
+        benchmark_replan_details = convert_str_to_bool(
+            LaunchConfiguration('benchmark_replan_details').perform(context))
+        enable_safety_gate = convert_str_to_bool(
+            LaunchConfiguration('enable_safety_gate').perform(context))
         use_hardware = convert_str_to_bool(LaunchConfiguration('use_hardware').perform(context))
         publish_odom = convert_str_to_bool(LaunchConfiguration('publish_odom').perform(context))
         odom_topic = LaunchConfiguration('odom_topic').perform(context)
@@ -162,6 +172,8 @@ def generate_launch_description():
         # Update parameters for benchmarking
         parameters['file_path'] = data_file
         parameters['use_benchmark'] = bool(use_benchmark)
+        parameters['benchmark_replan_details'] = bool(benchmark_replan_details)
+        parameters['enable_safety_gate'] = bool(enable_safety_gate)
         if use_benchmark:
             parameters['global_planner'] = global_planner
    
@@ -405,6 +417,8 @@ def generate_launch_description():
         data_file_arg,
         global_planner_arg,
         use_benchmark_arg,
+        benchmark_replan_details_arg,
+        enable_safety_gate_arg,
         use_hardware_arg,
         publish_odom_arg,
         odom_topic_arg,

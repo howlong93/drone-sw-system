@@ -5,13 +5,17 @@ set -Eeuo pipefail
 # =============================================================================
 # User configuration (edit these values for the next test batch)
 # =============================================================================
-TEST_RUN_COUNT="${TEST_RUN_COUNT:-10}"  # Number of simulation runs
+TEST_RUN_COUNT="${TEST_RUN_COUNT:-50}"  # Number of simulation runs
 RVIZ_GUI_DEFAULT="${RVIZ_GUI_DEFAULT:-0}"  # 1: enable RViz, 0: disable
 GAZEBO_GUI_DEFAULT="${GAZEBO_GUI_DEFAULT:-0}"  # 1: enable Gazebo GUI, 0: disable
 RECORD_STATISTICS="${RECORD_STATISTICS:-1}"  # 1: record benchmark data, 0: disable
-STATISTICS_FOLDER_NAME="${STATISTICS_FOLDER_NAME:-mighty_$(date +%Y%m%d_%H%M%S)}"
-RUN_TIMEOUT_SECONDS="${RUN_TIMEOUT_SECONDS:-350}"  # Overall timeout for each run
-FLIGHT_TIMEOUT_SECONDS="${FLIGHT_TIMEOUT_SECONDS:-300}"  # Timeout after flight starts
+ENABLE_SAFETY_GATE="${ENABLE_SAFETY_GATE:-0}"  # 1: reject unsafe candidates, 0: observe only
+# 1 enables the older heavy O(corridors*obstacles) audit. Lightweight P0/P1/P2
+# recording is always enabled whenever RECORD_STATISTICS=1.
+BENCHMARK_REPLAN_DETAILS="${BENCHMARK_REPLAN_DETAILS:-0}"
+STATISTICS_FOLDER_NAME="${STATISTICS_FOLDER_NAME:-base_ungated_$(date +%Y%m%d_%H%M%S)}"
+RUN_TIMEOUT_SECONDS="${RUN_TIMEOUT_SECONDS:-300}"  # Overall timeout for each run
+FLIGHT_TIMEOUT_SECONDS="${FLIGHT_TIMEOUT_SECONDS:-250}"  # Timeout after flight starts
 
 REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -23,6 +27,8 @@ if (( $# == 0 )); then
   export BATCH_RVIZ_GUI="${RVIZ_GUI_DEFAULT}"
   export BATCH_GAZEBO_GUI="${GAZEBO_GUI_DEFAULT}"
   export BATCH_RECORD_STATISTICS="${RECORD_STATISTICS}"
+  export BATCH_BENCHMARK_REPLAN_DETAILS="${BENCHMARK_REPLAN_DETAILS}"
+  export BATCH_ENABLE_SAFETY_GATE="${ENABLE_SAFETY_GATE}"
   export TIMEOUT_S="${RUN_TIMEOUT_SECONDS}"
   export FLIGHT_TIMEOUT_S="${FLIGHT_TIMEOUT_SECONDS}"
   exec "${REPO_DIR}/run_benchmark_batch_drone.sh" "${TEST_RUN_COUNT}"
@@ -55,6 +61,8 @@ Optional environment variables:
   AUTO_EXIT_DELAY Seconds to wait after reaching the goal before exiting
                   (default: 3; 0 exits immediately; -1 disables auto-exit)
   BENCHMARK       Override RECORD_STATISTICS for this invocation
+  BENCHMARK_REPLAN_DETAILS  1: enable heavy per-replan audits; 0: lightweight only
+  ENABLE_SAFETY_GATE  1: reject unsafe candidates; 0: record and publish for A/B tests
   BENCHMARK_RUN_ID Identifier used for the output folder and CSV filename
   BENCHMARK_RUN_DIR Host output directory; defaults to statistics/<run-id>
   CONTAINER_NAME  Docker container name (default: mighty-gazebo-forest)
@@ -91,6 +99,16 @@ fi
 
 if [[ "${RECORD_STATISTICS}" != "0" && "${RECORD_STATISTICS}" != "1" ]]; then
   echo "[ERROR] RECORD_STATISTICS must be 0 or 1 (received: ${RECORD_STATISTICS})." >&2
+  exit 2
+fi
+
+if [[ "${BENCHMARK_REPLAN_DETAILS}" != "0" && "${BENCHMARK_REPLAN_DETAILS}" != "1" ]]; then
+  echo "[ERROR] BENCHMARK_REPLAN_DETAILS must be 0 or 1 (received: ${BENCHMARK_REPLAN_DETAILS})." >&2
+  exit 2
+fi
+
+if [[ "${ENABLE_SAFETY_GATE}" != "0" && "${ENABLE_SAFETY_GATE}" != "1" ]]; then
+  echo "[ERROR] ENABLE_SAFETY_GATE must be 0 or 1 (received: ${ENABLE_SAFETY_GATE})." >&2
   exit 2
 fi
 
@@ -203,6 +221,8 @@ docker_args=(
   --env "USE_GAZEBO_GUI=$([[ "${GAZEBO_GUI}" == "1" ]] && echo true || echo false)"
   --env "AUTO_EXIT_DELAY=${AUTO_EXIT_DELAY}"
   --env "BENCHMARK_FILE=${BENCHMARK_CONTAINER_FILE}"
+  --env "BENCHMARK_REPLAN_DETAILS=${BENCHMARK_REPLAN_DETAILS}"
+  --env "ENABLE_SAFETY_GATE=${ENABLE_SAFETY_GATE}"
   --env "QT_X11_NO_MITSHM=1"
 )
 
@@ -282,6 +302,12 @@ fi
 args=(--mode gazebo -s /home/kkondo/code/mighty_ws/install/setup.bash --env "${ENV}" --auto-exit-delay "${AUTO_EXIT_DELAY}")
 if [[ -n "${BENCHMARK_FILE}" ]]; then
   args+=(--benchmark-file "${BENCHMARK_FILE}")
+  if [[ "${BENCHMARK_REPLAN_DETAILS}" == "1" ]]; then
+    args+=(--benchmark-replan-details)
+  fi
+fi
+if [[ "${ENABLE_SAFETY_GATE}" != "1" ]]; then
+  args+=(--disable-safety-gate)
 fi
 if [[ "${USE_RVIZ}" != "true" ]]; then
   args+=(--no-rviz)
@@ -312,6 +338,8 @@ echo "[MIGHTY] RViz GUI: ${RVIZ_GUI}"
 echo "[MIGHTY] Gazebo GUI: ${GAZEBO_GUI}"
 echo "[MIGHTY] Auto-exit delay: ${AUTO_EXIT_DELAY} second(s)"
 echo "[MIGHTY] Benchmark: ${BENCHMARK}"
+echo "[MIGHTY] Heavy replan details: ${BENCHMARK_REPLAN_DETAILS}"
+echo "[MIGHTY] Safety gate: ${ENABLE_SAFETY_GATE}"
 if [[ "${BENCHMARK}" == "1" ]]; then
   echo "[MIGHTY] Benchmark output: ${BENCHMARK_RUN_DIR}"
 fi
@@ -337,6 +365,21 @@ set -e
 ended_at="$(date --iso-8601=seconds)"
 ended_epoch="$(date +%s)"
 duration_s=$((ended_epoch - started_epoch))
+
+# Preserve the exact run inputs. These operations happen only after flight.
+cp "${REPO_DIR}/config/mighty.yaml" \
+  "${BENCHMARK_RUN_DIR}/${BENCHMARK_RUN_ID}_mighty.yaml"
+git_commit="$(git -C "${REPO_DIR}" rev-parse HEAD 2>/dev/null || echo unknown)"
+git_dirty=0
+[[ -z "$(git -C "${REPO_DIR}" status --porcelain 2>/dev/null)" ]] || git_dirty=1
+git_diff_sha256="$(git -C "${REPO_DIR}" diff --binary HEAD 2>/dev/null | sha256sum | awk '{print $1}')"
+config_sha256="$(sha256sum "${REPO_DIR}/config/mighty.yaml" | awk '{print $1}')"
+world_sha256="$(sha256sum "${REPO_DIR}/worlds/${WORLD}.world" | awk '{print $1}')"
+image_id="$(docker image inspect --format '{{.Id}}' "${IMAGE}" 2>/dev/null || echo unknown)"
+planner_co="$(awk '$1 == "planner_Co:" {print $2; exit}' "${REPO_DIR}/config/mighty.yaml")"
+inflation_hgp="$(awk '$1 == "inflation_hgp:" {print $2; exit}' "${REPO_DIR}/config/mighty.yaml")"
+drone_bbox="$(sed -n 's/^[[:space:]]*drone_bbox:[[:space:]]*\([^#]*\).*$/\1/p' \
+  "${REPO_DIR}/config/mighty.yaml" | tr -d '[] ' )"
 
 ground_truth_generated=0
 if [[ -s "${BENCHMARK_TRAJECTORY_FILE}" ]]; then
@@ -382,6 +425,17 @@ fi
   printf 'goal_z=%s\n' "${GOAL_Z:-default}"
   printf 'auto_exit_delay=%s\n' "${AUTO_EXIT_DELAY}"
   printf 'image=%s\n' "${IMAGE}"
+  printf 'image_id=%s\n' "${image_id}"
+  printf 'git_commit=%s\n' "${git_commit}"
+  printf 'git_dirty=%s\n' "${git_dirty}"
+  printf 'git_diff_sha256=%s\n' "${git_diff_sha256}"
+  printf 'config_sha256=%s\n' "${config_sha256}"
+  printf 'world_sha256=%s\n' "${world_sha256}"
+  printf 'benchmark_replan_details=%s\n' "${BENCHMARK_REPLAN_DETAILS}"
+  printf 'enable_safety_gate=%s\n' "${ENABLE_SAFETY_GATE}"
+  printf 'planner_Co=%s\n' "${planner_co}"
+  printf 'inflation_hgp=%s\n' "${inflation_hgp}"
+  printf 'drone_bbox=%s\n' "${drone_bbox}"
 } > "${BENCHMARK_RUN_DIR}/${BENCHMARK_RUN_ID}_metadata.env"
 
 exit "${status}"

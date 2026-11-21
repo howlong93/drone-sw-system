@@ -745,7 +745,9 @@ def generate_gazebo_yaml(setup_bash: Path, goal: tuple, sim_env: str,
                          use_gazebo_gui: bool = False, use_ground_robot: bool = False,
                          no_goal: bool = False, exploration_enabled: bool = None,
                          auto_exit_delay: float = -1.0,
-                         benchmark_file: str = None) -> str:
+                         benchmark_file: str = None,
+                         benchmark_replan_details: bool = False,
+                         enable_safety_gate: bool = True) -> str:
     """Generate YAML for single-agent Gazebo simulation.
 
     exploration_enabled=False is what makes this mode mean "drive to the goal"
@@ -762,6 +764,7 @@ def generate_gazebo_yaml(setup_bash: Path, goal: tuple, sim_env: str,
         benchmark_args = (
             ' use_benchmark:=true'
             f' data_file:={shlex.quote(benchmark_file)}'
+            f' benchmark_replan_details:={str(benchmark_replan_details).lower()}'
         )
 
     panes = [
@@ -796,7 +799,8 @@ def generate_gazebo_yaml(setup_bash: Path, goal: tuple, sim_env: str,
             'shell_command': [
                 'sleep 3',
                 f'ros2 launch mighty onboard_mighty.launch.py x:={start_x} y:={start_y} z:={start_z} yaw:={start_yaw} '
-                f'sim_env:={sim_env} use_ground_robot:={str(use_ground_robot).lower()}'
+                f'sim_env:={sim_env} use_ground_robot:={str(use_ground_robot).lower()} '
+                f'enable_safety_gate:={str(enable_safety_gate).lower()}'
                 + ('' if exploration_enabled is None
                    else f' exploration_enabled:={str(exploration_enabled).lower()}')
                 + benchmark_args
@@ -975,6 +979,20 @@ def main():
         default=None,
         help='Enable MIGHTY per-replan benchmarking and write the resulting '
              'CSV to this path (Gazebo mode only)'
+    )
+
+    parser.add_argument(
+        '--benchmark-replan-details',
+        action='store_true',
+        help='Enable optional heavy per-replan validation/audit metrics. '
+             'The default lightweight benchmark does not need this.'
+    )
+
+    parser.add_argument(
+        '--disable-safety-gate',
+        action='store_true',
+        help='Publish candidates even when the lightweight safety validator marks '
+             'them unsafe. Unsafe events remain recorded for A/B comparison.'
     )
 
     parser.add_argument(
@@ -1212,7 +1230,9 @@ def main():
             no_goal=no_goal,
             exploration_enabled=exploration_enabled,
             auto_exit_delay=args.auto_exit_delay,
-            benchmark_file=args.benchmark_file
+            benchmark_file=args.benchmark_file,
+            benchmark_replan_details=args.benchmark_replan_details,
+            enable_safety_gate=not args.disable_safety_gate
         )
         print(f"[INFO] Mode: Single-agent Gazebo simulation (sim_env={sim_env})")
         print(f"[INFO] Environment: {args.env} (world: {world_name})")

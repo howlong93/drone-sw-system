@@ -257,6 +257,7 @@ MIGHTY_NODE::MIGHTY_NODE() : Node("mighty_node") {
   // Initialize the DYNUS object
   mighty_ptr_ = std::make_shared<MIGHTY>(par_);
   mighty_ptr_->setDetailedBenchmarkEnabled(use_benchmark_ && benchmark_replan_details_);
+  mighty_ptr_->setSafetyGateEnabled(enable_safety_gate_);
 
   // Initialize the tf2 buffer and listener
   tf2_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
@@ -529,6 +530,7 @@ void MIGHTY_NODE::declareParameters() {
   this->declare_parameter("file_path", "/home/kkondo/code/dynus_ws/src/dynus/data/data.txt");
   this->declare_parameter("use_benchmark", false);
   this->declare_parameter("benchmark_replan_details", false);
+  this->declare_parameter("enable_safety_gate", true);
   this->declare_parameter("benchmark_hover_speed_threshold_mps", 0.1);
   this->declare_parameter("benchmark_hover_min_duration_s", 0.3);
   this->declare_parameter("start_yaw", -90.0);
@@ -885,6 +887,7 @@ void MIGHTY_NODE::setParameters() {
   file_path_ = this->get_parameter("file_path").as_string();
   use_benchmark_ = this->get_parameter("use_benchmark").as_bool();
   benchmark_replan_details_ = this->get_parameter("benchmark_replan_details").as_bool();
+  enable_safety_gate_ = this->get_parameter("enable_safety_gate").as_bool();
   benchmark_hover_speed_threshold_mps_ =
       this->get_parameter("benchmark_hover_speed_threshold_mps").as_double();
   benchmark_hover_min_duration_s_ =
@@ -1540,9 +1543,44 @@ void MIGHTY_NODE::stateCallback(const dynus_interfaces::msg::State::SharedPtr ms
     const double now_s = this->now().seconds();
     if (now_s - benchmark_last_clearance_sample_time_ >= 0.1) {
       benchmark_last_clearance_sample_time_ = now_s;
+      Eigen::Vector3d acceleration = Eigen::Vector3d::Zero();
+      Eigen::Vector3d jerk = Eigen::Vector3d::Zero();
+      if (benchmark_have_previous_kinematic_sample_) {
+        const double dt = now_s - benchmark_previous_kinematic_time_s_;
+        if (dt > 1e-6) {
+          acceleration = (velocity - benchmark_previous_velocity_) / dt;
+          jerk = (acceleration - benchmark_previous_acceleration_) / dt;
+        }
+      }
+      benchmark_previous_velocity_ = velocity;
+      benchmark_previous_acceleration_ = acceleration;
+      benchmark_previous_kinematic_time_s_ = now_s;
+      benchmark_have_previous_kinematic_sample_ = true;
+
+      const double nan = std::numeric_limits<double>::quiet_NaN();
+      Eigen::Vector3d setpoint_position = Eigen::Vector3d::Constant(nan);
+      Eigen::Vector3d setpoint_velocity = Eigen::Vector3d::Constant(nan);
+      Eigen::Vector3d setpoint_acceleration = Eigen::Vector3d::Constant(nan);
+      Eigen::Vector3d setpoint_jerk = Eigen::Vector3d::Constant(nan);
+      {
+        std::lock_guard<std::mutex> setpoint_lock(benchmark_setpoint_mutex_);
+        if (benchmark_have_latest_setpoint_) {
+          setpoint_position = benchmark_latest_setpoint_.pos;
+          setpoint_velocity = benchmark_latest_setpoint_.vel;
+          setpoint_acceleration = benchmark_latest_setpoint_.accel;
+          setpoint_jerk = benchmark_latest_setpoint_.jerk;
+        }
+      }
       {
         std::lock_guard<std::mutex> lock(benchmark_trajectory_mutex_);
         benchmark_safety_positions_.push_back(position);
+        benchmark_actual_velocities_.push_back(velocity);
+        benchmark_actual_accelerations_.push_back(acceleration);
+        benchmark_actual_jerks_.push_back(jerk);
+        benchmark_setpoint_positions_.push_back(setpoint_position);
+        benchmark_setpoint_velocities_.push_back(setpoint_velocity);
+        benchmark_setpoint_accelerations_.push_back(setpoint_acceleration);
+        benchmark_setpoint_jerks_.push_back(setpoint_jerk);
         benchmark_trajectory_elapsed_s_.push_back(now_s - benchmark_flight_start_time_s_);
       }
       updateHoverMonitor(now_s, position, velocity.norm());
@@ -1648,6 +1686,60 @@ void MIGHTY_NODE::replanCallback() {
     event.plan_points_at_append = benchmark_sample.plan_points_at_append;
     event.generated_plan_points = benchmark_sample.generated_plan_points;
     event.plan_points_after_append = benchmark_sample.plan_points_after_append;
+    event.housekeeping_ms = benchmark_sample.housekeeping_ms;
+    event.global_stage_ms = benchmark_sample.global_stage_ms;
+    event.global_planner_core_ms = benchmark_sample.global_planner_core_ms;
+    event.local_stage_ms = benchmark_sample.local_stage_ms;
+    event.append_plan_ms = benchmark_sample.append_plan_ms;
+    event.initial_guess_ms = benchmark_sample.initial_guess_ms;
+    event.optimizer_ms = benchmark_sample.optimizer_ms;
+    event.sc_total_ms = benchmark_sample.sc_total_ms;
+    event.sc_input_prepare_ms = benchmark_sample.sc_input_prepare_ms;
+    event.sc_primary_ms = benchmark_sample.sc_primary_ms;
+    event.sc_secondary_ms = benchmark_sample.sc_secondary_ms;
+    event.sc_validation_ms = benchmark_sample.sc_validation_ms;
+    event.sc_method = benchmark_sample.sc_method;
+    event.sc_primary_success = benchmark_sample.sc_primary_success;
+    event.sc_secondary_success = benchmark_sample.sc_secondary_success;
+    event.sc_segments = benchmark_sample.sc_segment_count;
+    event.sc_primary_obstacles = benchmark_sample.sc_primary_obstacle_count;
+    event.sc_primary_hyperplanes = benchmark_sample.sc_primary_hyperplanes;
+    event.sc_secondary_obstacles = benchmark_sample.sc_secondary_obstacle_count;
+    event.sc_secondary_hyperplanes = benchmark_sample.sc_secondary_hyperplanes;
+    event.sc_primary_failure_reason = benchmark_sample.sc_primary_failure_reason;
+    event.sc_secondary_failure_reason = benchmark_sample.sc_secondary_failure_reason;
+    event.hgp_static_jps_ms = benchmark_sample.hgp_static_jps_ms;
+    event.hgp_check_path_ms = benchmark_sample.hgp_check_path_ms;
+    event.hgp_dynamic_astar_ms = benchmark_sample.hgp_dynamic_astar_ms;
+    event.hgp_recover_path_ms = benchmark_sample.hgp_recover_path_ms;
+    event.candidate_safety_checked = benchmark_sample.candidate_safety_checked;
+    event.candidate_safety_unsafe_detected =
+        benchmark_sample.candidate_safety_unsafe_detected;
+    event.candidate_safety_rejected = benchmark_sample.candidate_safety_rejected;
+    event.safety_gate_enabled = benchmark_sample.safety_gate_enabled;
+    event.safety_recovery_forced_fresh_hgp =
+        benchmark_sample.safety_recovery_forced_fresh_hgp;
+    event.candidate_safety_failure_reason =
+        benchmark_sample.candidate_safety_failure_reason;
+    event.candidate_corridor_diagnostic_valid =
+        benchmark_sample.candidate_corridor_diagnostic_valid;
+    event.candidate_corridor_violation_samples =
+        benchmark_sample.candidate_corridor_violation_samples;
+    event.candidate_corridor_max_violation =
+        benchmark_sample.candidate_corridor_max_violation;
+    event.first_unsafe_x = benchmark_sample.first_unsafe_x;
+    event.first_unsafe_y = benchmark_sample.first_unsafe_y;
+    event.first_unsafe_z = benchmark_sample.first_unsafe_z;
+    event.first_unsafe_segment = benchmark_sample.first_unsafe_segment;
+    event.first_unsafe_corridor_max_plane =
+        benchmark_sample.first_unsafe_corridor_max_plane;
+    event.first_unsafe_distance_from_start =
+        benchmark_sample.first_unsafe_distance_from_start;
+    event.safety_rejection_buffer_points = benchmark_sample.plan_points_start;
+    event.consecutive_safety_rejections =
+        benchmark_sample.consecutive_safety_rejections;
+    event.trajectory_validation_samples =
+        benchmark_sample.trajectory_validation_samples;
     event.plan_points_finish = mighty_ptr_->getPlanSize();
     event.min_plan_points = std::min(event.plan_points_start, event.plan_points_finish);
     if (event.append_attempted)
@@ -1753,9 +1845,17 @@ void MIGHTY_NODE::replanCallback() {
       {
         std::lock_guard<std::mutex> lock(benchmark_trajectory_mutex_);
         benchmark_safety_positions_.clear();
+        benchmark_actual_velocities_.clear();
+        benchmark_actual_accelerations_.clear();
+        benchmark_actual_jerks_.clear();
+        benchmark_setpoint_positions_.clear();
+        benchmark_setpoint_velocities_.clear();
+        benchmark_setpoint_accelerations_.clear();
+        benchmark_setpoint_jerks_.clear();
         benchmark_trajectory_elapsed_s_.clear();
         benchmark_trajectory_rows_flushed_ = 0;
       }
+      benchmark_have_previous_kinematic_sample_ = false;
       if (!file_path_.empty()) {
         std::string marker_path = file_path_;
         const auto extension = marker_path.rfind(".csv");
@@ -1951,9 +2051,28 @@ void MIGHTY_NODE::terminalGoalCallbackImpl(const geometry_msgs::msg::PoseStamped
         std::lock_guard<std::mutex> lock(benchmark_trajectory_mutex_);
         benchmark_safety_positions_.clear();
         benchmark_safety_positions_.reserve(4096);
+        benchmark_actual_velocities_.clear();
+        benchmark_actual_velocities_.reserve(4096);
+        benchmark_actual_accelerations_.clear();
+        benchmark_actual_accelerations_.reserve(4096);
+        benchmark_actual_jerks_.clear();
+        benchmark_actual_jerks_.reserve(4096);
+        benchmark_setpoint_positions_.clear();
+        benchmark_setpoint_positions_.reserve(4096);
+        benchmark_setpoint_velocities_.clear();
+        benchmark_setpoint_velocities_.reserve(4096);
+        benchmark_setpoint_accelerations_.clear();
+        benchmark_setpoint_accelerations_.reserve(4096);
+        benchmark_setpoint_jerks_.clear();
+        benchmark_setpoint_jerks_.reserve(4096);
         benchmark_trajectory_elapsed_s_.clear();
         benchmark_trajectory_elapsed_s_.reserve(4096);
       }
+      {
+        std::lock_guard<std::mutex> lock(benchmark_setpoint_mutex_);
+        benchmark_have_latest_setpoint_ = false;
+      }
+      benchmark_have_previous_kinematic_sample_ = false;
       {
         std::lock_guard<std::mutex> lock(benchmark_hover_mutex_);
         benchmark_hover_events_.clear();
@@ -2739,6 +2858,69 @@ void MIGHTY_NODE::logData(bool final) {
       ++accepted_planned_obstacle_violations;
     ++status_counts[row.sample.status];
   }
+  // The lightweight stream is always populated during benchmarking, while
+  // global_path_benchmark_ is intentionally empty unless the heavy audit is
+  // enabled. Use it as the authoritative mission-level replan accounting.
+  size_t lightweight_successes = 0;
+  size_t lightweight_hgp_successes = 0;
+  std::unordered_map<std::string, size_t> lightweight_status_counts;
+  for (const auto& event : plan_buffer_events) {
+    lightweight_successes += event.success;
+    lightweight_hgp_successes += event.hgp_success;
+    ++lightweight_status_counts[event.status];
+  }
+
+  size_t tracking_samples = 0;
+  double position_error_sq_sum = 0.0;
+  double velocity_error_sq_sum = 0.0;
+  double max_position_error = 0.0;
+  double max_velocity_error = 0.0;
+  double max_actual_acceleration = 0.0;
+  double max_actual_jerk = 0.0;
+  std::vector<double> position_errors;
+  std::vector<double> velocity_errors;
+  std::vector<double> acceleration_norms;
+  std::vector<double> jerk_norms;
+  {
+    std::lock_guard<std::mutex> lock(benchmark_trajectory_mutex_);
+    const size_t count = std::min(
+        {benchmark_safety_positions_.size(), benchmark_actual_velocities_.size(),
+         benchmark_actual_accelerations_.size(), benchmark_actual_jerks_.size(),
+         benchmark_setpoint_positions_.size(), benchmark_setpoint_velocities_.size()});
+    position_errors.reserve(count);
+    velocity_errors.reserve(count);
+    acceleration_norms.reserve(count);
+    jerk_norms.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+      const double acceleration_norm = benchmark_actual_accelerations_[i].norm();
+      const double jerk_norm = benchmark_actual_jerks_[i].norm();
+      acceleration_norms.push_back(acceleration_norm);
+      jerk_norms.push_back(jerk_norm);
+      max_actual_acceleration = std::max(max_actual_acceleration, acceleration_norm);
+      max_actual_jerk = std::max(max_actual_jerk, jerk_norm);
+      if (!benchmark_setpoint_positions_[i].allFinite() ||
+          !benchmark_setpoint_velocities_[i].allFinite())
+        continue;
+      const double position_error =
+          (benchmark_safety_positions_[i] - benchmark_setpoint_positions_[i]).norm();
+      const double velocity_error =
+          (benchmark_actual_velocities_[i] - benchmark_setpoint_velocities_[i]).norm();
+      position_errors.push_back(position_error);
+      velocity_errors.push_back(velocity_error);
+      position_error_sq_sum += position_error * position_error;
+      velocity_error_sq_sum += velocity_error * velocity_error;
+      max_position_error = std::max(max_position_error, position_error);
+      max_velocity_error = std::max(max_velocity_error, velocity_error);
+      ++tracking_samples;
+    }
+  }
+  auto percentile95 = [](std::vector<double> values) {
+    if (values.empty()) return std::numeric_limits<double>::quiet_NaN();
+    std::sort(values.begin(), values.end());
+    const size_t index = static_cast<size_t>(
+        std::ceil(0.95 * static_cast<double>(values.size()))) - 1;
+    return values[std::min(index, values.size() - 1)];
+  };
 
   std::ofstream summary_file(summary_path);
   if (summary_file.is_open()) {
@@ -2752,10 +2934,36 @@ void MIGHTY_NODE::logData(bool final) {
     size_t append_inserted_count = 0;
     size_t append_splice_expired_count = 0;
     size_t min_plan_points = std::numeric_limits<size_t>::max();
+    size_t safety_candidates_checked = 0;
+    size_t safety_unsafe_candidates_detected = 0;
+    size_t safety_candidates_rejected = 0;
+    size_t corridor_diagnostic_invalid_candidates = 0;
+    size_t corridor_violation_candidates = 0;
+    size_t corridor_violation_samples = 0;
+    double max_candidate_corridor_violation = 0.0;
+    size_t min_rejection_buffer_points = std::numeric_limits<size_t>::max();
+    uint64_t max_consecutive_safety_rejections = 0;
     for (const auto& event : plan_buffer_events) {
       append_inserted_count += event.append_inserted;
       append_splice_expired_count += event.append_splice_expired;
       min_plan_points = std::min(min_plan_points, event.min_plan_points);
+      safety_candidates_checked += event.candidate_safety_checked;
+      safety_unsafe_candidates_detected += event.candidate_safety_unsafe_detected;
+      corridor_diagnostic_invalid_candidates +=
+          !event.candidate_corridor_diagnostic_valid;
+      if (event.candidate_corridor_violation_samples > 0) {
+        ++corridor_violation_candidates;
+        corridor_violation_samples += event.candidate_corridor_violation_samples;
+        max_candidate_corridor_violation = std::max(
+            max_candidate_corridor_violation, event.candidate_corridor_max_violation);
+      }
+      if (event.candidate_safety_rejected) {
+        ++safety_candidates_rejected;
+        min_rejection_buffer_points =
+            std::min(min_rejection_buffer_points, event.safety_rejection_buffer_points);
+        max_consecutive_safety_rejections = std::max(
+            max_consecutive_safety_rejections, event.consecutive_safety_rejections);
+      }
     }
     const int corridor_safe = benchmark_replan_details_
                                   ? (successes > 0 && accepted_corridor_violations == 0)
@@ -2786,15 +2994,33 @@ void MIGHTY_NODE::logData(bool final) {
                  << "hover_total_duration_s," << hover_total_duration_s << '\n'
                  << "hover_max_duration_s," << hover_max_duration_s << '\n'
                  << "trajectory_samples_recorded," << trajectory_sample_count << '\n'
+                 << "tracking_samples_recorded," << tracking_samples << '\n'
+                 << "position_tracking_error_rms_m,"
+                 << (tracking_samples > 0
+                         ? std::sqrt(position_error_sq_sum / tracking_samples)
+                         : std::numeric_limits<double>::quiet_NaN()) << '\n'
+                 << "position_tracking_error_p95_m," << percentile95(position_errors) << '\n'
+                 << "position_tracking_error_max_m," << max_position_error << '\n'
+                 << "velocity_tracking_error_rms_mps,"
+                 << (tracking_samples > 0
+                         ? std::sqrt(velocity_error_sq_sum / tracking_samples)
+                         : std::numeric_limits<double>::quiet_NaN()) << '\n'
+                 << "velocity_tracking_error_p95_mps," << percentile95(velocity_errors) << '\n'
+                 << "velocity_tracking_error_max_mps," << max_velocity_error << '\n'
+                 << "actual_acceleration_p95_mps2," << percentile95(acceleration_norms) << '\n'
+                 << "actual_acceleration_max_mps2," << max_actual_acceleration << '\n'
+                 << "actual_jerk_p95_mps3," << percentile95(jerk_norms) << '\n'
+                 << "actual_jerk_max_mps3," << max_actual_jerk << '\n'
                  << "executed_path_length_m," << benchmark_executed_path_length_ << '\n'
                  << "max_executed_velocity," << benchmark_max_executed_velocity_ << '\n'
                  << "min_occupied_center_distance_m,nan\n"
                  << "occupied_collision_samples,-1\n"
                  << "clearance_violation_samples,-1\n"
                  << "terminal_error_m," << benchmark_terminal_error_m_ << '\n'
-                 << "replan_attempts," << global_path_benchmark_.size() << '\n'
-                 << "replan_successes," << successes << '\n'
-                 << "replan_failures," << global_path_benchmark_.size() - successes << '\n'
+                 << "replan_attempts," << plan_buffer_events.size() << '\n'
+                 << "replan_successes," << lightweight_successes << '\n'
+                 << "replan_failures," << plan_buffer_events.size() - lightweight_successes << '\n'
+                 << "hgp_successes," << lightweight_hgp_successes << '\n'
                  << "local_goal_occupied_events," << benchmark_local_goal_occupied_ << '\n'
                  << "local_goal_relocations," << benchmark_local_goal_relocated_ << '\n'
                  << "local_goal_relocation_failures,"
@@ -2807,6 +3033,22 @@ void MIGHTY_NODE::logData(bool final) {
                  << benchmark_planned_trajectory_safety_retries_ << '\n'
                  << "planned_trajectory_safety_retry_successes,"
                  << benchmark_planned_trajectory_safety_retry_successes_ << '\n'
+                 << "candidate_safety_checks," << safety_candidates_checked << '\n'
+                 << "safety_gate_enabled," << enable_safety_gate_ << '\n'
+                 << "candidate_safety_unsafe_detected,"
+                 << safety_unsafe_candidates_detected << '\n'
+                 << "candidate_safety_rejections," << safety_candidates_rejected << '\n'
+                 << "corridor_diagnostic_invalid_candidates,"
+                 << corridor_diagnostic_invalid_candidates << '\n'
+                 << "corridor_violation_candidates," << corridor_violation_candidates << '\n'
+                 << "corridor_violation_samples," << corridor_violation_samples << '\n'
+                 << "max_candidate_corridor_violation,"
+                 << max_candidate_corridor_violation << '\n'
+                 << "min_safety_rejection_buffer_points,"
+                 << (safety_candidates_rejected == 0 ? -1 :
+                     static_cast<long long>(min_rejection_buffer_points)) << '\n'
+                 << "max_consecutive_safety_rejections,"
+                 << max_consecutive_safety_rejections << '\n'
                  << "idle_not_ready_callbacks," << benchmark_idle_not_ready_ << '\n'
                  << "idle_no_replan_callbacks," << benchmark_idle_no_replan_ << '\n'
                  << "sc_primary_failures," << sc_failures << '\n'
@@ -2816,7 +3058,7 @@ void MIGHTY_NODE::logData(bool final) {
                  << "accepted_planned_obstacle_violation_replans,"
                  << accepted_planned_obstacle_violations << '\n'
                  << "trajectory_validation_failures," << trajectory_validation_failures << '\n';
-    for (const auto& [status, count] : status_counts)
+    for (const auto& [status, count] : lightweight_status_counts)
       summary_file << "status_" << status << ',' << count << '\n';
   }
 
@@ -2857,7 +3099,23 @@ void MIGHTY_NODE::logData(bool final) {
         << "replan_id,start_elapsed_s,callback_wall_ms,callback_gap_ms,status,success,"
            "hgp_success,plan_points_start,plan_points_at_k_selection,k_value_selected,"
            "append_attempted,append_inserted,append_splice_expired,plan_points_at_append,"
-           "generated_plan_points,plan_points_after_append,plan_points_finish,min_plan_points\n";
+           "generated_plan_points,plan_points_after_append,plan_points_finish,min_plan_points,"
+           "housekeeping_ms,global_stage_ms,global_planner_core_ms,local_stage_ms,"
+           "append_plan_ms,initial_guess_ms,optimizer_ms,sc_total_ms,sc_input_prepare_ms,"
+           "sc_primary_ms,sc_secondary_ms,sc_validation_ms,sc_method,sc_primary_success,"
+           "sc_secondary_success,sc_segments,sc_primary_obstacles,sc_secondary_obstacles,"
+           "sc_primary_hyperplanes,sc_secondary_hyperplanes,sc_primary_failure_reason,"
+           "sc_secondary_failure_reason,hgp_static_jps_ms,"
+           "hgp_check_path_ms,hgp_dynamic_astar_ms,hgp_recover_path_ms,"
+           "candidate_safety_checked,candidate_safety_unsafe_detected,"
+           "candidate_safety_rejected,safety_gate_enabled,"
+           "safety_recovery_forced_fresh_hgp,candidate_safety_failure_reason,"
+           "candidate_corridor_diagnostic_valid,candidate_corridor_violation_samples,"
+           "candidate_corridor_max_violation,"
+           "first_unsafe_x_m,first_unsafe_y_m,first_unsafe_z_m,first_unsafe_segment,"
+           "first_unsafe_corridor_max_plane,first_unsafe_distance_from_start_m,"
+           "safety_rejection_buffer_points,consecutive_safety_rejections,"
+           "trajectory_validation_samples\n";
     for (const auto& event : plan_buffer_events) {
       buffer_file << event.replan_id << ',' << event.start_elapsed_s << ','
                   << event.callback_wall_ms << ',' << event.callback_gap_ms << ','
@@ -2867,7 +3125,100 @@ void MIGHTY_NODE::logData(bool final) {
                   << event.append_inserted << ',' << event.append_splice_expired << ','
                   << event.plan_points_at_append << ',' << event.generated_plan_points << ','
                   << event.plan_points_after_append << ',' << event.plan_points_finish << ','
-                  << event.min_plan_points << '\n';
+                  << event.min_plan_points << ',' << event.housekeeping_ms << ','
+                  << event.global_stage_ms << ',' << event.global_planner_core_ms << ','
+                  << event.local_stage_ms << ',' << event.append_plan_ms << ','
+                  << event.initial_guess_ms << ',' << event.optimizer_ms << ','
+                  << event.sc_total_ms << ',' << event.sc_input_prepare_ms << ','
+                  << event.sc_primary_ms << ',' << event.sc_secondary_ms << ','
+                  << event.sc_validation_ms << ',' << event.sc_method << ','
+                  << event.sc_primary_success << ',' << event.sc_secondary_success << ','
+                  << event.sc_segments << ',' << event.sc_primary_obstacles << ','
+                  << event.sc_secondary_obstacles << ',' << event.sc_primary_hyperplanes << ','
+                  << event.sc_secondary_hyperplanes << ',' << event.sc_primary_failure_reason
+                  << ',' << event.sc_secondary_failure_reason << ',' << event.hgp_static_jps_ms << ','
+                  << event.hgp_check_path_ms << ',' << event.hgp_dynamic_astar_ms << ','
+                  << event.hgp_recover_path_ms << ',' << event.candidate_safety_checked << ','
+                  << event.candidate_safety_unsafe_detected << ','
+                  << event.candidate_safety_rejected << ',' << event.safety_gate_enabled << ','
+                  << event.safety_recovery_forced_fresh_hgp << ','
+                  << event.candidate_safety_failure_reason << ','
+                  << event.candidate_corridor_diagnostic_valid << ','
+                  << event.candidate_corridor_violation_samples << ','
+                  << event.candidate_corridor_max_violation << ',' << event.first_unsafe_x << ','
+                  << event.first_unsafe_y << ',' << event.first_unsafe_z << ','
+                  << event.first_unsafe_segment << ','
+                  << event.first_unsafe_corridor_max_plane << ','
+                  << event.first_unsafe_distance_from_start << ','
+                  << event.safety_rejection_buffer_points << ','
+                  << event.consecutive_safety_rejections << ','
+                  << event.trajectory_validation_samples << '\n';
+    }
+  }
+
+  // One row for every unsafe candidate, including candidates deliberately
+  // published during a gate-disabled A/B run.
+  std::string safety_event_path = file_path_;
+  const auto safety_event_extension = safety_event_path.rfind(".csv");
+  if (safety_event_extension != std::string::npos)
+    safety_event_path.replace(safety_event_extension, 4, "_safety_events.csv");
+  else
+    safety_event_path += "_safety_events.csv";
+  std::ofstream safety_event_file(safety_event_path, std::ios::trunc);
+  if (safety_event_file.is_open()) {
+    safety_event_file
+        << "event_index,replan_id,start_elapsed_s,gate_enabled,rejected,reason,"
+           "unsafe_x_m,unsafe_y_m,unsafe_z_m,trajectory_segment,corridor_max_plane,"
+           "distance_from_start_m,validation_samples,buffer_points,action\n";
+    size_t event_index = 0;
+    for (const auto& event : plan_buffer_events) {
+      if (!event.candidate_safety_unsafe_detected) continue;
+      safety_event_file << ++event_index << ',' << event.replan_id << ','
+                        << event.start_elapsed_s << ',' << event.safety_gate_enabled << ','
+                        << event.candidate_safety_rejected << ','
+                        << event.candidate_safety_failure_reason << ','
+                        << event.first_unsafe_x << ',' << event.first_unsafe_y << ','
+                        << event.first_unsafe_z << ',' << event.first_unsafe_segment << ','
+                        << event.first_unsafe_corridor_max_plane << ','
+                        << event.first_unsafe_distance_from_start << ','
+                        << event.trajectory_validation_samples << ','
+                        << event.safety_rejection_buffer_points << ','
+                        << (event.candidate_safety_rejected
+                                ? "reject_candidate_keep_committed_plan"
+                                : "publish_candidate_gate_disabled")
+                        << '\n';
+    }
+  }
+
+  // Dedicated audit trail: one row for every rejected candidate, without
+  // console throttling or first-event-only suppression.
+  std::string rejection_path = file_path_;
+  const auto rejection_extension = rejection_path.rfind(".csv");
+  if (rejection_extension != std::string::npos)
+    rejection_path.replace(rejection_extension, 4, "_safety_rejections.csv");
+  else
+    rejection_path += "_safety_rejections.csv";
+  std::ofstream rejection_file(rejection_path, std::ios::trunc);
+  if (rejection_file.is_open()) {
+    rejection_file
+        << "rejection_index,replan_id,start_elapsed_s,reason,unsafe_x_m,unsafe_y_m,"
+           "unsafe_z_m,trajectory_segment,corridor_max_plane,distance_from_start_m,"
+           "validation_samples,buffer_points,consecutive_rejections,"
+           "forced_fresh_hgp,action\n";
+    size_t rejection_index = 0;
+    for (const auto& event : plan_buffer_events) {
+      if (!event.candidate_safety_rejected) continue;
+      rejection_file << ++rejection_index << ',' << event.replan_id << ','
+                     << event.start_elapsed_s << ',' << event.candidate_safety_failure_reason
+                     << ',' << event.first_unsafe_x << ',' << event.first_unsafe_y << ','
+                     << event.first_unsafe_z << ',' << event.first_unsafe_segment << ','
+                     << event.first_unsafe_corridor_max_plane << ','
+                     << event.first_unsafe_distance_from_start << ','
+                     << event.trajectory_validation_samples << ','
+                     << event.safety_rejection_buffer_points << ','
+                     << event.consecutive_safety_rejections << ','
+                     << event.safety_recovery_forced_fresh_hgp
+                     << ",reject_candidate_keep_committed_plan\n";
     }
   }
   benchmark_logged_ = true;
@@ -2935,8 +3286,12 @@ void MIGHTY_NODE::logTrajectoryData() {
   if (file_path_.empty()) return;
 
   std::lock_guard<std::mutex> lock(benchmark_trajectory_mutex_);
-  const size_t sample_count =
-      std::min(benchmark_safety_positions_.size(), benchmark_trajectory_elapsed_s_.size());
+  const size_t sample_count = std::min(
+      {benchmark_safety_positions_.size(), benchmark_actual_velocities_.size(),
+       benchmark_actual_accelerations_.size(), benchmark_actual_jerks_.size(),
+       benchmark_setpoint_positions_.size(), benchmark_setpoint_velocities_.size(),
+       benchmark_setpoint_accelerations_.size(), benchmark_setpoint_jerks_.size(),
+       benchmark_trajectory_elapsed_s_.size()});
   if (benchmark_trajectory_rows_flushed_ >= sample_count) return;
 
   std::string trajectory_path = file_path_;
@@ -2950,11 +3305,36 @@ void MIGHTY_NODE::logTrajectoryData() {
   std::ofstream trajectory_file(
       trajectory_path, write_header ? std::ios::trunc : std::ios::app);
   if (!trajectory_file.is_open()) return;
-  if (write_header) trajectory_file << "elapsed_from_flight_start_s,x_m,y_m,z_m\n";
+  if (write_header)
+    trajectory_file
+        << "elapsed_from_flight_start_s,x_m,y_m,z_m,vx_mps,vy_mps,vz_mps,"
+           "ax_mps2,ay_mps2,az_mps2,jx_mps3,jy_mps3,jz_mps3,"
+           "setpoint_x_m,setpoint_y_m,setpoint_z_m,setpoint_vx_mps,setpoint_vy_mps,"
+           "setpoint_vz_mps,setpoint_ax_mps2,setpoint_ay_mps2,setpoint_az_mps2,"
+           "setpoint_jx_mps3,setpoint_jy_mps3,setpoint_jz_mps3,"
+           "position_tracking_error_m,velocity_tracking_error_mps\n";
   for (size_t i = benchmark_trajectory_rows_flushed_; i < sample_count; ++i) {
     const auto& position = benchmark_safety_positions_[i];
+    const auto& velocity = benchmark_actual_velocities_[i];
+    const auto& acceleration = benchmark_actual_accelerations_[i];
+    const auto& jerk = benchmark_actual_jerks_[i];
+    const auto& setpoint_position = benchmark_setpoint_positions_[i];
+    const auto& setpoint_velocity = benchmark_setpoint_velocities_[i];
+    const auto& setpoint_acceleration = benchmark_setpoint_accelerations_[i];
+    const auto& setpoint_jerk = benchmark_setpoint_jerks_[i];
+    const double position_error = (position - setpoint_position).norm();
+    const double velocity_error = (velocity - setpoint_velocity).norm();
     trajectory_file << benchmark_trajectory_elapsed_s_[i] << ',' << position.x() << ','
-                    << position.y() << ',' << position.z() << '\n';
+                    << position.y() << ',' << position.z() << ',' << velocity.x() << ','
+                    << velocity.y() << ',' << velocity.z() << ',' << acceleration.x() << ','
+                    << acceleration.y() << ',' << acceleration.z() << ',' << jerk.x() << ','
+                    << jerk.y() << ',' << jerk.z() << ',' << setpoint_position.x() << ','
+                    << setpoint_position.y() << ',' << setpoint_position.z() << ','
+                    << setpoint_velocity.x() << ',' << setpoint_velocity.y() << ','
+                    << setpoint_velocity.z() << ',' << setpoint_acceleration.x() << ','
+                    << setpoint_acceleration.y() << ',' << setpoint_acceleration.z() << ','
+                    << setpoint_jerk.x() << ',' << setpoint_jerk.y() << ','
+                    << setpoint_jerk.z() << ',' << position_error << ',' << velocity_error << '\n';
   }
   benchmark_trajectory_rows_flushed_ = sample_count;
 }
@@ -3245,6 +3625,14 @@ void MIGHTY_NODE::publishGoal() {
     quadGoal.yaw = next_goal.yaw;
     quadGoal.dyaw = next_goal.dyaw;
     pub_goal_->publish(quadGoal);
+
+    // Keep only the latest commanded state. The 10 Hz trajectory sampler
+    // copies it later, avoiding file I/O or additional planner work here.
+    if (use_benchmark_ && benchmark_goal_active_) {
+      std::lock_guard<std::mutex> lock(benchmark_setpoint_mutex_);
+      benchmark_latest_setpoint_ = next_goal;
+      benchmark_have_latest_setpoint_ = true;
+    }
 
     // Debug log: every published setpoint, with current state and plan front
     // for context. Helps trace dip-toward-origin bugs.

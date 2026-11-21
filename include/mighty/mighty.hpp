@@ -66,6 +66,13 @@ struct ReplanBenchmarkData {
   double local_stage_ms = 0.0;
   double append_plan_ms = 0.0;
   double final_housekeeping_ms = 0.0;
+  double global_planner_core_ms = 0.0;
+  double initial_guess_ms = 0.0;
+  double optimizer_ms = 0.0;
+  double hgp_static_jps_ms = 0.0;
+  double hgp_check_path_ms = 0.0;
+  double hgp_dynamic_astar_ms = 0.0;
+  double hgp_recover_path_ms = 0.0;
 
   // Lightweight trajectory-buffer diagnostics. These remain enabled when the
   // expensive per-replan benchmark details are disabled.
@@ -95,6 +102,7 @@ struct ReplanBenchmarkData {
   double sc_primary_ms = 0.0;
   double sc_secondary_ms = 0.0;
   double sc_validation_ms = 0.0;
+  std::string sc_method = "ellipsoid";
   bool sc_primary_success = false;
   bool sc_secondary_success = false;
   bool sc_seed_validation_success = false;
@@ -122,6 +130,22 @@ struct ReplanBenchmarkData {
   bool planned_trajectory_rejected = false;
   bool planned_trajectory_safety_retry_attempted = false;
   bool planned_trajectory_safety_retry_succeeded = false;
+  bool candidate_safety_checked = false;
+  bool candidate_safety_unsafe_detected = false;
+  bool candidate_safety_rejected = false;
+  bool safety_gate_enabled = true;
+  bool safety_recovery_forced_fresh_hgp = false;
+  std::string candidate_safety_failure_reason;
+  bool candidate_corridor_diagnostic_valid = true;
+  size_t candidate_corridor_violation_samples = 0;
+  double candidate_corridor_max_violation = 0.0;
+  double first_unsafe_x = std::numeric_limits<double>::quiet_NaN();
+  double first_unsafe_y = std::numeric_limits<double>::quiet_NaN();
+  double first_unsafe_z = std::numeric_limits<double>::quiet_NaN();
+  int first_unsafe_segment = -1;
+  double first_unsafe_corridor_max_plane = std::numeric_limits<double>::quiet_NaN();
+  double first_unsafe_distance_from_start = std::numeric_limits<double>::quiet_NaN();
+  uint64_t consecutive_safety_rejections = 0;
   size_t trajectory_validation_samples = 0;
   size_t planned_obstacle_violations = 0;
   double trajectory_validation_ms = 0.0;
@@ -424,6 +448,7 @@ class MIGHTY {
 
   /** Enable expensive per-replan audit metrics. Mission/path logging does not require this. */
   void setDetailedBenchmarkEnabled(bool enabled) { detailed_benchmark_enabled_ = enabled; }
+  void setSafetyGateEnabled(bool enabled) { safety_gate_enabled_ = enabled; }
 
   /** Distance to the nearest occupied voxel center; infinity if no occupied points exist. */
   double nearestOccupiedCenterDistance(const Eigen::Vector3d& point);
@@ -604,6 +629,7 @@ class MIGHTY {
   ReplanBenchmarkData benchmark_data_;
   vec_Vec3f benchmark_obstacle_snapshot_;
   bool detailed_benchmark_enabled_ = false;
+  bool safety_gate_enabled_ = true;
   vec_E<Polyhedron<3>> poly_out_whole_;
   vec_E<Polyhedron<3>> poly_out_safe_;
   std::vector<state> goal_setpoints_;
@@ -675,6 +701,7 @@ class MIGHTY {
   // Counter for replanning failure
   int replanning_failure_count_ = 0;
   double last_safety_rejection_log_time_ = -std::numeric_limits<double>::infinity();
+  uint64_t consecutive_safety_rejections_ = 0;
 
   // Map size
   bool map_size_initialized_ = false;  // Map size initialized

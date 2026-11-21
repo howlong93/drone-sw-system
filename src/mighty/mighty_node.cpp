@@ -531,6 +531,12 @@ void MIGHTY_NODE::declareParameters() {
   this->declare_parameter("use_benchmark", false);
   this->declare_parameter("benchmark_replan_details", false);
   this->declare_parameter("enable_safety_gate", true);
+  this->declare_parameter("safety_recovery_rejection_threshold", 15);
+  this->declare_parameter("safety_recovery_buffer_threshold_s", 1.0);
+  this->declare_parameter("safety_recovery_goal_offset_m", 1.0);
+  this->declare_parameter("safety_recovery_route_variants", 6);
+  this->declare_parameter("safety_recovery_retreat_distance_m", 1.0);
+  this->declare_parameter("safety_recovery_retreat_speed_mps", 0.3);
   this->declare_parameter("benchmark_hover_speed_threshold_mps", 0.1);
   this->declare_parameter("benchmark_hover_min_duration_s", 0.3);
   this->declare_parameter("start_yaw", -90.0);
@@ -888,6 +894,18 @@ void MIGHTY_NODE::setParameters() {
   use_benchmark_ = this->get_parameter("use_benchmark").as_bool();
   benchmark_replan_details_ = this->get_parameter("benchmark_replan_details").as_bool();
   enable_safety_gate_ = this->get_parameter("enable_safety_gate").as_bool();
+  par_.safety_recovery_rejection_threshold =
+      this->get_parameter("safety_recovery_rejection_threshold").as_int();
+  par_.safety_recovery_buffer_threshold_s =
+      this->get_parameter("safety_recovery_buffer_threshold_s").as_double();
+  par_.safety_recovery_goal_offset_m =
+      this->get_parameter("safety_recovery_goal_offset_m").as_double();
+  par_.safety_recovery_route_variants =
+      this->get_parameter("safety_recovery_route_variants").as_int();
+  par_.safety_recovery_retreat_distance_m =
+      this->get_parameter("safety_recovery_retreat_distance_m").as_double();
+  par_.safety_recovery_retreat_speed_mps =
+      this->get_parameter("safety_recovery_retreat_speed_mps").as_double();
   benchmark_hover_speed_threshold_mps_ =
       this->get_parameter("benchmark_hover_speed_threshold_mps").as_double();
   benchmark_hover_min_duration_s_ =
@@ -1752,6 +1770,18 @@ void MIGHTY_NODE::replanCallback() {
         benchmark_sample.committed_plan_first_unsafe_index;
     event.committed_plan_failure_reason =
         benchmark_sample.committed_plan_failure_reason;
+    event.safety_recovery_active = benchmark_sample.safety_recovery_active;
+    event.safety_recovery_entered = benchmark_sample.safety_recovery_entered;
+    event.safety_recovery_stop_state_start =
+        benchmark_sample.safety_recovery_stop_state_start;
+    event.safety_recovery_route_variant =
+        benchmark_sample.safety_recovery_route_variant;
+    event.safety_recovery_retreat_started =
+        benchmark_sample.safety_recovery_retreat_started;
+    event.safety_recovery_retreat_points =
+        benchmark_sample.safety_recovery_retreat_points;
+    event.safety_recovery_retreat_count =
+        benchmark_sample.safety_recovery_retreat_count;
     event.trajectory_validation_samples =
         benchmark_sample.trajectory_validation_samples;
     event.plan_points_finish = mighty_ptr_->getPlanSize();
@@ -2750,6 +2780,10 @@ void MIGHTY_NODE::logData(bool final) {
          "committed_plan_truncated,committed_plan_points_checked,"
          "committed_plan_points_before,committed_plan_points_after,"
          "committed_plan_first_unsafe_index,"
+         "safety_recovery_active,safety_recovery_entered,"
+         "safety_recovery_stop_state_start,safety_recovery_route_variant,"
+         "safety_recovery_retreat_started,safety_recovery_retreat_points,"
+         "safety_recovery_retreat_count,"
          "trajectory_validation_samples,"
          "planned_obstacle_violations,trajectory_validation_ms,"
          "trajectory_min_corridor_margin,planned_min_occupied_center_distance_m,"
@@ -2794,6 +2828,12 @@ void MIGHTY_NODE::logData(bool final) {
              << s.committed_plan_truncated << ',' << s.committed_plan_points_checked << ','
              << s.committed_plan_points_before << ',' << s.committed_plan_points_after << ','
              << s.committed_plan_first_unsafe_index << ','
+             << s.safety_recovery_active << ',' << s.safety_recovery_entered << ','
+             << s.safety_recovery_stop_state_start << ','
+             << s.safety_recovery_route_variant << ','
+             << s.safety_recovery_retreat_started << ','
+             << s.safety_recovery_retreat_points << ','
+             << s.safety_recovery_retreat_count << ','
              << s.trajectory_validation_samples << ',' << s.planned_obstacle_violations << ','
              << s.trajectory_validation_ms << ',' << s.trajectory_min_corridor_margin << ','
              << s.planned_min_occupied_center_distance << ',' << s.planned_trajectory_length << ','
@@ -2969,6 +3009,10 @@ void MIGHTY_NODE::logData(bool final) {
     size_t committed_plan_unsafe_events = 0;
     size_t committed_plan_truncations = 0;
     size_t committed_plan_points_removed = 0;
+    size_t safety_recovery_entries = 0;
+    size_t safety_recovery_stop_state_replans = 0;
+    size_t safety_recovery_retreats = 0;
+    uint64_t safety_recovery_max_retreat_count = 0;
     for (const auto& event : plan_buffer_events) {
       append_inserted_count += event.append_inserted;
       append_splice_expired_count += event.append_splice_expired;
@@ -2998,6 +3042,11 @@ void MIGHTY_NODE::logData(bool final) {
         committed_plan_points_removed +=
             event.committed_plan_points_before - event.committed_plan_points_after;
       }
+      safety_recovery_entries += event.safety_recovery_entered;
+      safety_recovery_stop_state_replans += event.safety_recovery_stop_state_start;
+      safety_recovery_retreats += event.safety_recovery_retreat_started;
+      safety_recovery_max_retreat_count = std::max(
+          safety_recovery_max_retreat_count, event.safety_recovery_retreat_count);
     }
     const int corridor_safe = benchmark_replan_details_
                                   ? (successes > 0 && accepted_corridor_violations == 0)
@@ -3087,6 +3136,12 @@ void MIGHTY_NODE::logData(bool final) {
                  << "committed_plan_unsafe_events," << committed_plan_unsafe_events << '\n'
                  << "committed_plan_truncations," << committed_plan_truncations << '\n'
                  << "committed_plan_points_removed," << committed_plan_points_removed << '\n'
+                 << "safety_recovery_entries," << safety_recovery_entries << '\n'
+                 << "safety_recovery_stop_state_replans,"
+                 << safety_recovery_stop_state_replans << '\n'
+                 << "safety_recovery_retreats," << safety_recovery_retreats << '\n'
+                 << "safety_recovery_max_retreat_count,"
+                 << safety_recovery_max_retreat_count << '\n'
                  << "idle_not_ready_callbacks," << benchmark_idle_not_ready_ << '\n'
                  << "idle_no_replan_callbacks," << benchmark_idle_no_replan_ << '\n'
                  << "sc_primary_failures," << sc_failures << '\n'
@@ -3157,6 +3212,10 @@ void MIGHTY_NODE::logData(bool final) {
            "committed_plan_truncated,committed_plan_points_checked,"
            "committed_plan_points_before,committed_plan_points_after,"
            "committed_plan_first_unsafe_index,committed_plan_failure_reason,"
+           "safety_recovery_active,safety_recovery_entered,"
+           "safety_recovery_stop_state_start,safety_recovery_route_variant,"
+           "safety_recovery_retreat_started,safety_recovery_retreat_points,"
+           "safety_recovery_retreat_count,"
            "trajectory_validation_samples\n";
     for (const auto& event : plan_buffer_events) {
       buffer_file << event.replan_id << ',' << event.start_elapsed_s << ','
@@ -3202,6 +3261,13 @@ void MIGHTY_NODE::logData(bool final) {
                   << event.committed_plan_points_after << ','
                   << event.committed_plan_first_unsafe_index << ','
                   << event.committed_plan_failure_reason << ','
+                  << event.safety_recovery_active << ','
+                  << event.safety_recovery_entered << ','
+                  << event.safety_recovery_stop_state_start << ','
+                  << event.safety_recovery_route_variant << ','
+                  << event.safety_recovery_retreat_started << ','
+                  << event.safety_recovery_retreat_points << ','
+                  << event.safety_recovery_retreat_count << ','
                   << event.trajectory_validation_samples << '\n';
     }
   }
@@ -3223,7 +3289,10 @@ void MIGHTY_NODE::logData(bool final) {
            "committed_plan_checked,committed_plan_unsafe,committed_plan_truncated,"
            "committed_plan_points_checked,committed_plan_points_before,"
            "committed_plan_points_after,committed_plan_first_unsafe_index,"
-           "committed_plan_failure_reason,action\n";
+           "committed_plan_failure_reason,safety_recovery_active,"
+           "safety_recovery_entered,safety_recovery_stop_state_start,"
+           "safety_recovery_route_variant,safety_recovery_retreat_started,"
+           "safety_recovery_retreat_points,safety_recovery_retreat_count,action\n";
     size_t event_index = 0;
     for (const auto& event : plan_buffer_events) {
       if (!event.candidate_safety_unsafe_detected) continue;
@@ -3245,6 +3314,13 @@ void MIGHTY_NODE::logData(bool final) {
                         << event.committed_plan_points_after << ','
                         << event.committed_plan_first_unsafe_index << ','
                         << event.committed_plan_failure_reason << ','
+                        << event.safety_recovery_active << ','
+                        << event.safety_recovery_entered << ','
+                        << event.safety_recovery_stop_state_start << ','
+                        << event.safety_recovery_route_variant << ','
+                        << event.safety_recovery_retreat_started << ','
+                        << event.safety_recovery_retreat_points << ','
+                        << event.safety_recovery_retreat_count << ','
                         << (event.candidate_safety_rejected
                                 ? (event.committed_plan_truncated
                                        ? "reject_candidate_truncate_unsafe_committed_plan"
@@ -3271,7 +3347,11 @@ void MIGHTY_NODE::logData(bool final) {
            "forced_fresh_hgp,committed_plan_checked,committed_plan_unsafe,"
            "committed_plan_truncated,committed_plan_points_checked,"
            "committed_plan_points_before,committed_plan_points_after,"
-           "committed_plan_first_unsafe_index,committed_plan_failure_reason,action\n";
+           "committed_plan_first_unsafe_index,committed_plan_failure_reason,"
+           "safety_recovery_active,safety_recovery_entered,"
+           "safety_recovery_stop_state_start,safety_recovery_route_variant,"
+           "safety_recovery_retreat_started,safety_recovery_retreat_points,"
+           "safety_recovery_retreat_count,action\n";
     size_t rejection_index = 0;
     for (const auto& event : plan_buffer_events) {
       if (!event.candidate_safety_rejected) continue;
@@ -3293,6 +3373,13 @@ void MIGHTY_NODE::logData(bool final) {
                      << event.committed_plan_points_after << ','
                      << event.committed_plan_first_unsafe_index << ','
                      << event.committed_plan_failure_reason << ','
+                     << event.safety_recovery_active << ','
+                     << event.safety_recovery_entered << ','
+                     << event.safety_recovery_stop_state_start << ','
+                     << event.safety_recovery_route_variant << ','
+                     << event.safety_recovery_retreat_started << ','
+                     << event.safety_recovery_retreat_points << ','
+                     << event.safety_recovery_retreat_count << ','
                      << (event.committed_plan_truncated
                              ? "reject_candidate_truncate_unsafe_committed_plan"
                              : "reject_candidate_keep_safe_committed_plan")

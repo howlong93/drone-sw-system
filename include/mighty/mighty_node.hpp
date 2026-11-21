@@ -491,6 +491,13 @@ class MIGHTY_NODE : public rclcpp::Node {
     size_t committed_plan_points_after = 0;
     int committed_plan_first_unsafe_index = -1;
     std::string committed_plan_failure_reason;
+    bool safety_recovery_active = false;
+    bool safety_recovery_entered = false;
+    bool safety_recovery_stop_state_start = false;
+    int safety_recovery_route_variant = -1;
+    bool safety_recovery_retreat_started = false;
+    size_t safety_recovery_retreat_points = 0;
+    uint64_t safety_recovery_retreat_count = 0;
     size_t trajectory_validation_samples = 0;
   };
 

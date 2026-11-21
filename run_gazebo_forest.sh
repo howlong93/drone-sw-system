@@ -14,8 +14,8 @@ ENABLE_SAFETY_GATE="${ENABLE_SAFETY_GATE:-1}"  # 1: reject unsafe candidates, 0:
 # recording is always enabled whenever RECORD_STATISTICS=1.
 BENCHMARK_REPLAN_DETAILS="${BENCHMARK_REPLAN_DETAILS:-0}"
 STATISTICS_FOLDER_NAME="${STATISTICS_FOLDER_NAME:-gated_v1.2_$(date +%Y%m%d_%H%M%S)}"
-RUN_TIMEOUT_SECONDS="${RUN_TIMEOUT_SECONDS:-240}"  # Overall timeout for each run
-FLIGHT_TIMEOUT_SECONDS="${FLIGHT_TIMEOUT_SECONDS:-200}"  # Timeout after flight starts
+RUN_TIMEOUT_SECONDS="${RUN_TIMEOUT_SECONDS:-280}"  # Overall timeout for each run
+FLIGHT_TIMEOUT_SECONDS="${FLIGHT_TIMEOUT_SECONDS:-240}"  # Timeout after flight starts
 
 REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 

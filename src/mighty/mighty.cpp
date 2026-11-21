@@ -893,6 +893,18 @@ std::tuple<bool, bool> MIGHTY::replan(double last_replaning_computation_time, do
   benchmark_data_.terminal_goal_x = local_G_term.pos.x();
   benchmark_data_.terminal_goal_y = local_G_term.pos.y();
   benchmark_data_.terminal_goal_z = local_G_term.pos.z();
+  benchmark_data_.safety_recovery_active = safety_recovery_active_;
+  benchmark_data_.safety_recovery_retreat_count = safety_recovery_retreat_count_;
+
+  // A retreat plan is itself the recovery action. Do not let the normal
+  // replanner overwrite it while it is being consumed. Once only the final
+  // hold point remains, resume stop-state replanning with alternate routes.
+  if (safety_recovery_retreating_) {
+    if (benchmark_data_.plan_points_start > 1)
+      return finish(false, false, "safety_recovery_retreating");
+    safety_recovery_retreating_ = false;
+    safety_recovery_variant_attempt_ = 0;
+  }
 
   // Re-run goal sanitization each replan: as the planning window slides
   // forward and previously-unknown cells become observed, an occupied goal
@@ -984,6 +996,13 @@ std::tuple<bool, bool> MIGHTY::replan(double last_replaning_computation_time, do
 
   // Reset the replanning failure count
   replanning_failure_count_ = 0;
+  if (safety_recovery_active_) {
+    safety_recovery_active_ = false;
+    safety_recovery_retreating_ = false;
+    safety_recovery_variant_attempt_ = 0;
+    safety_recovery_last_failure_position_.setConstant(
+        std::numeric_limits<double>::quiet_NaN());
+  }
   benchmark_data_.final_housekeeping_ms = timer_final.getElapsedMicros() / 1000.0;
   if (par_.debug_verbose)
     std::cout << "Final Housekeeping: " << timer_final.getElapsedMicros() / 1000.0 << " ms"
@@ -1017,9 +1036,22 @@ bool MIGHTY::generateGlobalPath(vec_Vecf<3>& global_path, double current_time,
     A_time = current_time;
   } else {
     // UAV: find A and A_time from trajectory
-    if (!findAandAtime(local_A, A_time, current_time, last_replaning_computation_time)) {
-      replanning_failure_count_++;
-      return false;
+    if (safety_recovery_active_) {
+      // In recovery the splice state can encode the same future motion that
+      // was just rejected. Start from the measured hover pose with zero
+      // dynamics so the next optimization is a genuinely new stop-state plan.
+      getState(local_A);
+      local_A.vel.setZero();
+      local_A.accel.setZero();
+      local_A.jerk.setZero();
+      local_A.dyaw = 0.0;
+      A_time = current_time;
+      benchmark_data_.safety_recovery_stop_state_start = true;
+    } else {
+      if (!findAandAtime(local_A, A_time, current_time, last_replaning_computation_time)) {
+        replanning_failure_count_++;
+        return false;
+      }
     }
   }
 
@@ -1064,6 +1096,14 @@ bool MIGHTY::generateGlobalPath(vec_Vecf<3>& global_path, double current_time,
       par_.hgp_timeout_duration_ms, par_.max_num_expansion, par_.w_unknown, par_.w_align,
       par_.decay_len_cells, par_.w_side, par_.los_cells, par_.min_len, par_.min_turn);
 
+  // setupHGPPlanner has just taken the current post-inflation map snapshot.
+  // Select recovery endpoints against that exact snapshot, not the previous
+  // cycle's planning-map copy.
+  if (safety_recovery_active_) {
+    applySafetyRecoveryGoalVariant(local_A, local_G_term, local_G);
+    setG(local_G);
+  }
+
   // For ground robot 2D mode: set max distance between path waypoints
   if (par_.use_2d_planning && par_.vehicle_type == "ground_robot") {
     hgp_manager_.setMaxDistVertexes2D(par_.max_dist_vertexes);
@@ -1086,7 +1126,7 @@ bool MIGHTY::generateGlobalPath(vec_Vecf<3>& global_path, double current_time,
   getGlobalPath(prev_global);  // last successful global path
 
   Eigen::Vector3d dir_hint = (local_G.pos - local_A.pos).normalized();
-  if (prev_global.size() >= 2) {
+  if (!safety_recovery_active_ && prev_global.size() >= 2) {
     Eigen::Vector3d s0 = prev_global[0];
     Eigen::Vector3d s1 = prev_global[1];
     Eigen::Vector3d seg = s1 - s0;
@@ -1217,6 +1257,164 @@ bool MIGHTY::generateGlobalPath(vec_Vecf<3>& global_path, double current_time,
   hgp_manager_.getComputationTime(global_planning_time_, hgp_static_jps_time_, hgp_check_path_time_,
                                   hgp_dynamic_astar_time_, hgp_recover_path_time_);
 
+  return true;
+}
+
+// ----------------------------------------------------------------------------
+
+bool MIGHTY::applySafetyRecoveryGoalVariant(const state& local_A,
+                                            const state& terminal_goal,
+                                            state& local_goal) {
+  const int variant_count = std::max(1, par_.safety_recovery_route_variants);
+  const double step = std::max(map_res_, par_.safety_recovery_goal_offset_m);
+  Eigen::Vector3d forward = terminal_goal.pos - local_A.pos;
+  if (forward.head<2>().norm() < 1e-6) forward = local_goal.pos - local_A.pos;
+  if (forward.head<2>().norm() < 1e-6) forward = Eigen::Vector3d::UnitX();
+  forward.z() = 0.0;
+  forward.normalize();
+  const Eigen::Vector3d lateral(-forward.y(), forward.x(), 0.0);
+  double away_from_failure_sign = 1.0;
+  if (safety_recovery_last_failure_position_.allFinite()) {
+    const double failure_side = lateral.dot(
+        safety_recovery_last_failure_position_ - local_A.pos);
+    if (std::abs(failure_side) > 1e-3)
+      away_from_failure_sign = failure_side > 0.0 ? -1.0 : 1.0;
+  }
+
+  const state nominal_goal = local_goal;
+  for (int offset_try = 0; offset_try < variant_count; ++offset_try) {
+    const int variant = static_cast<int>(
+        (safety_recovery_variant_attempt_ + offset_try) % variant_count);
+    Eigen::Vector3d offset = Eigen::Vector3d::Zero();
+    switch (variant % 6) {
+      case 0: offset = away_from_failure_sign * step * lateral; break;
+      case 1: offset = -away_from_failure_sign * step * lateral; break;
+      case 2: offset = away_from_failure_sign * 2.0 * step * lateral; break;
+      case 3: offset = -away_from_failure_sign * 2.0 * step * lateral; break;
+      case 4: offset.z() = step; break;
+      default: offset.z() = -0.75 * step; break;
+    }
+
+    state candidate = nominal_goal;
+    candidate.pos += offset;
+    candidate.pos.x() = std::clamp(candidate.pos.x(), par_.x_min, par_.x_max);
+    candidate.pos.y() = std::clamp(candidate.pos.y(), par_.y_min, par_.y_max);
+    candidate.pos.z() = std::clamp(candidate.pos.z(), par_.z_min, par_.z_max);
+    if (hgp_manager_.checkIfPointOccupied(candidate.pos)) continue;
+
+    const Eigen::Vector3d yaw_direction = terminal_goal.pos - candidate.pos;
+    if (yaw_direction.head<2>().norm() > 1e-6)
+      candidate.yaw = std::atan2(yaw_direction.y(), yaw_direction.x());
+    local_goal = candidate;
+    benchmark_data_.safety_recovery_route_variant = variant;
+    return true;
+  }
+
+  // No alternate endpoint was admissible. Retain the nominal endpoint; the
+  // bounded-attempt counter will move recovery to a validated retreat.
+  benchmark_data_.safety_recovery_route_variant = -1;
+  return false;
+}
+
+// ----------------------------------------------------------------------------
+
+bool MIGHTY::startSafetyRecoveryRetreat(const state& current_state) {
+  std::deque<state> history;
+  {
+    std::lock_guard<std::mutex> history_lock(mtx_safety_recovery_history_);
+    history = safety_recovery_state_history_;
+  }
+  if (history.size() < 2) return false;
+
+  std::vector<state> reverse_waypoints;
+  reverse_waypoints.push_back(current_state);
+  double accumulated_distance = 0.0;
+  size_t anchor_index = history.size() - 1;
+  bool reached_free_space = !hgp_manager_.checkIfPointOccupied(current_state.pos);
+  const double max_initial_escape_distance =
+      par_.inflation_hgp + std::sqrt(3.0) * par_.res;
+
+  for (size_t reverse_index = history.size(); reverse_index-- > 0;) {
+    const state& sample = history[reverse_index];
+    if (!sample.pos.allFinite()) continue;
+    const Eigen::Vector3d segment = sample.pos - reverse_waypoints.back().pos;
+    const double segment_length = segment.norm();
+    if (segment_length < 0.02) continue;
+
+    // Validate the entire reverse segment, not just recorded endpoints. Newly
+    // observed obstacles may have appeared between two state samples.
+    bool segment_safe = true;
+    const double validation_spacing = std::max(0.02, 0.5 * map_res_);
+    const int validation_samples =
+        std::max(1, static_cast<int>(std::ceil(segment_length / validation_spacing)));
+    for (int k = 1; k <= validation_samples; ++k) {
+      const double alpha = static_cast<double>(k) / validation_samples;
+      const Eigen::Vector3d position = reverse_waypoints.back().pos + alpha * segment;
+      const bool occupied = hgp_manager_.checkIfPointOccupied(position);
+      if (!occupied) {
+        reached_free_space = true;
+      } else if (reached_free_space ||
+                 accumulated_distance + alpha * segment_length >
+                     max_initial_escape_distance) {
+        segment_safe = false;
+        break;
+      }
+    }
+    if (!segment_safe) break;
+
+    reverse_waypoints.push_back(sample);
+    accumulated_distance += segment_length;
+    anchor_index = reverse_index;
+    if (accumulated_distance >= par_.safety_recovery_retreat_distance_m) break;
+  }
+
+  if (reverse_waypoints.size() < 2 || accumulated_distance < 0.25) return false;
+
+  const double retreat_speed =
+      std::max(0.05, std::min(par_.safety_recovery_retreat_speed_mps, par_.v_max));
+  const double spacing = std::max(1e-3, retreat_speed * par_.dc);
+  std::deque<state> retreat_plan;
+  retreat_plan.push_back(current_state);
+  for (size_t i = 0; i + 1 < reverse_waypoints.size(); ++i) {
+    const Eigen::Vector3d delta = reverse_waypoints[i + 1].pos - reverse_waypoints[i].pos;
+    const double length = delta.norm();
+    if (length < 1e-6) continue;
+    const Eigen::Vector3d direction = delta / length;
+    const int samples = std::max(1, static_cast<int>(std::ceil(length / spacing)));
+    for (int k = 1; k <= samples; ++k) {
+      state sample = current_state;
+      const double alpha = static_cast<double>(k) / samples;
+      sample.pos = reverse_waypoints[i].pos + alpha * delta;
+      sample.vel = retreat_speed * direction;
+      sample.accel.setZero();
+      sample.jerk.setZero();
+      sample.dyaw = 0.0;
+      retreat_plan.push_back(sample);
+    }
+  }
+  if (retreat_plan.size() < 2) return false;
+  retreat_plan.back().vel.setZero();
+  retreat_plan.back().accel.setZero();
+  retreat_plan.back().jerk.setZero();
+  retreat_plan.back().dyaw = 0.0;
+
+  {
+    std::lock_guard<std::mutex> plan_lock(mtx_plan_);
+    plan_.swap(retreat_plan);
+  }
+  {
+    std::lock_guard<std::mutex> history_lock(mtx_safety_recovery_history_);
+    if (anchor_index + 1 < safety_recovery_state_history_.size())
+      safety_recovery_state_history_.erase(
+          safety_recovery_state_history_.begin() + anchor_index + 1,
+          safety_recovery_state_history_.end());
+  }
+
+  safety_recovery_retreating_ = true;
+  ++safety_recovery_retreat_count_;
+  benchmark_data_.safety_recovery_retreat_started = true;
+  benchmark_data_.safety_recovery_retreat_points = getPlanSize();
+  benchmark_data_.safety_recovery_retreat_count = safety_recovery_retreat_count_;
   return true;
 }
 
@@ -1591,6 +1789,43 @@ bool MIGHTY::planLocalTrajectory(vec_Vecf<3>& global_path) {
             benchmark_data_.committed_plan_truncated = true;
           }
           benchmark_data_.committed_plan_points_after = plan_.size();
+
+          const size_t recovery_buffer_points =
+              par_.dc > 0.0
+                  ? static_cast<size_t>(std::ceil(
+                        par_.safety_recovery_buffer_threshold_s / par_.dc)) + 1
+                  : 1;
+          if (!safety_recovery_active_ &&
+              consecutive_safety_rejections_ >=
+                  static_cast<uint64_t>(
+                      std::max(1, par_.safety_recovery_rejection_threshold)) &&
+              plan_.size() <= recovery_buffer_points) {
+            safety_recovery_active_ = true;
+            safety_recovery_variant_attempt_ = 0;
+            benchmark_data_.safety_recovery_entered = true;
+            if (!plan_.empty()) {
+              plan_.back().vel.setZero();
+              plan_.back().accel.setZero();
+              plan_.back().jerk.setZero();
+              plan_.back().dyaw = 0.0;
+            }
+          }
+        }
+
+        safety_recovery_last_failure_position_ = first_occupied_position;
+        benchmark_data_.safety_recovery_active = safety_recovery_active_;
+        benchmark_data_.safety_recovery_retreat_count = safety_recovery_retreat_count_;
+        if (safety_recovery_active_ && !benchmark_data_.safety_recovery_entered) {
+          ++safety_recovery_variant_attempt_;
+          const uint64_t variant_budget = static_cast<uint64_t>(
+              std::max(1, par_.safety_recovery_route_variants));
+          if (safety_recovery_variant_attempt_ >= variant_budget &&
+              benchmark_data_.committed_plan_points_after <= 1) {
+            if (startSafetyRecoveryRetreat(current_state)) {
+              safety_recovery_variant_attempt_ = 0;
+              benchmark_data_.committed_plan_points_after = getPlanSize();
+            }
+          }
         }
 
       // A repeated optimization over an identical cached route is both
@@ -2192,6 +2427,20 @@ void MIGHTY::updateState(state data) {
     state_ = data;
   }
 
+  // Keep a bounded trace of actually executed states. It is not used during
+  // nominal planning; recovery validates it against the current map before
+  // constructing a reverse plan.
+  if (data.pos.allFinite()) {
+    std::lock_guard<std::mutex> history_lock(mtx_safety_recovery_history_);
+    if (safety_recovery_state_history_.empty() ||
+        (data.pos - safety_recovery_state_history_.back().pos).norm() >= 0.05) {
+      safety_recovery_state_history_.push_back(data);
+      constexpr size_t max_recovery_history_samples = 4000;
+      while (safety_recovery_state_history_.size() > max_recovery_history_samples)
+        safety_recovery_state_history_.pop_front();
+    }
+  }
+
   if ((state_initialized_ == false || drone_status_ == DroneStatus::YAWING) &&
       (!par_.use_hardware || terminal_goal_initialized_)) {
     // create temporary state
@@ -2450,6 +2699,21 @@ void MIGHTY::setTerminalGoal(const state& term_goal) {
   // Get the state
   state local_state;
   getState(local_state);
+
+  // A new mission must not inherit a deadlock mode or a retreat history from
+  // the previous goal.
+  consecutive_safety_rejections_ = 0;
+  safety_recovery_active_ = false;
+  safety_recovery_retreating_ = false;
+  safety_recovery_variant_attempt_ = 0;
+  safety_recovery_retreat_count_ = 0;
+  safety_recovery_last_failure_position_.setConstant(
+      std::numeric_limits<double>::quiet_NaN());
+  {
+    std::lock_guard<std::mutex> history_lock(mtx_safety_recovery_history_);
+    safety_recovery_state_history_.clear();
+    if (local_state.pos.allFinite()) safety_recovery_state_history_.push_back(local_state);
+  }
 
   // Set the terminal goal
   setGterm(term_goal);

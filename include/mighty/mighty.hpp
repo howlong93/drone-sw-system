@@ -154,6 +154,13 @@ struct ReplanBenchmarkData {
   size_t committed_plan_points_after = 0;
   int committed_plan_first_unsafe_index = -1;
   std::string committed_plan_failure_reason;
+  bool safety_recovery_active = false;
+  bool safety_recovery_entered = false;
+  bool safety_recovery_stop_state_start = false;
+  int safety_recovery_route_variant = -1;
+  bool safety_recovery_retreat_started = false;
+  size_t safety_recovery_retreat_points = 0;
+  uint64_t safety_recovery_retreat_count = 0;
   size_t trajectory_validation_samples = 0;
   size_t planned_obstacle_violations = 0;
   double trajectory_validation_ms = 0.0;
@@ -514,6 +521,13 @@ class MIGHTY {
   bool tryReuseCachedRoute(const state& local_A, double current_time,
                            vec_Vecf<3>& reanchored_out);
 
+  /** Select a non-occupied alternate local goal for deadlock recovery. */
+  bool applySafetyRecoveryGoalVariant(const state& local_A, const state& terminal_goal,
+                                      state& local_goal);
+
+  /** Build a low-speed reverse plan over recently executed, currently-free samples. */
+  bool startSafetyRecoveryRetreat(const state& current_state);
+
   /** @brief Push the global path waypoints into free space.
    *  @param global_path Input/output global path.
    *  @param free_global_path Output path truncated to free space.
@@ -698,6 +712,7 @@ class MIGHTY {
   std::mutex mtx_solve_hgp_;             // Mutex for the solveHGP
   std::mutex mtx_global_path_;           // Mutex for the global_path_
   std::mutex mtx_original_global_path_;  // Mutex for the original_global_path_
+  std::mutex mtx_safety_recovery_history_;  // Mutex for executed-state recovery history
   std::mutex mtx_kdtree_map_;            // Mutex for the map_
   std::mutex mtx_kdtree_unk_;            // Mutex for the unknown map_
   pcl::PointCloud<pcl::PointXYZ>::ConstPtr pclptr_map_;
@@ -710,6 +725,13 @@ class MIGHTY {
   int replanning_failure_count_ = 0;
   double last_safety_rejection_log_time_ = -std::numeric_limits<double>::infinity();
   uint64_t consecutive_safety_rejections_ = 0;
+  bool safety_recovery_active_ = false;
+  bool safety_recovery_retreating_ = false;
+  uint64_t safety_recovery_variant_attempt_ = 0;
+  uint64_t safety_recovery_retreat_count_ = 0;
+  std::deque<state> safety_recovery_state_history_;
+  Eigen::Vector3d safety_recovery_last_failure_position_ =
+      Eigen::Vector3d::Constant(std::numeric_limits<double>::quiet_NaN());
 
   // Map size
   bool map_size_initialized_ = false;  // Map size initialized

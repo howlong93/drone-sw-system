@@ -90,6 +90,18 @@ struct parameters {
   double free_goal_factor;
   bool relocate_occupied_goal;
 
+  // Safety-gate deadlock recovery. A recovery cycle starts only after the
+  // publication gate has rejected enough consecutive candidates and the
+  // committed-plan buffer is nearly exhausted. It replans from the measured
+  // zero-dynamics state, rotates through alternate local goals, and finally
+  // backtracks over recently executed free-space samples if no variant works.
+  int safety_recovery_rejection_threshold{15};
+  double safety_recovery_buffer_threshold_s{1.0};
+  double safety_recovery_goal_offset_m{1.0};
+  int safety_recovery_route_variants{6};
+  double safety_recovery_retreat_distance_m{1.0};
+  double safety_recovery_retreat_speed_mps{0.3};
+
   // LOS post processing parameters
   int los_cells;
   double min_len;   // [m] minimum length between two waypoints after post processing

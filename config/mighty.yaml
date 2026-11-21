@@ -307,6 +307,12 @@ mighty_node:
         benchmark_replan_details: false                 # [-] Optional heavy per-replan audit metrics
         benchmark_hover_speed_threshold_mps: 0.1        # [m/s] low-speed threshold for hover events
         benchmark_hover_min_duration_s: 0.3             # [s] minimum low-speed duration recorded as a hover
+        safety_recovery_rejection_threshold: 15         # consecutive gate rejects before deadlock recovery
+        safety_recovery_buffer_threshold_s: 1.0         # [s] activate only when committed plan is nearly exhausted
+        safety_recovery_goal_offset_m: 1.0              # [m] lateral/vertical alternate-goal spacing
+        safety_recovery_route_variants: 6               # alternate local goals attempted before retreat
+        safety_recovery_retreat_distance_m: 1.0         # [m] validated executed path to backtrack
+        safety_recovery_retreat_speed_mps: 0.3          # [m/s] low-speed retreat command
         file_path: ""                                   # Path to save benchmark CSV
         use_only_global_planner: false                  # [-] Use only global planner for benchmarking
 

@@ -1495,9 +1495,107 @@ bool MIGHTY::planLocalTrajectory(vec_Vecf<3>& global_path) {
         benchmark_data_.safety_recovery_forced_fresh_hgp = true;
         benchmark_data_.consecutive_safety_rejections = ++consecutive_safety_rejections_;
 
+        // Rejecting a new candidate must not blindly preserve a stale committed
+        // trajectory. Revalidate the next two seconds against the same inflated
+        // planning map. If it is unsafe, keep only the safe prefix and turn its
+        // final state into a zero-dynamics hold point while the next callback
+        // performs a fresh HGP solve.
+        constexpr double committed_plan_validation_horizon_s = 2.0;
+        benchmark_data_.committed_plan_safety_checked = true;
+        state current_state;
+        getState(current_state);
+        {
+          std::lock_guard<std::mutex> plan_lock(mtx_plan_);
+          benchmark_data_.committed_plan_points_before = plan_.size();
+          const size_t horizon_points =
+              par_.dc > 0.0
+                  ? static_cast<size_t>(
+                        std::ceil(committed_plan_validation_horizon_s / par_.dc)) +
+                        1
+                  : plan_.size();
+          const size_t points_to_check = std::min(plan_.size(), horizon_points);
+          benchmark_data_.committed_plan_points_checked = points_to_check;
+          const double committed_max_initial_escape_distance =
+              par_.inflation_hgp + std::sqrt(3.0) * par_.res;
+
+          bool reached_free_space = false;
+          bool have_previous_position = false;
+          bool committed_plan_unsafe = plan_.empty();
+          size_t committed_first_unsafe_index = std::numeric_limits<size_t>::max();
+          double distance_from_start = 0.0;
+          Eigen::Vector3d previous_position = Eigen::Vector3d::Zero();
+          std::string committed_failure_reason =
+              plan_.empty() ? "empty_committed_plan" : std::string();
+
+          for (size_t plan_index = 0;
+               !committed_plan_unsafe && plan_index < points_to_check; ++plan_index) {
+            const Eigen::Vector3d& position = plan_[plan_index].pos;
+            if (!position.allFinite()) {
+              committed_plan_unsafe = true;
+              committed_first_unsafe_index = plan_index;
+              committed_failure_reason = "nonfinite_committed_position";
+              break;
+            }
+            if (have_previous_position)
+              distance_from_start += (position - previous_position).norm();
+            previous_position = position;
+            have_previous_position = true;
+
+            const bool occupied = hgp_manager_.checkIfPointOccupied(position);
+            if (!occupied) {
+              reached_free_space = true;
+            } else if (reached_free_space ||
+                       distance_from_start > committed_max_initial_escape_distance) {
+              committed_plan_unsafe = true;
+              committed_first_unsafe_index = plan_index;
+              committed_failure_reason = reached_free_space
+                                             ? "committed_occupied_after_free"
+                                             : "committed_escape_too_long";
+            }
+          }
+
+          if (!committed_plan_unsafe && points_to_check > 0 && !reached_free_space) {
+            committed_plan_unsafe = true;
+            committed_first_unsafe_index = points_to_check - 1;
+            committed_failure_reason = "committed_never_reached_free";
+          }
+
+          benchmark_data_.committed_plan_unsafe = committed_plan_unsafe;
+          benchmark_data_.committed_plan_failure_reason = committed_failure_reason;
+          if (committed_first_unsafe_index != std::numeric_limits<size_t>::max())
+            benchmark_data_.committed_plan_first_unsafe_index =
+                static_cast<int>(committed_first_unsafe_index);
+
+          if (committed_plan_unsafe) {
+            state stop_state = current_state;
+            size_t safe_prefix_points = 0;
+            if ((committed_failure_reason == "committed_occupied_after_free" ||
+                 committed_failure_reason == "nonfinite_committed_position") &&
+                committed_first_unsafe_index > 0 &&
+                committed_first_unsafe_index <= plan_.size()) {
+              safe_prefix_points = committed_first_unsafe_index;
+              stop_state = plan_[safe_prefix_points - 1];
+            }
+            stop_state.vel.setZero();
+            stop_state.accel.setZero();
+            stop_state.jerk.setZero();
+            stop_state.dyaw = 0.0;
+
+            if (safe_prefix_points == 0) {
+              plan_.clear();
+              plan_.push_back(stop_state);
+            } else {
+              plan_.erase(plan_.begin() + safe_prefix_points, plan_.end());
+              plan_.back() = stop_state;
+            }
+            benchmark_data_.committed_plan_truncated = true;
+          }
+          benchmark_data_.committed_plan_points_after = plan_.size();
+        }
+
       // A repeated optimization over an identical cached route is both
       // deterministic and consumes the remaining execution buffer. Force the
-      // next callback through a fresh HGP solve instead. Do not clear plan_.
+      // next callback through a fresh HGP solve instead.
         cached_route_.clear();
         cached_route_time_ = -1.0;
         ++replanning_failure_count_;
@@ -1508,12 +1606,18 @@ bool MIGHTY::planLocalTrajectory(vec_Vecf<3>& global_path) {
                     << " pwp_segment=" << first_occupied_segment
                     << " corridor_max_plane=" << first_occupied_corridor_max_plane
                     << " distance_from_start=" << first_occupied_distance_from_start
-                    << " corridors=" << safe_corridor_polytopes_whole_.size() << std::endl;
+                    << " corridors=" << safe_corridor_polytopes_whole_.size()
+                    << " committed_unsafe=" << benchmark_data_.committed_plan_unsafe
+                    << " committed_points_before="
+                    << benchmark_data_.committed_plan_points_before
+                    << " committed_points_after="
+                    << benchmark_data_.committed_plan_points_after << std::endl;
           last_safety_rejection_log_time_ = A_time;
         }
 
       // Prevent any later visualization/publication path from observing the
-      // rejected candidate. Existing committed setpoints remain in plan_.
+      // rejected candidate. The committed plan has already been retained or
+      // truncated according to its own near-horizon safety result.
         goal_setpoints_.clear();
         pwp_to_share_.clear();
         cps_.clear();

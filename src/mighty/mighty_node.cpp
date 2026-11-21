@@ -1738,6 +1738,20 @@ void MIGHTY_NODE::replanCallback() {
     event.safety_rejection_buffer_points = benchmark_sample.plan_points_start;
     event.consecutive_safety_rejections =
         benchmark_sample.consecutive_safety_rejections;
+    event.committed_plan_safety_checked =
+        benchmark_sample.committed_plan_safety_checked;
+    event.committed_plan_unsafe = benchmark_sample.committed_plan_unsafe;
+    event.committed_plan_truncated = benchmark_sample.committed_plan_truncated;
+    event.committed_plan_points_checked =
+        benchmark_sample.committed_plan_points_checked;
+    event.committed_plan_points_before =
+        benchmark_sample.committed_plan_points_before;
+    event.committed_plan_points_after =
+        benchmark_sample.committed_plan_points_after;
+    event.committed_plan_first_unsafe_index =
+        benchmark_sample.committed_plan_first_unsafe_index;
+    event.committed_plan_failure_reason =
+        benchmark_sample.committed_plan_failure_reason;
     event.trajectory_validation_samples =
         benchmark_sample.trajectory_validation_samples;
     event.plan_points_finish = mighty_ptr_->getPlanSize();
@@ -2732,6 +2746,10 @@ void MIGHTY_NODE::logData(bool final) {
          "trajectory_valid,planned_obstacle_safe,planned_trajectory_rejected,"
          "planned_trajectory_safety_retry_attempted,"
          "planned_trajectory_safety_retry_succeeded,"
+         "committed_plan_safety_checked,committed_plan_unsafe,"
+         "committed_plan_truncated,committed_plan_points_checked,"
+         "committed_plan_points_before,committed_plan_points_after,"
+         "committed_plan_first_unsafe_index,"
          "trajectory_validation_samples,"
          "planned_obstacle_violations,trajectory_validation_ms,"
          "trajectory_min_corridor_margin,planned_min_occupied_center_distance_m,"
@@ -2772,6 +2790,10 @@ void MIGHTY_NODE::logData(bool final) {
              << s.planned_trajectory_rejected << ','
              << s.planned_trajectory_safety_retry_attempted << ','
              << s.planned_trajectory_safety_retry_succeeded << ','
+             << s.committed_plan_safety_checked << ',' << s.committed_plan_unsafe << ','
+             << s.committed_plan_truncated << ',' << s.committed_plan_points_checked << ','
+             << s.committed_plan_points_before << ',' << s.committed_plan_points_after << ','
+             << s.committed_plan_first_unsafe_index << ','
              << s.trajectory_validation_samples << ',' << s.planned_obstacle_violations << ','
              << s.trajectory_validation_ms << ',' << s.trajectory_min_corridor_margin << ','
              << s.planned_min_occupied_center_distance << ',' << s.planned_trajectory_length << ','
@@ -2943,6 +2965,10 @@ void MIGHTY_NODE::logData(bool final) {
     double max_candidate_corridor_violation = 0.0;
     size_t min_rejection_buffer_points = std::numeric_limits<size_t>::max();
     uint64_t max_consecutive_safety_rejections = 0;
+    size_t committed_plan_checks = 0;
+    size_t committed_plan_unsafe_events = 0;
+    size_t committed_plan_truncations = 0;
+    size_t committed_plan_points_removed = 0;
     for (const auto& event : plan_buffer_events) {
       append_inserted_count += event.append_inserted;
       append_splice_expired_count += event.append_splice_expired;
@@ -2963,6 +2989,14 @@ void MIGHTY_NODE::logData(bool final) {
             std::min(min_rejection_buffer_points, event.safety_rejection_buffer_points);
         max_consecutive_safety_rejections = std::max(
             max_consecutive_safety_rejections, event.consecutive_safety_rejections);
+      }
+      committed_plan_checks += event.committed_plan_safety_checked;
+      committed_plan_unsafe_events += event.committed_plan_unsafe;
+      committed_plan_truncations += event.committed_plan_truncated;
+      if (event.committed_plan_truncated &&
+          event.committed_plan_points_before > event.committed_plan_points_after) {
+        committed_plan_points_removed +=
+            event.committed_plan_points_before - event.committed_plan_points_after;
       }
     }
     const int corridor_safe = benchmark_replan_details_
@@ -3049,6 +3083,10 @@ void MIGHTY_NODE::logData(bool final) {
                      static_cast<long long>(min_rejection_buffer_points)) << '\n'
                  << "max_consecutive_safety_rejections,"
                  << max_consecutive_safety_rejections << '\n'
+                 << "committed_plan_safety_checks," << committed_plan_checks << '\n'
+                 << "committed_plan_unsafe_events," << committed_plan_unsafe_events << '\n'
+                 << "committed_plan_truncations," << committed_plan_truncations << '\n'
+                 << "committed_plan_points_removed," << committed_plan_points_removed << '\n'
                  << "idle_not_ready_callbacks," << benchmark_idle_not_ready_ << '\n'
                  << "idle_no_replan_callbacks," << benchmark_idle_no_replan_ << '\n'
                  << "sc_primary_failures," << sc_failures << '\n'
@@ -3115,6 +3153,10 @@ void MIGHTY_NODE::logData(bool final) {
            "first_unsafe_x_m,first_unsafe_y_m,first_unsafe_z_m,first_unsafe_segment,"
            "first_unsafe_corridor_max_plane,first_unsafe_distance_from_start_m,"
            "safety_rejection_buffer_points,consecutive_safety_rejections,"
+           "committed_plan_safety_checked,committed_plan_unsafe,"
+           "committed_plan_truncated,committed_plan_points_checked,"
+           "committed_plan_points_before,committed_plan_points_after,"
+           "committed_plan_first_unsafe_index,committed_plan_failure_reason,"
            "trajectory_validation_samples\n";
     for (const auto& event : plan_buffer_events) {
       buffer_file << event.replan_id << ',' << event.start_elapsed_s << ','
@@ -3152,6 +3194,14 @@ void MIGHTY_NODE::logData(bool final) {
                   << event.first_unsafe_distance_from_start << ','
                   << event.safety_rejection_buffer_points << ','
                   << event.consecutive_safety_rejections << ','
+                  << event.committed_plan_safety_checked << ','
+                  << event.committed_plan_unsafe << ','
+                  << event.committed_plan_truncated << ','
+                  << event.committed_plan_points_checked << ','
+                  << event.committed_plan_points_before << ','
+                  << event.committed_plan_points_after << ','
+                  << event.committed_plan_first_unsafe_index << ','
+                  << event.committed_plan_failure_reason << ','
                   << event.trajectory_validation_samples << '\n';
     }
   }
@@ -3169,7 +3219,11 @@ void MIGHTY_NODE::logData(bool final) {
     safety_event_file
         << "event_index,replan_id,start_elapsed_s,gate_enabled,rejected,reason,"
            "unsafe_x_m,unsafe_y_m,unsafe_z_m,trajectory_segment,corridor_max_plane,"
-           "distance_from_start_m,validation_samples,buffer_points,action\n";
+           "distance_from_start_m,validation_samples,buffer_points,"
+           "committed_plan_checked,committed_plan_unsafe,committed_plan_truncated,"
+           "committed_plan_points_checked,committed_plan_points_before,"
+           "committed_plan_points_after,committed_plan_first_unsafe_index,"
+           "committed_plan_failure_reason,action\n";
     size_t event_index = 0;
     for (const auto& event : plan_buffer_events) {
       if (!event.candidate_safety_unsafe_detected) continue;
@@ -3183,8 +3237,18 @@ void MIGHTY_NODE::logData(bool final) {
                         << event.first_unsafe_distance_from_start << ','
                         << event.trajectory_validation_samples << ','
                         << event.safety_rejection_buffer_points << ','
+                        << event.committed_plan_safety_checked << ','
+                        << event.committed_plan_unsafe << ','
+                        << event.committed_plan_truncated << ','
+                        << event.committed_plan_points_checked << ','
+                        << event.committed_plan_points_before << ','
+                        << event.committed_plan_points_after << ','
+                        << event.committed_plan_first_unsafe_index << ','
+                        << event.committed_plan_failure_reason << ','
                         << (event.candidate_safety_rejected
-                                ? "reject_candidate_keep_committed_plan"
+                                ? (event.committed_plan_truncated
+                                       ? "reject_candidate_truncate_unsafe_committed_plan"
+                                       : "reject_candidate_keep_safe_committed_plan")
                                 : "publish_candidate_gate_disabled")
                         << '\n';
     }
@@ -3204,7 +3268,10 @@ void MIGHTY_NODE::logData(bool final) {
         << "rejection_index,replan_id,start_elapsed_s,reason,unsafe_x_m,unsafe_y_m,"
            "unsafe_z_m,trajectory_segment,corridor_max_plane,distance_from_start_m,"
            "validation_samples,buffer_points,consecutive_rejections,"
-           "forced_fresh_hgp,action\n";
+           "forced_fresh_hgp,committed_plan_checked,committed_plan_unsafe,"
+           "committed_plan_truncated,committed_plan_points_checked,"
+           "committed_plan_points_before,committed_plan_points_after,"
+           "committed_plan_first_unsafe_index,committed_plan_failure_reason,action\n";
     size_t rejection_index = 0;
     for (const auto& event : plan_buffer_events) {
       if (!event.candidate_safety_rejected) continue;
@@ -3218,7 +3285,18 @@ void MIGHTY_NODE::logData(bool final) {
                      << event.safety_rejection_buffer_points << ','
                      << event.consecutive_safety_rejections << ','
                      << event.safety_recovery_forced_fresh_hgp
-                     << ",reject_candidate_keep_committed_plan\n";
+                     << ',' << event.committed_plan_safety_checked << ','
+                     << event.committed_plan_unsafe << ','
+                     << event.committed_plan_truncated << ','
+                     << event.committed_plan_points_checked << ','
+                     << event.committed_plan_points_before << ','
+                     << event.committed_plan_points_after << ','
+                     << event.committed_plan_first_unsafe_index << ','
+                     << event.committed_plan_failure_reason << ','
+                     << (event.committed_plan_truncated
+                             ? "reject_candidate_truncate_unsafe_committed_plan"
+                             : "reject_candidate_keep_safe_committed_plan")
+                     << '\n';
     }
   }
   benchmark_logged_ = true;

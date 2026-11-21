@@ -146,6 +146,14 @@ struct ReplanBenchmarkData {
   double first_unsafe_corridor_max_plane = std::numeric_limits<double>::quiet_NaN();
   double first_unsafe_distance_from_start = std::numeric_limits<double>::quiet_NaN();
   uint64_t consecutive_safety_rejections = 0;
+  bool committed_plan_safety_checked = false;
+  bool committed_plan_unsafe = false;
+  bool committed_plan_truncated = false;
+  size_t committed_plan_points_checked = 0;
+  size_t committed_plan_points_before = 0;
+  size_t committed_plan_points_after = 0;
+  int committed_plan_first_unsafe_index = -1;
+  std::string committed_plan_failure_reason;
   size_t trajectory_validation_samples = 0;
   size_t planned_obstacle_violations = 0;
   double trajectory_validation_ms = 0.0;

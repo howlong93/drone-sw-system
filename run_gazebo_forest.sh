@@ -5,17 +5,17 @@ set -Eeuo pipefail
 # =============================================================================
 # User configuration (edit these values for the next test batch)
 # =============================================================================
-TEST_RUN_COUNT="${TEST_RUN_COUNT:-50}"  # Number of simulation runs
-RVIZ_GUI_DEFAULT="${RVIZ_GUI_DEFAULT:-0}"  # 1: enable RViz, 0: disable
+TEST_RUN_COUNT="${TEST_RUN_COUNT:-10}"  # Number of simulation runs
+RVIZ_GUI_DEFAULT="${RVIZ_GUI_DEFAULT:-1}"  # 1: enable RViz, 0: disable
 GAZEBO_GUI_DEFAULT="${GAZEBO_GUI_DEFAULT:-0}"  # 1: enable Gazebo GUI, 0: disable
 RECORD_STATISTICS="${RECORD_STATISTICS:-1}"  # 1: record benchmark data, 0: disable
-ENABLE_SAFETY_GATE="${ENABLE_SAFETY_GATE:-0}"  # 1: reject unsafe candidates, 0: observe only
+ENABLE_SAFETY_GATE="${ENABLE_SAFETY_GATE:-1}"  # 1: reject unsafe candidates, 0: observe only
 # 1 enables the older heavy O(corridors*obstacles) audit. Lightweight P0/P1/P2
 # recording is always enabled whenever RECORD_STATISTICS=1.
 BENCHMARK_REPLAN_DETAILS="${BENCHMARK_REPLAN_DETAILS:-0}"
-STATISTICS_FOLDER_NAME="${STATISTICS_FOLDER_NAME:-base_ungated_$(date +%Y%m%d_%H%M%S)}"
-RUN_TIMEOUT_SECONDS="${RUN_TIMEOUT_SECONDS:-300}"  # Overall timeout for each run
-FLIGHT_TIMEOUT_SECONDS="${FLIGHT_TIMEOUT_SECONDS:-250}"  # Timeout after flight starts
+STATISTICS_FOLDER_NAME="${STATISTICS_FOLDER_NAME:-gated_v1.2_$(date +%Y%m%d_%H%M%S)}"
+RUN_TIMEOUT_SECONDS="${RUN_TIMEOUT_SECONDS:-240}"  # Overall timeout for each run
+FLIGHT_TIMEOUT_SECONDS="${FLIGHT_TIMEOUT_SECONDS:-200}"  # Timeout after flight starts
 
 REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 

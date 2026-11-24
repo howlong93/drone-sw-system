@@ -10,14 +10,17 @@ RVIZ_GUI_DEFAULT="${RVIZ_GUI_DEFAULT:-0}"  # 1: enable RViz, 0: disable
 GAZEBO_GUI_DEFAULT="${GAZEBO_GUI_DEFAULT:-0}"  # 1: enable Gazebo GUI, 0: disable
 RECORD_STATISTICS="${RECORD_STATISTICS:-1}"  # 1: record benchmark data, 0: disable
 ENABLE_SAFETY_GATE="${ENABLE_SAFETY_GATE:-0}"  # 1: reject unsafe candidates, 0: observe only
-SC_METHOD="${SC_METHOD:-risp_line}"  # ellipsoid, risp_point, or risp_line
+SC_METHOD="${SC_METHOD:-pathcover_line}"  # ellipsoid, risp_point, risp_line, or pathcover_line
 RISP_ALPHA="${RISP_ALPHA:-0.05}"  # RISP separation margin fraction in (0, 1)
 SC_ELLIPSOID_FALLBACK="${SC_ELLIPSOID_FALLBACK:-0}"  # 1: ellipsoid fallback after RISP failure
 RISP_RANDOM_SEED="${RISP_RANDOM_SEED:-1}"  # deterministic non-negative base seed
+PATHCOVER_MAX_CORRIDORS="${PATHCOVER_MAX_CORRIDORS:-12}"
+PATHCOVER_OVERLAP_DISTANCE="${PATHCOVER_OVERLAP_DISTANCE:-0.25}"  # metres
+PATHCOVER_MIN_OVERLAP_MARGIN="${PATHCOVER_MIN_OVERLAP_MARGIN:-0.001}"  # metres
 # 1 enables the older heavy O(corridors*obstacles) audit. Lightweight P0/P1/P2
 # recording is always enabled whenever RECORD_STATISTICS=1.
 BENCHMARK_REPLAN_DETAILS="${BENCHMARK_REPLAN_DETAILS:-0}"
-STATISTICS_FOLDER_NAME="${STATISTICS_FOLDER_NAME:-Lrisp_ungated_a0.01_v1.0_$(date +%Y%m%d_%H%M%S)}"
+STATISTICS_FOLDER_NAME="${STATISTICS_FOLDER_NAME:-pathcover_line_a0.05_v1.0_$(date +%Y%m%d_%H%M%S)}"
 RUN_TIMEOUT_SECONDS="${RUN_TIMEOUT_SECONDS:-280}"  # Overall timeout for each run
 FLIGHT_TIMEOUT_SECONDS="${FLIGHT_TIMEOUT_SECONDS:-240}"  # Timeout after flight starts
 
@@ -37,6 +40,9 @@ if (( $# == 0 )); then
   export BATCH_RISP_ALPHA="${RISP_ALPHA}"
   export BATCH_SC_ELLIPSOID_FALLBACK="${SC_ELLIPSOID_FALLBACK}"
   export BATCH_RISP_RANDOM_SEED="${RISP_RANDOM_SEED}"
+  export BATCH_PATHCOVER_MAX_CORRIDORS="${PATHCOVER_MAX_CORRIDORS}"
+  export BATCH_PATHCOVER_OVERLAP_DISTANCE="${PATHCOVER_OVERLAP_DISTANCE}"
+  export BATCH_PATHCOVER_MIN_OVERLAP_MARGIN="${PATHCOVER_MIN_OVERLAP_MARGIN}"
   export TIMEOUT_S="${RUN_TIMEOUT_SECONDS}"
   export FLIGHT_TIMEOUT_S="${FLIGHT_TIMEOUT_SECONDS}"
   exec "${REPO_DIR}/run_benchmark_batch_drone.sh" "${TEST_RUN_COUNT}"
@@ -71,10 +77,13 @@ Optional environment variables:
   BENCHMARK       Override RECORD_STATISTICS for this invocation
   BENCHMARK_REPLAN_DETAILS  1: enable heavy per-replan audits; 0: lightweight only
   ENABLE_SAFETY_GATE  1: reject unsafe candidates; 0: record and publish for A/B tests
-  SC_METHOD       Safe-corridor generator: ellipsoid, risp_point, or risp_line
+  SC_METHOD       Safe-corridor generator: ellipsoid, risp_point, risp_line, or pathcover_line
   RISP_ALPHA      RISP separation margin fraction in (0, 1)
   SC_ELLIPSOID_FALLBACK  1: use ellipsoid after a RISP failure; 0: pure RISP
   RISP_RANDOM_SEED Deterministic non-negative RISP base seed
+  PATHCOVER_MAX_CORRIDORS Maximum number of PathCover corridors
+  PATHCOVER_OVERLAP_DISTANCE Backtrack distance used to create overlap (metres)
+  PATHCOVER_MIN_OVERLAP_MARGIN Required normalized seam margin (metres)
   BENCHMARK_RUN_ID Identifier used for the output folder and CSV filename
   BENCHMARK_RUN_DIR Host output directory; defaults to statistics/<run-id>
   CONTAINER_NAME  Docker container name (default: mighty-gazebo-forest)
@@ -125,8 +134,8 @@ if [[ "${ENABLE_SAFETY_GATE}" != "0" && "${ENABLE_SAFETY_GATE}" != "1" ]]; then
 fi
 
 if [[ "${SC_METHOD}" != "ellipsoid" && "${SC_METHOD}" != "risp_point" &&
-      "${SC_METHOD}" != "risp_line" ]]; then
-  echo "[ERROR] SC_METHOD must be ellipsoid, risp_point, or risp_line (received: ${SC_METHOD})." >&2
+      "${SC_METHOD}" != "risp_line" && "${SC_METHOD}" != "pathcover_line" ]]; then
+  echo "[ERROR] SC_METHOD is invalid (received: ${SC_METHOD})." >&2
   exit 2
 fi
 if ! awk -v value="${RISP_ALPHA}" 'BEGIN { exit !(value > 0 && value < 1) }'; then
@@ -141,6 +150,9 @@ if [[ ! "${RISP_RANDOM_SEED}" =~ ^[0-9]+$ ]]; then
   echo "[ERROR] RISP_RANDOM_SEED must be a non-negative integer (received: ${RISP_RANDOM_SEED})." >&2
   exit 2
 fi
+[[ "${PATHCOVER_MAX_CORRIDORS}" =~ ^([2-9]|[1-9][0-9]+)$ ]] || { echo "[ERROR] PATHCOVER_MAX_CORRIDORS must be at least 2." >&2; exit 2; }
+awk -v value="${PATHCOVER_OVERLAP_DISTANCE}" 'BEGIN { exit !(value >= 0) }' || { echo "[ERROR] PATHCOVER_OVERLAP_DISTANCE must be non-negative." >&2; exit 2; }
+awk -v value="${PATHCOVER_MIN_OVERLAP_MARGIN}" 'BEGIN { exit !(value >= 0) }' || { echo "[ERROR] PATHCOVER_MIN_OVERLAP_MARGIN must be non-negative." >&2; exit 2; }
 
 if [[ ! "${STATISTICS_FOLDER_NAME}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
   echo "[ERROR] STATISTICS_FOLDER_NAME contains unsupported characters: ${STATISTICS_FOLDER_NAME}" >&2
@@ -257,6 +269,9 @@ docker_args=(
   --env "RISP_ALPHA=${RISP_ALPHA}"
   --env "SC_ELLIPSOID_FALLBACK=${SC_ELLIPSOID_FALLBACK}"
   --env "RISP_RANDOM_SEED=${RISP_RANDOM_SEED}"
+  --env "PATHCOVER_MAX_CORRIDORS=${PATHCOVER_MAX_CORRIDORS}"
+  --env "PATHCOVER_OVERLAP_DISTANCE=${PATHCOVER_OVERLAP_DISTANCE}"
+  --env "PATHCOVER_MIN_OVERLAP_MARGIN=${PATHCOVER_MIN_OVERLAP_MARGIN}"
   --env "QT_X11_NO_MITSHM=1"
 )
 
@@ -335,6 +350,7 @@ fi
 
 args=(--mode gazebo -s /home/kkondo/code/mighty_ws/install/setup.bash --env "${ENV}" --auto-exit-delay "${AUTO_EXIT_DELAY}")
 args+=(--sc-method "${SC_METHOD}" --risp-alpha "${RISP_ALPHA}" --risp-random-seed "${RISP_RANDOM_SEED}")
+args+=(--pathcover-max-corridors "${PATHCOVER_MAX_CORRIDORS}" --pathcover-overlap-distance "${PATHCOVER_OVERLAP_DISTANCE}" --pathcover-min-overlap-margin "${PATHCOVER_MIN_OVERLAP_MARGIN}")
 if [[ "${SC_ELLIPSOID_FALLBACK}" == "1" ]]; then
   args+=(--sc-ellipsoid-fallback)
 fi
@@ -382,6 +398,9 @@ echo "[MIGHTY] SC method: ${SC_METHOD}"
 echo "[MIGHTY] RISP alpha: ${RISP_ALPHA}"
 echo "[MIGHTY] Ellipsoid fallback: ${SC_ELLIPSOID_FALLBACK}"
 echo "[MIGHTY] RISP random seed: ${RISP_RANDOM_SEED}"
+echo "[MIGHTY] PathCover max corridors: ${PATHCOVER_MAX_CORRIDORS}"
+echo "[MIGHTY] PathCover overlap distance: ${PATHCOVER_OVERLAP_DISTANCE}"
+echo "[MIGHTY] PathCover minimum overlap margin: ${PATHCOVER_MIN_OVERLAP_MARGIN}"
 if [[ "${BENCHMARK}" == "1" ]]; then
   echo "[MIGHTY] Benchmark output: ${BENCHMARK_RUN_DIR}"
 fi
@@ -479,6 +498,9 @@ fi
   printf 'risp_alpha=%s\n' "${RISP_ALPHA}"
   printf 'sc_ellipsoid_fallback=%s\n' "${SC_ELLIPSOID_FALLBACK}"
   printf 'risp_random_seed=%s\n' "${RISP_RANDOM_SEED}"
+  printf 'pathcover_max_corridors=%s\n' "${PATHCOVER_MAX_CORRIDORS}"
+  printf 'pathcover_overlap_distance=%s\n' "${PATHCOVER_OVERLAP_DISTANCE}"
+  printf 'pathcover_min_overlap_margin=%s\n' "${PATHCOVER_MIN_OVERLAP_MARGIN}"
   printf 'planner_Co=%s\n' "${planner_co}"
   printf 'inflation_hgp=%s\n' "${inflation_hgp}"
   printf 'drone_bbox=%s\n' "${drone_bbox}"

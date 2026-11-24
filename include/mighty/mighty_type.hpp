@@ -176,6 +176,9 @@ struct parameters {
   double risp_alpha{0.05};
   bool sc_ellipsoid_fallback{false};
   int risp_random_seed{1};
+  int pathcover_max_corridors{12};
+  double pathcover_overlap_distance{0.25};
+  double pathcover_min_overlap_margin{0.001};
 
   // Communication delay parameters
   bool use_comm_delay_inflation;

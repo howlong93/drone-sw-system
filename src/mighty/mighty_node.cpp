@@ -590,6 +590,9 @@ void MIGHTY_NODE::declareParameters() {
   this->declare_parameter("risp_alpha", 0.05);
   this->declare_parameter("sc_ellipsoid_fallback", false);
   this->declare_parameter("risp_random_seed", 1);
+  this->declare_parameter("pathcover_max_corridors", 12);
+  this->declare_parameter("pathcover_overlap_distance", 0.25);
+  this->declare_parameter("pathcover_min_overlap_margin", 0.001);
 
   // Map parameters
   this->declare_parameter("map_buffer", 6.0);
@@ -970,8 +973,13 @@ void MIGHTY_NODE::setParameters() {
   par_.risp_alpha = this->get_parameter("risp_alpha").as_double();
   par_.sc_ellipsoid_fallback = this->get_parameter("sc_ellipsoid_fallback").as_bool();
   par_.risp_random_seed = this->get_parameter("risp_random_seed").as_int();
+  par_.pathcover_max_corridors = this->get_parameter("pathcover_max_corridors").as_int();
+  par_.pathcover_overlap_distance =
+      this->get_parameter("pathcover_overlap_distance").as_double();
+  par_.pathcover_min_overlap_margin =
+      this->get_parameter("pathcover_min_overlap_margin").as_double();
   if (par_.sc_method != "ellipsoid" && par_.sc_method != "risp_point" &&
-      par_.sc_method != "risp_line") {
+      par_.sc_method != "risp_line" && par_.sc_method != "pathcover_line") {
     RCLCPP_WARN(this->get_logger(),
                 "Unknown sc_method '%s'; falling back to the MIGHTY ellipsoid baseline",
                 par_.sc_method.c_str());
@@ -985,6 +993,22 @@ void MIGHTY_NODE::setParameters() {
   if (par_.risp_random_seed < 0) {
     RCLCPP_WARN(this->get_logger(), "risp_random_seed must be non-negative; using 1");
     par_.risp_random_seed = 1;
+  }
+  if (par_.pathcover_max_corridors < 2) {
+    RCLCPP_WARN(this->get_logger(), "pathcover_max_corridors must be at least 2; using 12");
+    par_.pathcover_max_corridors = 12;
+  }
+  if (!(par_.pathcover_overlap_distance >= 0.0) ||
+      !std::isfinite(par_.pathcover_overlap_distance)) {
+    RCLCPP_WARN(this->get_logger(),
+                "pathcover_overlap_distance must be finite and non-negative; using 0.25");
+    par_.pathcover_overlap_distance = 0.25;
+  }
+  if (!(par_.pathcover_min_overlap_margin >= 0.0) ||
+      !std::isfinite(par_.pathcover_min_overlap_margin)) {
+    RCLCPP_WARN(this->get_logger(),
+                "pathcover_min_overlap_margin must be finite and non-negative; using 0.001");
+    par_.pathcover_min_overlap_margin = 0.001;
   }
 
   // Map parameters
@@ -1332,6 +1356,12 @@ void MIGHTY_NODE::printParameters() {
   RCLCPP_INFO(this->get_logger(), "RISP Alpha: %.6f", par_.risp_alpha);
   RCLCPP_INFO(this->get_logger(), "SC Ellipsoid Fallback: %d", par_.sc_ellipsoid_fallback);
   RCLCPP_INFO(this->get_logger(), "RISP Random Seed: %d", par_.risp_random_seed);
+  RCLCPP_INFO(this->get_logger(), "PathCover Max Corridors: %d",
+              par_.pathcover_max_corridors);
+  RCLCPP_INFO(this->get_logger(), "PathCover Overlap Distance: %.3f m",
+              par_.pathcover_overlap_distance);
+  RCLCPP_INFO(this->get_logger(), "PathCover Minimum Overlap Margin: %.4f m",
+              par_.pathcover_min_overlap_margin);
   if (par_.sc_method != "ellipsoid" && par_.inflation_hgp < par_.drone_radius) {
     RCLCPP_WARN(this->get_logger(),
                 "RISP uses the inflated planning map without adding drone_radius: "
@@ -1757,6 +1787,17 @@ void MIGHTY_NODE::replanCallback() {
     event.sc_primary_success = benchmark_sample.sc_primary_success;
     event.sc_secondary_success = benchmark_sample.sc_secondary_success;
     event.sc_segments = benchmark_sample.sc_segment_count;
+    event.sc_reference_waypoints = benchmark_sample.sc_reference_waypoints;
+    event.sc_reference_segments = benchmark_sample.sc_reference_segments;
+    event.sc_pathcover_compression_ratio = benchmark_sample.sc_pathcover_compression_ratio;
+    event.sc_pathcover_segmentation_ms = benchmark_sample.sc_pathcover_segmentation_ms;
+    event.sc_pathcover_reference_length = benchmark_sample.sc_pathcover_reference_length;
+    event.sc_pathcover_covered_length = benchmark_sample.sc_pathcover_covered_length;
+    event.sc_pathcover_coverage_ratio = benchmark_sample.sc_pathcover_coverage_ratio;
+    event.sc_pathcover_min_overlap_margin = benchmark_sample.sc_pathcover_min_overlap_margin;
+    event.sc_unreduced_retry_count = benchmark_sample.sc_unreduced_retry_count;
+    event.sc_pathcover_full_coverage = benchmark_sample.sc_pathcover_full_coverage;
+    event.sc_pathcover_horizon_exceeded = benchmark_sample.sc_pathcover_horizon_exceeded;
     event.sc_primary_obstacles = benchmark_sample.sc_primary_obstacle_count;
     event.sc_primary_hyperplanes = benchmark_sample.sc_primary_hyperplanes;
     event.sc_secondary_obstacles = benchmark_sample.sc_secondary_obstacle_count;
@@ -2805,7 +2846,13 @@ void MIGHTY_NODE::logData(bool final) {
          "sc_total_ms,sc_input_prepare_ms,sc_primary_ms,sc_secondary_ms,sc_validation_ms,"
          "sc_method,sc_result_class,sc_fallback_used,sc_fallback_success,"
          "sc_primary_success,sc_secondary_success,sc_seed_valid,sc_obstacles_valid,"
-         "sc_segments,sc_primary_obstacles,sc_secondary_obstacles,sc_primary_hyperplanes,"
+         "sc_segments,sc_reference_waypoints,sc_reference_segments,"
+         "sc_pathcover_compression_ratio,sc_pathcover_segmentation_ms,"
+         "sc_pathcover_reference_length_m,sc_pathcover_covered_length_m,"
+         "sc_pathcover_coverage_ratio,sc_pathcover_min_overlap_margin_m,"
+         "sc_unreduced_retry_count,sc_pathcover_full_coverage,"
+         "sc_pathcover_horizon_exceeded,sc_primary_obstacles,sc_secondary_obstacles,"
+         "sc_primary_hyperplanes,"
          "sc_secondary_hyperplanes,sc_obstacle_violations,sc_max_obstacle_penetration_m,"
          "sc_primary_obstacle_copy_ms,"
          "sc_primary_dilation_ms,sc_primary_constraint_ms,sc_secondary_obstacle_copy_ms,"
@@ -2850,7 +2897,13 @@ void MIGHTY_NODE::logData(bool final) {
              << s.sc_fallback_success << ',' << s.sc_primary_success << ','
              << s.sc_secondary_success << ','
              << s.sc_seed_validation_success << ',' << s.sc_obstacle_validation_success << ','
-             << s.sc_segment_count << ',' << s.sc_primary_obstacle_count << ','
+             << s.sc_segment_count << ',' << s.sc_reference_waypoints << ','
+             << s.sc_reference_segments << ',' << s.sc_pathcover_compression_ratio << ','
+             << s.sc_pathcover_segmentation_ms << ',' << s.sc_pathcover_reference_length << ','
+             << s.sc_pathcover_covered_length << ',' << s.sc_pathcover_coverage_ratio << ','
+             << s.sc_pathcover_min_overlap_margin << ',' << s.sc_unreduced_retry_count << ','
+             << s.sc_pathcover_full_coverage << ',' << s.sc_pathcover_horizon_exceeded << ','
+             << s.sc_primary_obstacle_count << ','
              << s.sc_secondary_obstacle_count << ',' << s.sc_primary_hyperplanes << ','
              << s.sc_secondary_hyperplanes << ',' << s.sc_obstacle_violations << ','
              << s.sc_max_obstacle_penetration << ','
@@ -3237,7 +3290,12 @@ void MIGHTY_NODE::logData(bool final) {
            "append_plan_ms,initial_guess_ms,optimizer_ms,sc_total_ms,sc_input_prepare_ms,"
            "sc_primary_ms,sc_secondary_ms,sc_validation_ms,sc_method,sc_result_class,"
            "sc_fallback_used,sc_fallback_success,sc_primary_success,"
-           "sc_secondary_success,sc_segments,sc_primary_obstacles,sc_secondary_obstacles,"
+           "sc_secondary_success,sc_segments,sc_reference_waypoints,sc_reference_segments,"
+           "sc_pathcover_compression_ratio,sc_pathcover_segmentation_ms,"
+           "sc_pathcover_reference_length_m,sc_pathcover_covered_length_m,"
+           "sc_pathcover_coverage_ratio,sc_pathcover_min_overlap_margin_m,"
+           "sc_unreduced_retry_count,sc_pathcover_full_coverage,"
+           "sc_pathcover_horizon_exceeded,sc_primary_obstacles,sc_secondary_obstacles,"
            "sc_primary_hyperplanes,sc_secondary_hyperplanes,sc_primary_failure_reason,"
            "sc_secondary_failure_reason,hgp_static_jps_ms,"
            "hgp_check_path_ms,hgp_dynamic_astar_ms,hgp_recover_path_ms,"
@@ -3277,7 +3335,18 @@ void MIGHTY_NODE::logData(bool final) {
                   << event.sc_result_class << ',' << event.sc_fallback_used << ','
                   << event.sc_fallback_success << ',' << event.sc_primary_success << ','
                   << event.sc_secondary_success << ','
-                  << event.sc_segments << ',' << event.sc_primary_obstacles << ','
+                  << event.sc_segments << ',' << event.sc_reference_waypoints << ','
+                  << event.sc_reference_segments << ','
+                  << event.sc_pathcover_compression_ratio << ','
+                  << event.sc_pathcover_segmentation_ms << ','
+                  << event.sc_pathcover_reference_length << ','
+                  << event.sc_pathcover_covered_length << ','
+                  << event.sc_pathcover_coverage_ratio << ','
+                  << event.sc_pathcover_min_overlap_margin << ','
+                  << event.sc_unreduced_retry_count << ','
+                  << event.sc_pathcover_full_coverage << ','
+                  << event.sc_pathcover_horizon_exceeded << ','
+                  << event.sc_primary_obstacles << ','
                   << event.sc_secondary_obstacles << ',' << event.sc_primary_hyperplanes << ','
                   << event.sc_secondary_hyperplanes << ',' << event.sc_primary_failure_reason
                   << ',' << event.sc_secondary_failure_reason << ',' << event.hgp_static_jps_ms << ','

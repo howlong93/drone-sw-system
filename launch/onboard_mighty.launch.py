@@ -46,7 +46,7 @@ def generate_launch_description():
         description='Reject unsafe candidate trajectories before publication')
     sc_method_arg = DeclareLaunchArgument(
         'sc_method', default_value='ellipsoid',
-        description='Safe-corridor generator: ellipsoid, risp_point, or risp_line')
+        description='Safe-corridor generator: ellipsoid, risp_point, risp_line, or pathcover_line')
     risp_alpha_arg = DeclareLaunchArgument(
         'risp_alpha', default_value='0.05', description='RISP separation margin fraction')
     sc_ellipsoid_fallback_arg = DeclareLaunchArgument(
@@ -54,6 +54,15 @@ def generate_launch_description():
         description='Use ellipsoid decomposition if RISP fails')
     risp_random_seed_arg = DeclareLaunchArgument(
         'risp_random_seed', default_value='1', description='Deterministic RISP base seed')
+    pathcover_max_corridors_arg = DeclareLaunchArgument(
+        'pathcover_max_corridors', default_value='12',
+        description='Maximum PathCover corridors before incomplete coverage is rejected')
+    pathcover_overlap_distance_arg = DeclareLaunchArgument(
+        'pathcover_overlap_distance', default_value='0.25',
+        description='PathCover seam backtrack distance in metres')
+    pathcover_min_overlap_margin_arg = DeclareLaunchArgument(
+        'pathcover_min_overlap_margin', default_value='0.001',
+        description='Minimum normalized overlap margin at every PathCover seam')
     use_hardware_arg = DeclareLaunchArgument('use_hardware', default_value='false', description='Flag to indicate whether to use hardware or simulation') # flag to indicte if this is hardware or simulation
     publish_odom_arg  = DeclareLaunchArgument('publish_odom', default_value='true')
     odom_topic_arg    = DeclareLaunchArgument('odom_topic', default_value='visual_slam/odom')
@@ -124,6 +133,12 @@ def generate_launch_description():
         sc_ellipsoid_fallback = convert_str_to_bool(
             LaunchConfiguration('sc_ellipsoid_fallback').perform(context))
         risp_random_seed = int(LaunchConfiguration('risp_random_seed').perform(context))
+        pathcover_max_corridors = int(
+            LaunchConfiguration('pathcover_max_corridors').perform(context))
+        pathcover_overlap_distance = float(
+            LaunchConfiguration('pathcover_overlap_distance').perform(context))
+        pathcover_min_overlap_margin = float(
+            LaunchConfiguration('pathcover_min_overlap_margin').perform(context))
         use_hardware = convert_str_to_bool(LaunchConfiguration('use_hardware').perform(context))
         publish_odom = convert_str_to_bool(LaunchConfiguration('publish_odom').perform(context))
         odom_topic = LaunchConfiguration('odom_topic').perform(context)
@@ -193,6 +208,9 @@ def generate_launch_description():
         parameters['risp_alpha'] = risp_alpha
         parameters['sc_ellipsoid_fallback'] = bool(sc_ellipsoid_fallback)
         parameters['risp_random_seed'] = risp_random_seed
+        parameters['pathcover_max_corridors'] = pathcover_max_corridors
+        parameters['pathcover_overlap_distance'] = pathcover_overlap_distance
+        parameters['pathcover_min_overlap_margin'] = pathcover_min_overlap_margin
         if use_benchmark:
             parameters['global_planner'] = global_planner
    
@@ -442,6 +460,9 @@ def generate_launch_description():
         risp_alpha_arg,
         sc_ellipsoid_fallback_arg,
         risp_random_seed_arg,
+        pathcover_max_corridors_arg,
+        pathcover_overlap_distance_arg,
+        pathcover_min_overlap_margin_arg,
         use_hardware_arg,
         publish_odom_arg,
         odom_topic_arg,

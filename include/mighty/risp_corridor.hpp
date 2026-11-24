@@ -4,6 +4,7 @@
 #include <libqhullcpp/Qhull.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <exception>
@@ -11,6 +12,7 @@
 #include <numeric>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace mighty::risp {
@@ -24,12 +26,56 @@ struct Result {
   Eigen::VectorXd b;
   size_t generated_planes{0};
   std::vector<size_t> remaining_obstacles;
+  bool used_unreduced_retry{false};
+};
+
+struct PathCoverResult {
+  std::vector<Result> corridors;
+  std::vector<Vec3> waypoints;
+  std::vector<std::pair<Vec3, Vec3>> seed_segments;
+  size_t reference_waypoints{0};
+  double reference_length{0.0};
+  double covered_length{0.0};
+  double min_overlap_margin{std::numeric_limits<double>::infinity()};
+  double risp_generation_ms{0.0};
+  size_t unreduced_retry_count{0};
+  bool full_coverage{false};
+  bool horizon_exceeded{false};
 };
 
 inline bool isStrictlyInside(const MatX3& A, const Eigen::VectorXd& b, const Vec3& point,
                              double tolerance = 1e-10) {
   return A.rows() == b.size() && A.cols() == 3 && A.allFinite() && b.allFinite() &&
          ((A * point).array() < (b.array() - tolerance)).all();
+}
+
+inline double normalizedMinimumSlack(const MatX3& A, const Eigen::VectorXd& b,
+                                     const Vec3& point) {
+  if (A.rows() != b.size() || A.cols() != 3 || A.rows() == 0 || !A.allFinite() ||
+      !b.allFinite() || !point.allFinite()) {
+    return -std::numeric_limits<double>::infinity();
+  }
+  double minimum = std::numeric_limits<double>::infinity();
+  for (Eigen::Index row = 0; row < A.rows(); ++row) {
+    const double norm = A.row(row).norm();
+    if (!(norm > 1e-12) || !std::isfinite(norm))
+      return -std::numeric_limits<double>::infinity();
+    minimum = std::min(minimum, (b(row) - A.row(row).dot(point)) / norm);
+  }
+  return minimum;
+}
+
+inline bool contains(const MatX3& A, const Eigen::VectorXd& b, const Vec3& point,
+                     double tolerance_m = 1e-8) {
+  return normalizedMinimumSlack(A, b, point) >= -tolerance_m;
+}
+
+inline bool excludesAllObstacles(const MatX3& A, const Eigen::VectorXd& b,
+                                 const std::vector<Vec3>& obstacles,
+                                 double tolerance_m = 1e-8) {
+  return std::none_of(obstacles.begin(), obstacles.end(), [&](const Vec3& obstacle) {
+    return contains(A, b, obstacle, tolerance_m);
+  });
 }
 
 inline bool reduceRedundantPlanes(MatX3& A, Eigen::VectorXd& b, const Vec3& interior,
@@ -164,7 +210,29 @@ inline bool generate(const std::vector<Vec3>& obstacles, const MatX3& A_bound,
   result.b.tail(b_bound.size()) = b_bound;
   result.generated_planes = plane_count;
 
-  if (!reduceRedundantPlanes(result.A, result.b, reduction_seed, failure_reason)) return false;
+  // Qhull redundancy removal is a numerical optimization, not part of RISP's
+  // safety argument. Preserve the complete constraint set and fall back to it
+  // whenever reduction fails or accidentally admits an obstacle.
+  const MatX3 complete_A = result.A;
+  const Eigen::VectorXd complete_b = result.b;
+  MatX3 reduced_A = complete_A;
+  Eigen::VectorXd reduced_b = complete_b;
+  std::string reduction_reason;
+  const bool reduced =
+      reduceRedundantPlanes(reduced_A, reduced_b, reduction_seed, reduction_reason);
+  if (reduced && excludesAllObstacles(reduced_A, reduced_b, obstacles)) {
+    result.A.swap(reduced_A);
+    result.b.swap(reduced_b);
+  } else {
+    if (!excludesAllObstacles(complete_A, complete_b, obstacles)) {
+      failure_reason = reduced ? "unreduced_obstacle_inside"
+                               : "reduction_failed_and_unreduced_obstacle_inside";
+      return false;
+    }
+    result.A = complete_A;
+    result.b = complete_b;
+    result.used_unreduced_retry = true;
+  }
   return true;
 }
 
@@ -189,5 +257,237 @@ inline bool lineSeed(const std::vector<Vec3>& obstacles, const Vec3& start, cons
                   result, failure_reason);
 }
 
-}  // namespace mighty::risp
+inline double polylineLength(const std::vector<Vec3>& path) {
+  double length = 0.0;
+  for (size_t i = 1; i < path.size(); ++i) length += (path[i] - path[i - 1]).norm();
+  return length;
+}
 
+inline bool segmentExitParameter(const Result& corridor, const Vec3& start, const Vec3& end,
+                                 double& exit_parameter) {
+  if (!contains(corridor.A, corridor.b, start) || contains(corridor.A, corridor.b, end))
+    return false;
+  const Vec3 direction = end - start;
+  double upper = 1.0;
+  bool found = false;
+  for (Eigen::Index row = 0; row < corridor.A.rows(); ++row) {
+    const double denominator = corridor.A.row(row).dot(direction);
+    if (denominator <= 1e-12) continue;
+    const double candidate =
+        (corridor.b(row) - corridor.A.row(row).dot(start)) / denominator;
+    if (candidate >= -1e-10 && candidate < upper) {
+      upper = candidate;
+      found = true;
+    }
+  }
+  if (!found || !std::isfinite(upper)) return false;
+  exit_parameter = std::clamp(upper, 0.0, 1.0);
+  return true;
+}
+
+template <typename PathContainer>
+inline bool pathCoverLineSeed(const std::vector<Vec3>& obstacles,
+                              const PathContainer& reference_path,
+                              const MatX3& A_bound, const Eigen::VectorXd& b_bound,
+                              double alpha, uint32_t random_seed, size_t max_corridors,
+                              double overlap_backtrack_m, double minimum_overlap_margin_m,
+                              PathCoverResult& output, std::string& failure_reason) {
+  output = PathCoverResult{};
+  failure_reason.clear();
+  if (max_corridors == 0) {
+    failure_reason = "invalid_max_corridors";
+    return false;
+  }
+  if (!(overlap_backtrack_m >= 0.0) || !(minimum_overlap_margin_m >= 0.0) ||
+      !std::isfinite(overlap_backtrack_m) || !std::isfinite(minimum_overlap_margin_m)) {
+    failure_reason = "invalid_overlap_parameters";
+    return false;
+  }
+
+  std::vector<Vec3> path;
+  path.reserve(reference_path.size());
+  for (const auto& point : reference_path) {
+    if (!point.allFinite()) {
+      failure_reason = "nonfinite_reference_path";
+      return false;
+    }
+    if (path.empty() || (point - path.back()).norm() > 1e-8) path.push_back(point);
+  }
+  if (path.size() < 2) {
+    failure_reason = "path_too_short";
+    return false;
+  }
+
+  output.reference_waypoints = path.size();
+  output.reference_length = polylineLength(path);
+  output.waypoints.push_back(path.front());
+
+  auto generate_corridor = [&](size_t corridor_index, const Vec3& start, const Vec3& end,
+                               Result& result, std::string& reason) {
+    std::seed_seq sequence{random_seed, static_cast<uint32_t>(corridor_index), 0x70617468U};
+    std::mt19937 rng(sequence);
+    const auto begin = std::chrono::steady_clock::now();
+    const bool ok = lineSeed(obstacles, start, end, A_bound, b_bound, alpha, rng, result, reason);
+    const double elapsed_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+    output.risp_generation_ms += elapsed_ms;
+    return ok;
+  };
+
+  Result first;
+  if (!generate_corridor(0, path[0], path[1], first, failure_reason)) {
+    failure_reason = "corridor_0_" + failure_reason;
+    return false;
+  }
+  output.unreduced_retry_count += first.used_unreduced_retry ? 1U : 0U;
+  output.corridors.push_back(first);
+  output.seed_segments.emplace_back(path[0], path[1]);
+
+  Vec3 last_inside = path[1];
+  size_t path_index = 2;
+  while (path_index < path.size()) {
+    const Vec3 target = path[path_index];
+    const Result& current = output.corridors.back();
+    if (contains(current.A, current.b, target)) {
+      last_inside = target;
+      ++path_index;
+      continue;
+    }
+
+    if (output.corridors.size() >= max_corridors) {
+      output.horizon_exceeded = true;
+      output.covered_length = 0.0;
+      for (size_t i = 1; i < path_index; ++i)
+        output.covered_length += (path[i] - path[i - 1]).norm();
+      failure_reason = "max_corridors_exceeded";
+      return false;
+    }
+
+    double exit_parameter = 0.0;
+    if (!segmentExitParameter(current, last_inside, target, exit_parameter)) {
+      failure_reason = "corridor_" + std::to_string(output.corridors.size() - 1) +
+                       "_exit_not_found";
+      return false;
+    }
+    const Vec3 edge = target - last_inside;
+    const double edge_length = edge.norm();
+    if (!(edge_length > 1e-8)) {
+      failure_reason = "degenerate_reference_edge";
+      return false;
+    }
+
+    const double backtrack_fraction = std::min(exit_parameter, overlap_backtrack_m / edge_length);
+    Vec3 transition = last_inside + (exit_parameter - backtrack_fraction) * edge;
+    Result next;
+    std::string next_reason;
+    const size_t next_index = output.corridors.size();
+    if (!generate_corridor(next_index, transition, target, next, next_reason)) {
+      failure_reason = "corridor_" + std::to_string(next_index) + "_" + next_reason;
+      return false;
+    }
+
+    double overlap_margin = std::min(normalizedMinimumSlack(current.A, current.b, transition),
+                                     normalizedMinimumSlack(next.A, next.b, transition));
+    // If a short edge did not provide enough numerical overlap, retry from the
+    // last fully covered HGP waypoint. This is also the conservative candidate
+    // proposed for the next design iteration.
+    if (overlap_margin < minimum_overlap_margin_m &&
+        (transition - last_inside).norm() > 1e-8) {
+      Result waypoint_seeded;
+      std::string retry_reason;
+      if (generate_corridor(next_index, last_inside, target, waypoint_seeded, retry_reason)) {
+        const double retry_margin =
+            std::min(normalizedMinimumSlack(current.A, current.b, last_inside),
+                     normalizedMinimumSlack(waypoint_seeded.A, waypoint_seeded.b, last_inside));
+        if (retry_margin > overlap_margin) {
+          transition = last_inside;
+          next = std::move(waypoint_seeded);
+          overlap_margin = retry_margin;
+        }
+      }
+    }
+    if (!(overlap_margin >= minimum_overlap_margin_m)) {
+      failure_reason = "corridor_" + std::to_string(next_index) + "_degenerate_overlap";
+      return false;
+    }
+
+    output.min_overlap_margin = std::min(output.min_overlap_margin, overlap_margin);
+    output.unreduced_retry_count += next.used_unreduced_retry ? 1U : 0U;
+    output.waypoints.push_back(transition);
+    output.seed_segments.emplace_back(transition, target);
+    output.corridors.push_back(std::move(next));
+    last_inside = target;
+    ++path_index;
+  }
+
+  // MIGHTY's local solver requires at least two polynomial segments. If one
+  // corridor naturally covers the whole horizon, split it at the reference
+  // path's arc-length midpoint and regenerate two line-seeded corridors.
+  if (output.corridors.size() == 1) {
+    if (max_corridors < 2) {
+      output.horizon_exceeded = true;
+      output.covered_length = output.reference_length;
+      failure_reason = "max_corridors_exceeded";
+      return false;
+    }
+    const double target_length = 0.5 * output.reference_length;
+    double accumulated = 0.0;
+    Vec3 seam = path.front();
+    for (size_t i = 1; i < path.size(); ++i) {
+      const double edge_length = (path[i] - path[i - 1]).norm();
+      if (accumulated + edge_length >= target_length && edge_length > 1e-12) {
+        seam = path[i - 1] +
+               ((target_length - accumulated) / edge_length) * (path[i] - path[i - 1]);
+        break;
+      }
+      accumulated += edge_length;
+    }
+    if ((seam - path.front()).norm() <= 1e-8 || (path.back() - seam).norm() <= 1e-8) {
+      failure_reason = "minimum_segment_count_degenerate_split";
+      return false;
+    }
+    Result first_half, second_half;
+    std::string first_reason, second_reason;
+    if (!generate_corridor(0, path.front(), seam, first_half, first_reason)) {
+      failure_reason = "minimum_segment_count_first_" + first_reason;
+      return false;
+    }
+    if (!generate_corridor(1, seam, path.back(), second_half, second_reason)) {
+      failure_reason = "minimum_segment_count_second_" + second_reason;
+      return false;
+    }
+    const double split_margin =
+        std::min(normalizedMinimumSlack(first_half.A, first_half.b, seam),
+                 normalizedMinimumSlack(second_half.A, second_half.b, seam));
+    if (!(split_margin >= minimum_overlap_margin_m)) {
+      failure_reason = "minimum_segment_count_degenerate_overlap";
+      return false;
+    }
+    output.corridors.clear();
+    output.corridors.push_back(std::move(first_half));
+    output.corridors.push_back(std::move(second_half));
+    output.seed_segments.clear();
+    output.seed_segments.emplace_back(path.front(), seam);
+    output.seed_segments.emplace_back(seam, path.back());
+    output.waypoints.clear();
+    output.waypoints.push_back(path.front());
+    output.waypoints.push_back(seam);
+    output.min_overlap_margin = split_margin;
+    output.unreduced_retry_count =
+        (output.corridors[0].used_unreduced_retry ? 1U : 0U) +
+        (output.corridors[1].used_unreduced_retry ? 1U : 0U);
+  }
+
+  output.waypoints.push_back(path.back());
+  output.covered_length = output.reference_length;
+  output.full_coverage = output.waypoints.size() == output.corridors.size() + 1;
+  if (output.corridors.size() == 1)
+    output.min_overlap_margin = std::numeric_limits<double>::infinity();
+  if (!output.full_coverage) {
+    failure_reason = "corridor_waypoint_count_mismatch";
+    return false;
+  }
+  return true;
+}
+
+}  // namespace mighty::risp

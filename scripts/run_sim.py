@@ -749,9 +749,12 @@ def generate_gazebo_yaml(setup_bash: Path, goal: tuple, sim_env: str,
                          benchmark_replan_details: bool = False,
                          enable_safety_gate: bool = True,
                          sc_method: str = 'ellipsoid',
-                         risp_alpha: float = 0.001,
+                         risp_alpha: float = 0.05,
                          sc_ellipsoid_fallback: bool = False,
-                         risp_random_seed: int = 1) -> str:
+                         risp_random_seed: int = 1,
+                         pathcover_max_corridors: int = 12,
+                         pathcover_overlap_distance: float = 0.25,
+                         pathcover_min_overlap_margin: float = 0.001) -> str:
     """Generate YAML for single-agent Gazebo simulation.
 
     exploration_enabled=False is what makes this mode mean "drive to the goal"
@@ -807,7 +810,10 @@ def generate_gazebo_yaml(setup_bash: Path, goal: tuple, sim_env: str,
                 f'enable_safety_gate:={str(enable_safety_gate).lower()} '
                 f'sc_method:={sc_method} risp_alpha:={risp_alpha} '
                 f'sc_ellipsoid_fallback:={str(sc_ellipsoid_fallback).lower()} '
-                f'risp_random_seed:={risp_random_seed}'
+                f'risp_random_seed:={risp_random_seed} '
+                f'pathcover_max_corridors:={pathcover_max_corridors} '
+                f'pathcover_overlap_distance:={pathcover_overlap_distance} '
+                f'pathcover_min_overlap_margin:={pathcover_min_overlap_margin}'
                 + ('' if exploration_enabled is None
                    else f' exploration_enabled:={str(exploration_enabled).lower()}')
                 + benchmark_args
@@ -1004,13 +1010,13 @@ def main():
 
     parser.add_argument(
         '--sc-method',
-        choices=['ellipsoid', 'risp_point', 'risp_line'],
+        choices=['ellipsoid', 'risp_point', 'risp_line', 'pathcover_line'],
         default='ellipsoid',
         help='Safe-corridor generator (default: ellipsoid)'
     )
     parser.add_argument(
-        '--risp-alpha', type=float, default=0.001,
-        help='RISP separation margin fraction in (0, 1) (default: 0.001)'
+        '--risp-alpha', type=float, default=0.05,
+        help='RISP separation margin fraction in (0, 1) (default: 0.05)'
     )
     parser.add_argument(
         '--sc-ellipsoid-fallback', action='store_true',
@@ -1019,6 +1025,18 @@ def main():
     parser.add_argument(
         '--risp-random-seed', type=int, default=1,
         help='Non-negative deterministic base seed for RISP (default: 1)'
+    )
+    parser.add_argument(
+        '--pathcover-max-corridors', type=int, default=12,
+        help='Maximum PathCover corridors before incomplete coverage is rejected'
+    )
+    parser.add_argument(
+        '--pathcover-overlap-distance', type=float, default=0.25,
+        help='Backtrack distance used to create overlap between adjacent corridors'
+    )
+    parser.add_argument(
+        '--pathcover-min-overlap-margin', type=float, default=0.001,
+        help='Minimum normalized seam margin required in both adjacent corridors'
     )
 
     parser.add_argument(
@@ -1070,6 +1088,12 @@ def main():
         parser.error('--risp-alpha must be in (0, 1)')
     if args.risp_random_seed < 0:
         parser.error('--risp-random-seed must be non-negative')
+    if args.pathcover_max_corridors < 2:
+        parser.error('--pathcover-max-corridors must be at least 2')
+    if args.pathcover_overlap_distance < 0.0:
+        parser.error('--pathcover-overlap-distance must be non-negative')
+    if args.pathcover_min_overlap_margin < 0.0:
+        parser.error('--pathcover-min-overlap-margin must be non-negative')
 
     # Find setup.bash path and rviz config
     setup_bash = find_setup_bash(args.setup_bash)
@@ -1266,7 +1290,10 @@ def main():
             sc_method=args.sc_method,
             risp_alpha=args.risp_alpha,
             sc_ellipsoid_fallback=args.sc_ellipsoid_fallback,
-            risp_random_seed=args.risp_random_seed
+            risp_random_seed=args.risp_random_seed,
+            pathcover_max_corridors=args.pathcover_max_corridors,
+            pathcover_overlap_distance=args.pathcover_overlap_distance,
+            pathcover_min_overlap_margin=args.pathcover_min_overlap_margin
         )
         print(f"[INFO] Mode: Single-agent Gazebo simulation (sim_env={sim_env})")
         print(f"[INFO] Environment: {args.env} (world: {world_name})")

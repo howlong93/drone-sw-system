@@ -111,6 +111,17 @@ struct ReplanBenchmarkData {
   bool sc_seed_validation_success = false;
   bool sc_obstacle_validation_success = false;
   size_t sc_segment_count = 0;
+  size_t sc_reference_waypoints = 0;
+  size_t sc_reference_segments = 0;
+  double sc_pathcover_compression_ratio = 1.0;
+  double sc_pathcover_segmentation_ms = 0.0;
+  double sc_pathcover_reference_length = 0.0;
+  double sc_pathcover_covered_length = 0.0;
+  double sc_pathcover_coverage_ratio = 0.0;
+  double sc_pathcover_min_overlap_margin = std::numeric_limits<double>::infinity();
+  size_t sc_unreduced_retry_count = 0;
+  bool sc_pathcover_full_coverage = false;
+  bool sc_pathcover_horizon_exceeded = false;
   size_t sc_primary_obstacle_count = 0;
   size_t sc_secondary_obstacle_count = 0;
   size_t sc_primary_hyperplanes = 0;
@@ -225,7 +236,8 @@ class MIGHTY {
    *  @param A Planning start state.
    *  @return True if safe corridors were successfully computed.
    */
-  bool getSafeCorridor(const vec_Vecf<3>& global_path, const state& A);
+  bool getSafeCorridor(const vec_Vecf<3>& global_path, const state& A,
+                       vec_Vecf<3>& optimizer_path);
 
   /** @brief Execute one full replan cycle (global path + local trajectory).
    *  @param last_replaning_computation_time Computation time of the previous replan.
@@ -435,7 +447,8 @@ class MIGHTY {
   bool generateLocalTrajectory(const state& local_A, double A_time, vec_Vec3f& global_path,
                                double& initial_guess_computation_time,
                                double& local_traj_computation_time,
-                               std::shared_ptr<lbfgs::SolverLBFGS>& whole_traj_solver_ptr);
+                               std::shared_ptr<lbfgs::SolverLBFGS>& whole_traj_solver_ptr,
+                               const vec_Vec3f* anchor_reference_path = nullptr);
 
   /** @brief Reset all internal timing and cost data to zero. */
   void resetData();

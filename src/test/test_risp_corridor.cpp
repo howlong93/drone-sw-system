@@ -86,5 +86,59 @@ TEST(RispCorridor, RejectsZeroAlphaAndObstacleOnLine) {
   EXPECT_EQ(reason, "seed_intersects_obstacle");
 }
 
-}  // namespace
+TEST(RispCorridor, PathCoverLineBuildsOverlappingCorridorChain) {
+  MatX3 A_bound;
+  Eigen::VectorXd b_bound;
+  makeBounds(A_bound, b_bound);
+  const std::vector<Vec3> path = {Vec3(-2.0, 0.0, 0.0), Vec3(0.0, 0.0, 0.0),
+                                  Vec3(0.0, 2.0, 0.0), Vec3(2.0, 2.0, 0.0)};
+  const std::vector<Vec3> obstacles = {
+      Vec3(-1.0, 0.6, 0.0), Vec3(-1.0, -0.6, 0.0), Vec3(-1.0, 0.0, 0.6),
+      Vec3(-1.0, 0.0, -0.6), Vec3(0.6, 1.0, 0.0), Vec3(-0.6, 1.0, 0.0),
+      Vec3(0.0, 1.0, 0.6), Vec3(0.0, 1.0, -0.6), Vec3(1.0, 2.6, 0.0),
+      Vec3(1.0, 1.4, 0.0), Vec3(1.0, 2.0, 0.6), Vec3(1.0, 2.0, -0.6)};
 
+  mighty::risp::PathCoverResult result;
+  std::string reason;
+  ASSERT_TRUE(mighty::risp::pathCoverLineSeed(obstacles, path, A_bound, b_bound, 0.05, 7,
+                                               8, 0.25, 1e-4, result, reason))
+      << reason;
+  ASSERT_GE(result.corridors.size(), 2U);
+  ASSERT_EQ(result.waypoints.size(), result.corridors.size() + 1);
+  EXPECT_TRUE(result.full_coverage);
+  EXPECT_NEAR(result.reference_length, result.covered_length, 1e-12);
+  for (size_t i = 0; i < result.corridors.size(); ++i) {
+    EXPECT_TRUE(mighty::risp::contains(result.corridors[i].A, result.corridors[i].b,
+                                       result.waypoints[i]));
+    EXPECT_TRUE(mighty::risp::contains(result.corridors[i].A, result.corridors[i].b,
+                                       result.waypoints[i + 1]));
+    for (const auto& obstacle : obstacles)
+      EXPECT_TRUE(outside(result.corridors[i], obstacle));
+  }
+  for (size_t i = 1; i + 1 < result.waypoints.size(); ++i) {
+    EXPECT_GT(mighty::risp::normalizedMinimumSlack(
+                  result.corridors[i - 1].A, result.corridors[i - 1].b, result.waypoints[i]),
+              0.0);
+    EXPECT_GT(mighty::risp::normalizedMinimumSlack(
+                  result.corridors[i].A, result.corridors[i].b, result.waypoints[i]),
+              0.0);
+  }
+}
+
+TEST(RispCorridor, PathCoverLineRejectsIncompleteHorizon) {
+  MatX3 A_bound;
+  Eigen::VectorXd b_bound;
+  makeBounds(A_bound, b_bound);
+  const std::vector<Vec3> path = {Vec3(-2.0, 0.0, 0.0), Vec3(0.0, 0.0, 0.0),
+                                  Vec3(0.0, 2.0, 0.0)};
+  const std::vector<Vec3> obstacles = {Vec3(-1.0, 0.5, 0.0), Vec3(-1.0, -0.5, 0.0),
+                                       Vec3(0.5, 1.0, 0.0), Vec3(-0.5, 1.0, 0.0)};
+  mighty::risp::PathCoverResult result;
+  std::string reason;
+  EXPECT_FALSE(mighty::risp::pathCoverLineSeed(obstacles, path, A_bound, b_bound, 0.05, 7,
+                                                1, 0.25, 1e-4, result, reason));
+  EXPECT_TRUE(result.horizon_exceeded);
+  EXPECT_EQ(reason, "max_corridors_exceeded");
+}
+
+}  // namespace

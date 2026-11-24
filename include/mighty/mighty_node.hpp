@@ -459,6 +459,17 @@ class MIGHTY_NODE : public rclcpp::Node {
     bool sc_primary_success = false;
     bool sc_secondary_success = false;
     size_t sc_segments = 0;
+    size_t sc_reference_waypoints = 0;
+    size_t sc_reference_segments = 0;
+    double sc_pathcover_compression_ratio = 1.0;
+    double sc_pathcover_segmentation_ms = 0.0;
+    double sc_pathcover_reference_length = 0.0;
+    double sc_pathcover_covered_length = 0.0;
+    double sc_pathcover_coverage_ratio = 0.0;
+    double sc_pathcover_min_overlap_margin = std::numeric_limits<double>::infinity();
+    size_t sc_unreduced_retry_count = 0;
+    bool sc_pathcover_full_coverage = false;
+    bool sc_pathcover_horizon_exceeded = false;
     size_t sc_primary_obstacles = 0;
     size_t sc_primary_hyperplanes = 0;
     size_t sc_secondary_obstacles = 0;

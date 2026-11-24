@@ -535,10 +535,14 @@ void MIGHTY::evaluateRecordedTrajectorySafety(const std::vector<Eigen::Vector3d>
 
 // ----------------------------------------------------------------------------
 
-bool MIGHTY::getSafeCorridor(const vec_Vecf<3>& global_path, const state& A) {
+bool MIGHTY::getSafeCorridor(const vec_Vecf<3>& global_path, const state& A,
+                             vec_Vecf<3>& optimizer_path) {
   (void)A;
+  optimizer_path = global_path;
   MyTimer sc_total_timer(true);
   benchmark_data_.sc_segment_count = global_path.size() > 1 ? global_path.size() - 1 : 0;
+  benchmark_data_.sc_reference_waypoints = global_path.size();
+  benchmark_data_.sc_reference_segments = global_path.size() > 1 ? global_path.size() - 1 : 0;
   benchmark_data_.sc_method = par_.sc_method;
   benchmark_data_.sc_result_class.clear();
   benchmark_data_.sc_fallback_used = false;
@@ -598,13 +602,13 @@ bool MIGHTY::getSafeCorridor(const vec_Vecf<3>& global_path, const state& A) {
     benchmark_data_.sc_secondary_failure_reason = stats.failure_reason;
   };
 
-  auto run_risp = [&](const vec_Vec3f& obstacles,
+  auto run_risp = [&](const vec_Vecf<3>& segment_path, const vec_Vec3f& obstacles,
                       std::vector<LinearConstraint3D>& constraints,
                       vec_E<Polyhedron<3>>& polytopes, CorridorDecompStats& stats) {
     MyTimer total_timer(true);
     stats = CorridorDecompStats{};
     stats.input_obstacle_count = obstacles.size();
-    stats.segment_count = global_path.size() > 1 ? global_path.size() - 1 : 0;
+    stats.segment_count = segment_path.size() > 1 ? segment_path.size() - 1 : 0;
     constraints.clear();
     polytopes.clear();
     constraints.reserve(stats.segment_count);
@@ -618,17 +622,17 @@ bool MIGHTY::getSafeCorridor(const vec_Vecf<3>& global_path, const state& A) {
       polytopes.clear();
       return false;
     };
-    if (global_path.size() < 2) return fail("path_too_short");
+    if (segment_path.size() < 2) return fail("path_too_short");
 
     const Eigen::Vector3d local_extent(par_.local_box_size[0], par_.local_box_size[1],
                                        par_.local_box_size[2]);
     const Eigen::Vector3d global_lower(par_.x_min, par_.y_min, par_.z_min);
     const Eigen::Vector3d global_upper(par_.x_max, par_.y_max, par_.z_max);
 
-    for (size_t segment = 0; segment + 1 < global_path.size(); ++segment) {
+    for (size_t segment = 0; segment + 1 < segment_path.size(); ++segment) {
       MyTimer segment_timer(true);
-      const Eigen::Vector3d start = global_path[segment].template cast<double>();
-      const Eigen::Vector3d end = global_path[segment + 1].template cast<double>();
+      const Eigen::Vector3d start = segment_path[segment].template cast<double>();
+      const Eigen::Vector3d end = segment_path[segment + 1].template cast<double>();
       Eigen::Vector3d lower = start.cwiseMin(end) - local_extent;
       Eigen::Vector3d upper = start.cwiseMax(end) + local_extent;
       lower = lower.cwiseMax(global_lower);
@@ -663,7 +667,7 @@ bool MIGHTY::getSafeCorridor(const vec_Vecf<3>& global_path, const state& A) {
       std::string reason;
       MyTimer generation_timer(true);
       const bool generated =
-          par_.sc_method == "risp_line"
+          (par_.sc_method == "risp_line" || par_.sc_method == "pathcover_line")
               ? mighty::risp::lineSeed(local_obstacles, start, end, A_bound, b_bound,
                                         par_.risp_alpha, rng, result, reason)
               : mighty::risp::pointSeed(local_obstacles, 0.5 * (start + end), A_bound, b_bound,
@@ -712,16 +716,130 @@ bool MIGHTY::getSafeCorridor(const vec_Vecf<3>& global_path, const state& A) {
     return true;
   };
 
-  const bool risp_requested = par_.sc_method == "risp_point" || par_.sc_method == "risp_line";
+  mighty::risp::PathCoverResult pathcover_result;
+  auto run_pathcover = [&](const vec_Vec3f& obstacles,
+                           std::vector<LinearConstraint3D>& constraints,
+                           vec_E<Polyhedron<3>>& polytopes, CorridorDecompStats& stats) {
+    MyTimer total_timer(true);
+    stats = CorridorDecompStats{};
+    stats.input_obstacle_count = obstacles.size();
+    constraints.clear();
+    polytopes.clear();
+    if (global_path.size() < 2) {
+      stats.failure_reason = "path_too_short";
+      stats.total_ms = total_timer.getElapsedMicros() / 1000.0;
+      return false;
+    }
+
+    const Eigen::Vector3d local_extent(par_.local_box_size[0], par_.local_box_size[1],
+                                       par_.local_box_size[2]);
+    Eigen::Vector3d lower = global_path.front().template cast<double>();
+    Eigen::Vector3d upper = lower;
+    for (const auto& waypoint : global_path) {
+      lower = lower.cwiseMin(waypoint.template cast<double>());
+      upper = upper.cwiseMax(waypoint.template cast<double>());
+    }
+    lower = (lower - local_extent).cwiseMax(Eigen::Vector3d(par_.x_min, par_.y_min, par_.z_min));
+    upper = (upper + local_extent).cwiseMin(Eigen::Vector3d(par_.x_max, par_.y_max, par_.z_max));
+    if (!lower.allFinite() || !upper.allFinite() || (lower.array() >= upper.array()).any()) {
+      stats.failure_reason = "invalid_pathcover_bounds";
+      stats.total_ms = total_timer.getElapsedMicros() / 1000.0;
+      return false;
+    }
+
+    mighty::risp::MatX3 A_bound(6, 3);
+    A_bound << -1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 1.0,
+        0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 1.0;
+    Eigen::VectorXd b_bound(6);
+    b_bound << -lower.x(), upper.x(), -lower.y(), upper.y(), -lower.z(), upper.z();
+
+    MyTimer copy_timer(true);
+    std::vector<Eigen::Vector3d> local_obstacles;
+    local_obstacles.reserve(obstacles.size());
+    for (const auto& obstacle_raw : obstacles) {
+      const Eigen::Vector3d obstacle = obstacle_raw.template cast<double>();
+      if ((obstacle.array() >= lower.array()).all() &&
+          (obstacle.array() <= upper.array()).all()) {
+        local_obstacles.push_back(obstacle);
+      }
+    }
+    stats.obstacle_copy_ms = copy_timer.getElapsedMicros() / 1000.0;
+
+    MyTimer pathcover_timer(true);
+    std::string reason;
+    const bool generated = mighty::risp::pathCoverLineSeed(
+        local_obstacles, global_path, A_bound, b_bound, par_.risp_alpha,
+        static_cast<uint32_t>(par_.risp_random_seed),
+        static_cast<size_t>(par_.pathcover_max_corridors), par_.pathcover_overlap_distance,
+        par_.pathcover_min_overlap_margin, pathcover_result, reason);
+    const double pathcover_ms = pathcover_timer.getElapsedMicros() / 1000.0;
+    stats.dilation_ms = pathcover_result.risp_generation_ms;
+    benchmark_data_.sc_pathcover_segmentation_ms =
+        std::max(0.0, pathcover_ms - pathcover_result.risp_generation_ms);
+    benchmark_data_.sc_pathcover_reference_length = pathcover_result.reference_length;
+    benchmark_data_.sc_pathcover_covered_length = pathcover_result.covered_length;
+    benchmark_data_.sc_pathcover_coverage_ratio =
+        pathcover_result.reference_length > 1e-9
+            ? pathcover_result.covered_length / pathcover_result.reference_length
+            : 0.0;
+    benchmark_data_.sc_pathcover_min_overlap_margin = pathcover_result.min_overlap_margin;
+    benchmark_data_.sc_unreduced_retry_count = pathcover_result.unreduced_retry_count;
+    benchmark_data_.sc_pathcover_full_coverage = pathcover_result.full_coverage;
+    benchmark_data_.sc_pathcover_horizon_exceeded = pathcover_result.horizon_exceeded;
+    if (!generated) {
+      stats.failure_reason = reason;
+      stats.total_ms = total_timer.getElapsedMicros() / 1000.0;
+      return false;
+    }
+
+    stats.segment_count = pathcover_result.corridors.size();
+    constraints.reserve(stats.segment_count);
+    polytopes.reserve(stats.segment_count);
+    MyTimer constraint_timer(true);
+    for (size_t segment = 0; segment < pathcover_result.corridors.size(); ++segment) {
+      const auto& result = pathcover_result.corridors[segment];
+      LinearConstraint3D constraint(result.A, result.b);
+      Polyhedron<3> polytope;
+      for (Eigen::Index row = 0; row < result.A.rows(); ++row) {
+        const Eigen::Vector3d normal = result.A.row(row).transpose();
+        const double squared_norm = normal.squaredNorm();
+        if (!(squared_norm > 1e-16) || !std::isfinite(squared_norm)) {
+          stats.failure_reason = "corridor_" + std::to_string(segment) + "_degenerate_plane";
+          constraints.clear();
+          polytopes.clear();
+          stats.total_ms = total_timer.getElapsedMicros() / 1000.0;
+          return false;
+        }
+        polytope.add(Hyperplane3D((result.b(row) / squared_norm) * normal, normal));
+      }
+      constraint.poly_ = polytope;
+      constraints.push_back(std::move(constraint));
+      polytopes.push_back(std::move(polytope));
+      stats.total_hyperplanes += static_cast<size_t>(result.A.rows());
+      ++stats.completed_segment_count;
+    }
+    stats.constraint_ms = constraint_timer.getElapsedMicros() / 1000.0;
+    stats.success = true;
+    stats.total_ms = total_timer.getElapsedMicros() / 1000.0;
+    return true;
+  };
+
+  const bool pathcover_requested = par_.sc_method == "pathcover_line";
+  const bool risp_requested = pathcover_requested || par_.sc_method == "risp_point" ||
+                              par_.sc_method == "risp_line";
   bool primary_ok = false;
   std::string risp_failure_reason;
   if (risp_requested) {
-    primary_ok = run_risp(base_uo, safe_corridor_polytopes_whole_, poly_out_whole_, primary_stats);
+    primary_ok = pathcover_requested
+                     ? run_pathcover(base_uo, safe_corridor_polytopes_whole_, poly_out_whole_,
+                                     primary_stats)
+                     : run_risp(global_path, base_uo, safe_corridor_polytopes_whole_,
+                                poly_out_whole_, primary_stats);
     apply_primary_stats();
     benchmark_data_.sc_primary_success = primary_ok;
     if (!primary_ok) {
       risp_failure_reason = primary_stats.failure_reason;
-      benchmark_data_.sc_result_class = "risp_failed";
+      benchmark_data_.sc_result_class = pathcover_requested ? "pathcover_failed" : "risp_failed";
       if (!par_.sc_ellipsoid_fallback) {
         std::cout << bold << red << "RISP corridor generation failed: " << risp_failure_reason
                   << reset << std::endl;
@@ -733,7 +851,21 @@ bool MIGHTY::getSafeCorridor(const vec_Vecf<3>& global_path, const state& A) {
       }
       benchmark_data_.sc_fallback_used = true;
     } else {
-      benchmark_data_.sc_result_class = "risp_success";
+      if (pathcover_requested) {
+        optimizer_path.assign(pathcover_result.waypoints.begin(),
+                              pathcover_result.waypoints.end());
+        benchmark_data_.sc_segment_count = pathcover_result.corridors.size();
+        benchmark_data_.sc_pathcover_compression_ratio =
+            benchmark_data_.sc_reference_segments > 0
+                ? static_cast<double>(pathcover_result.corridors.size()) /
+                      static_cast<double>(benchmark_data_.sc_reference_segments)
+                : 1.0;
+        benchmark_data_.sc_result_class = pathcover_result.unreduced_retry_count > 0
+                                               ? "pathcover_success_unreduced_retry"
+                                               : "pathcover_success";
+      } else {
+        benchmark_data_.sc_result_class = "risp_success";
+      }
     }
   }
 
@@ -751,7 +883,11 @@ bool MIGHTY::getSafeCorridor(const vec_Vecf<3>& global_path, const state& A) {
     if (benchmark_data_.sc_fallback_used) {
       benchmark_data_.sc_fallback_success = primary_ok;
       benchmark_data_.sc_result_class =
-          primary_ok ? "risp_failed_fallback_success" : "risp_failed_fallback_failed";
+          primary_ok
+              ? (pathcover_requested ? "pathcover_failed_fallback_success"
+                                     : "risp_failed_fallback_success")
+              : (pathcover_requested ? "pathcover_failed_fallback_failed"
+                                     : "risp_failed_fallback_failed");
       benchmark_data_.sc_primary_failure_reason =
           "risp:" + risp_failure_reason +
           (primary_ok ? ";ellipsoid:success"
@@ -783,9 +919,9 @@ bool MIGHTY::getSafeCorridor(const vec_Vecf<3>& global_path, const state& A) {
       return ((cs.A_ * p - cs.b_).array() <= validation_tol).all();
     };
     for (size_t i = 0;
-         i < safe_corridor_polytopes_whole_.size() && i + 1 < global_path.size(); ++i) {
+         i < safe_corridor_polytopes_whole_.size() && i + 1 < optimizer_path.size(); ++i) {
       const auto& cs = safe_corridor_polytopes_whole_[i];
-      if (!is_inside(cs, global_path[i]) || !is_inside(cs, global_path[i + 1]))
+      if (!is_inside(cs, optimizer_path[i]) || !is_inside(cs, optimizer_path[i + 1]))
         seeds_valid = false;
       for (const auto& obstacle : base_uo) {
         if (is_inside(cs, obstacle)) {
@@ -822,7 +958,8 @@ bool MIGHTY::getSafeCorridor(const vec_Vecf<3>& global_path, const state& A) {
     CorridorDecompStats secondary_stats;
     bool secondary_ok = false;
     if (risp_requested && !benchmark_data_.sc_fallback_used) {
-      secondary_ok = run_risp(base_uo_safe, safe_constraints, poly_out_safe_, secondary_stats);
+      secondary_ok = run_risp(optimizer_path, base_uo_safe, safe_constraints, poly_out_safe_,
+                              secondary_stats);
     } else {
       EllipsoidDecomp3D ellip_safe;
       ellip_safe.set_local_bbox(
@@ -1663,9 +1800,14 @@ bool MIGHTY::planLocalTrajectory(vec_Vecf<3>& global_path) {
     global_path.insert(global_path.begin() + 1, midpoint);
   }
 
+  // PathCover may replace only the optimizer segmentation. Keep the HGP route
+  // unchanged as the positional anchor/reference for the local optimizer.
+  const vec_Vec3f hgp_reference_path = global_path;
+  vec_Vec3f optimizer_path = global_path;
+
   // convex decomposition
   MyTimer timer_sfc(true);
-  if (!getSafeCorridor(global_path, local_A)) {
+  if (!getSafeCorridor(hgp_reference_path, local_A, optimizer_path)) {
     if (par_.debug_verbose)
       printf("[TIMING]   Safe corridor (FAILED): %.2f ms\n", timer_sfc.getElapsedMicros() / 1000.0);
     replanning_failure_count_++;
@@ -1685,8 +1827,9 @@ bool MIGHTY::planLocalTrajectory(vec_Vecf<3>& global_path) {
 
   MyTimer timer_opt(true);
   optimization_succeeded =
-      generateLocalTrajectory(local_A, A_time, global_path, initial_guess_computation_time_,
-                              local_traj_computation_time_, whole_traj_solver_ptr_);
+      generateLocalTrajectory(local_A, A_time, optimizer_path, initial_guess_computation_time_,
+                              local_traj_computation_time_, whole_traj_solver_ptr_,
+                              &hgp_reference_path);
   if (par_.debug_verbose)
     printf("[TIMING]   L-BFGS optimization: %.2f ms\n", timer_opt.getElapsedMicros() / 1000.0);
 
@@ -2120,7 +2263,8 @@ void MIGHTY::getPiecewiseQuinticPol(PieceWiseQuinticPol& pwp) { pwp = pwp_to_sha
 bool MIGHTY::generateLocalTrajectory(const state& local_A, double A_time, vec_Vec3f& global_path,
                                      double& initial_guess_computation_time,
                                      double& local_traj_computation_time,
-                                     std::shared_ptr<lbfgs::SolverLBFGS>& whole_traj_solver_ptr) {
+                                     std::shared_ptr<lbfgs::SolverLBFGS>& whole_traj_solver_ptr,
+                                     const vec_Vec3f* anchor_reference_path) {
   if (par_.debug_verbose) std::cout << "Preparing solver for replan" << std::endl;
 
   auto local_trajs = getTrajs();  // RVO/NRVO elides copy
@@ -2148,7 +2292,8 @@ bool MIGHTY::generateLocalTrajectory(const state& local_A, double A_time, vec_Ve
 
   whole_traj_solver_ptr->prepareSolverForReplan(
       A_time, global_path, safe_corridor_polytopes_whole_, local_trajs, local_A, local_E,
-      initial_guess_computation_time, par_.use_multiple_initial_guesses);
+      initial_guess_computation_time, par_.use_multiple_initial_guesses, true,
+      anchor_reference_path);
 
   // Skip the solver's pushed path — use the original HGP path instead
   // whole_traj_solver_ptr->getGlobalPath(global_path);
@@ -2217,7 +2362,8 @@ bool MIGHTY::generateLocalTrajectory(const state& local_A, double A_time, vec_Ve
         double initial_guess_computation_time = 0.0;
         solver_ptr->prepareSolverForReplan(
             A_time, global_path, safe_corridor_polytopes_whole_, local_trajs, local_A, local_E,
-            initial_guess_computation_time);  // initial time t0 = 0.0
+            initial_guess_computation_time, false, true,
+            anchor_reference_path);  // initial time t0 = 0.0
 
         // copy initial guess
         Eigen::VectorXd z0 = list_z0[i];

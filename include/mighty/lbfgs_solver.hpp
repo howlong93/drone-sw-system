@@ -316,7 +316,8 @@ class SolverLBFGS {
                               const state& initial_state, const state& goal_state,
                               double& initial_guess_computation_time,
                               bool use_for_safe_path = false,
-                              bool use_multiple_initial_guesses = true);
+                              bool use_multiple_initial_guesses = true,
+                              const vec_Vec3f* anchor_reference_path = nullptr);
 
   /** @brief Compute the six quintic Hermite control points for one segment.
    *  @param P0 Start position.

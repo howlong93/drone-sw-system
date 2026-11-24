@@ -172,6 +172,10 @@ struct parameters {
   double obst_position_error{0.0};
   bool inflate_unknown_boundary{false};
   bool sfc_use_unknown_as_obstacle{false};
+  std::string sc_method{"ellipsoid"};
+  double risp_alpha{0.05};
+  bool sc_ellipsoid_fallback{false};
+  int risp_random_seed{1};
 
   // Communication delay parameters
   bool use_comm_delay_inflation;

@@ -103,6 +103,9 @@ struct ReplanBenchmarkData {
   double sc_secondary_ms = 0.0;
   double sc_validation_ms = 0.0;
   std::string sc_method = "ellipsoid";
+  std::string sc_result_class;
+  bool sc_fallback_used = false;
+  bool sc_fallback_success = false;
   bool sc_primary_success = false;
   bool sc_secondary_success = false;
   bool sc_seed_validation_success = false;

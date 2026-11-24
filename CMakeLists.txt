@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.8)
 project(mighty)
 
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Default build type" FORCE)
   message(STATUS "mighty: defaulting CMAKE_BUILD_TYPE to Release")
@@ -52,6 +55,7 @@ find_package(std_srvs REQUIRED)
 find_package(pcl_ros REQUIRED)
 find_package(nlohmann_json REQUIRED)
 find_package(gazebo_msgs REQUIRED)
+find_package(Qhull REQUIRED)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}")
 
@@ -74,7 +78,7 @@ add_definitions(${PCL_DEFINITIONS})
 
 # add executables
 add_executable(mighty src/mighty/mighty_node.cpp src/mighty/mighty.cpp src/hgp/hgp_manager.cpp src/hgp/utils.cpp src/hgp/hgp_planner.cpp src/hgp/graph_search.cpp src/mighty/utils.cpp src/mighty/lbfgs_solver.cpp src/mighty/lbfgs_solver_utils.cpp src/mighty/frontier_detector.cpp src/mighty/frontier_manager.cpp)
-target_link_libraries(mighty ${PCL_LIBRARIES})
+target_link_libraries(mighty ${PCL_LIBRARIES} Qhull::qhullcpp Qhull::qhull_r)
 ament_target_dependencies(mighty rclcpp example_interfaces dynus_interfaces visualization_msgs Eigen3 decomp_ros_msgs sensor_msgs std_msgs nav_msgs decomp_rviz_plugins decomp_test_node tf2_geometry_msgs tf2 tf2_ros tf2_eigen std_srvs pcl_ros)
 
 # Add odom to state converter
@@ -220,6 +224,12 @@ if(BUILD_TESTING)
     rclcpp example_interfaces dynus_interfaces visualization_msgs Eigen3
     decomp_ros_msgs sensor_msgs std_msgs decomp_rviz_plugins decomp_test_node
     tf2_geometry_msgs)
+
+  ament_add_gtest(test_risp_corridor
+    src/test/test_risp_corridor.cpp)
+  target_link_libraries(test_risp_corridor
+    Qhull::qhullcpp Qhull::qhull_r)
+  ament_target_dependencies(test_risp_corridor Eigen3)
 endif()
 
 ament_package()

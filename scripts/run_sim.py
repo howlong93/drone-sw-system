@@ -747,7 +747,11 @@ def generate_gazebo_yaml(setup_bash: Path, goal: tuple, sim_env: str,
                          auto_exit_delay: float = -1.0,
                          benchmark_file: str = None,
                          benchmark_replan_details: bool = False,
-                         enable_safety_gate: bool = True) -> str:
+                         enable_safety_gate: bool = True,
+                         sc_method: str = 'ellipsoid',
+                         risp_alpha: float = 0.001,
+                         sc_ellipsoid_fallback: bool = False,
+                         risp_random_seed: int = 1) -> str:
     """Generate YAML for single-agent Gazebo simulation.
 
     exploration_enabled=False is what makes this mode mean "drive to the goal"
@@ -800,7 +804,10 @@ def generate_gazebo_yaml(setup_bash: Path, goal: tuple, sim_env: str,
                 'sleep 3',
                 f'ros2 launch mighty onboard_mighty.launch.py x:={start_x} y:={start_y} z:={start_z} yaw:={start_yaw} '
                 f'sim_env:={sim_env} use_ground_robot:={str(use_ground_robot).lower()} '
-                f'enable_safety_gate:={str(enable_safety_gate).lower()}'
+                f'enable_safety_gate:={str(enable_safety_gate).lower()} '
+                f'sc_method:={sc_method} risp_alpha:={risp_alpha} '
+                f'sc_ellipsoid_fallback:={str(sc_ellipsoid_fallback).lower()} '
+                f'risp_random_seed:={risp_random_seed}'
                 + ('' if exploration_enabled is None
                    else f' exploration_enabled:={str(exploration_enabled).lower()}')
                 + benchmark_args
@@ -996,6 +1003,25 @@ def main():
     )
 
     parser.add_argument(
+        '--sc-method',
+        choices=['ellipsoid', 'risp_point', 'risp_line'],
+        default='ellipsoid',
+        help='Safe-corridor generator (default: ellipsoid)'
+    )
+    parser.add_argument(
+        '--risp-alpha', type=float, default=0.001,
+        help='RISP separation margin fraction in (0, 1) (default: 0.001)'
+    )
+    parser.add_argument(
+        '--sc-ellipsoid-fallback', action='store_true',
+        help='Use ellipsoid decomposition when RISP fails; the event remains classified as RISP failure'
+    )
+    parser.add_argument(
+        '--risp-random-seed', type=int, default=1,
+        help='Non-negative deterministic base seed for RISP (default: 1)'
+    )
+
+    parser.add_argument(
         '--dry-run',
         action='store_true',
         help='Print the generated YAML without launching'
@@ -1040,6 +1066,10 @@ def main():
         parser.error('--auto-exit-delay must be -1 or a non-negative number')
     if args.benchmark_file and args.mode != 'gazebo':
         parser.error('--benchmark-file is only supported with --mode gazebo')
+    if not 0.0 < args.risp_alpha < 1.0:
+        parser.error('--risp-alpha must be in (0, 1)')
+    if args.risp_random_seed < 0:
+        parser.error('--risp-random-seed must be non-negative')
 
     # Find setup.bash path and rviz config
     setup_bash = find_setup_bash(args.setup_bash)
@@ -1232,7 +1262,11 @@ def main():
             auto_exit_delay=args.auto_exit_delay,
             benchmark_file=args.benchmark_file,
             benchmark_replan_details=args.benchmark_replan_details,
-            enable_safety_gate=not args.disable_safety_gate
+            enable_safety_gate=not args.disable_safety_gate,
+            sc_method=args.sc_method,
+            risp_alpha=args.risp_alpha,
+            sc_ellipsoid_fallback=args.sc_ellipsoid_fallback,
+            risp_random_seed=args.risp_random_seed
         )
         print(f"[INFO] Mode: Single-agent Gazebo simulation (sim_env={sim_env})")
         print(f"[INFO] Environment: {args.env} (world: {world_name})")

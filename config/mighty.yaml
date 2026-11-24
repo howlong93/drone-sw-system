@@ -201,6 +201,10 @@ mighty_node:
         use_shrinked_box: false                         # [-] Use shrunk box for decomposition
         shrinked_box_size: 0.0                          # [m] Shrunk box size
         sfc_use_unknown_as_obstacle: false              # [-] Treat unknown cells as obstacles in SFC generation
+        sc_method: "ellipsoid"                          # [ellipsoid, risp_point, risp_line]
+        risp_alpha: 0.05                                # [-] Algorithmic separator; safety comes from map inflation
+        sc_ellipsoid_fallback: false                    # [-] Use ellipsoid only after a RISP failure
+        risp_random_seed: 1                             # [-] Deterministic per-segment RISP sampling seed
 
         # --- L-BFGS Solver Internals ---
         spline_degree: 5                                # [-] Hermite spline degree (3=cubic, 5=quintic)

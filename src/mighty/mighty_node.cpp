@@ -586,6 +586,10 @@ void MIGHTY_NODE::declareParameters() {
   this->declare_parameter("use_shrinked_box", false);
   this->declare_parameter("shrinked_box_size", 0.2);
   this->declare_parameter("sfc_use_unknown_as_obstacle", false);
+  this->declare_parameter("sc_method", "ellipsoid");
+  this->declare_parameter("risp_alpha", 0.05);
+  this->declare_parameter("sc_ellipsoid_fallback", false);
+  this->declare_parameter("risp_random_seed", 1);
 
   // Map parameters
   this->declare_parameter("map_buffer", 6.0);
@@ -962,6 +966,26 @@ void MIGHTY_NODE::setParameters() {
   par_.use_shrinked_box = this->get_parameter("use_shrinked_box").as_bool();
   par_.shrinked_box_size = this->get_parameter("shrinked_box_size").as_double();
   par_.sfc_use_unknown_as_obstacle = this->get_parameter("sfc_use_unknown_as_obstacle").as_bool();
+  par_.sc_method = this->get_parameter("sc_method").as_string();
+  par_.risp_alpha = this->get_parameter("risp_alpha").as_double();
+  par_.sc_ellipsoid_fallback = this->get_parameter("sc_ellipsoid_fallback").as_bool();
+  par_.risp_random_seed = this->get_parameter("risp_random_seed").as_int();
+  if (par_.sc_method != "ellipsoid" && par_.sc_method != "risp_point" &&
+      par_.sc_method != "risp_line") {
+    RCLCPP_WARN(this->get_logger(),
+                "Unknown sc_method '%s'; falling back to the MIGHTY ellipsoid baseline",
+                par_.sc_method.c_str());
+    par_.sc_method = "ellipsoid";
+  }
+  if (!(par_.risp_alpha > 0.0 && par_.risp_alpha < 1.0) ||
+      !std::isfinite(par_.risp_alpha)) {
+    RCLCPP_WARN(this->get_logger(), "risp_alpha must be finite and in (0,1); using 0.05");
+    par_.risp_alpha = 0.05;
+  }
+  if (par_.risp_random_seed < 0) {
+    RCLCPP_WARN(this->get_logger(), "risp_random_seed must be non-negative; using 1");
+    par_.risp_random_seed = 1;
+  }
 
   // Map parameters
   par_.map_buffer = this->get_parameter("map_buffer").as_double();
@@ -1304,6 +1328,16 @@ void MIGHTY_NODE::printParameters() {
   RCLCPP_INFO(this->get_logger(), "Shrinked Box Size: %f", par_.shrinked_box_size);
   RCLCPP_INFO(this->get_logger(), "SFC Use Unknown As Obstacle: %d",
               par_.sfc_use_unknown_as_obstacle);
+  RCLCPP_INFO(this->get_logger(), "SC Method: %s", par_.sc_method.c_str());
+  RCLCPP_INFO(this->get_logger(), "RISP Alpha: %.6f", par_.risp_alpha);
+  RCLCPP_INFO(this->get_logger(), "SC Ellipsoid Fallback: %d", par_.sc_ellipsoid_fallback);
+  RCLCPP_INFO(this->get_logger(), "RISP Random Seed: %d", par_.risp_random_seed);
+  if (par_.sc_method != "ellipsoid" && par_.inflation_hgp < par_.drone_radius) {
+    RCLCPP_WARN(this->get_logger(),
+                "RISP uses the inflated planning map without adding drone_radius: "
+                "inflation_hgp=%.3f is smaller than drone_radius=%.3f",
+                par_.inflation_hgp, par_.drone_radius);
+  }
 
   // Map parameters
   RCLCPP_INFO(this->get_logger(), "Local Map Buffer: %f", par_.map_buffer);
@@ -1717,6 +1751,9 @@ void MIGHTY_NODE::replanCallback() {
     event.sc_secondary_ms = benchmark_sample.sc_secondary_ms;
     event.sc_validation_ms = benchmark_sample.sc_validation_ms;
     event.sc_method = benchmark_sample.sc_method;
+    event.sc_result_class = benchmark_sample.sc_result_class;
+    event.sc_fallback_used = benchmark_sample.sc_fallback_used;
+    event.sc_fallback_success = benchmark_sample.sc_fallback_success;
     event.sc_primary_success = benchmark_sample.sc_primary_success;
     event.sc_secondary_success = benchmark_sample.sc_secondary_success;
     event.sc_segments = benchmark_sample.sc_segment_count;
@@ -2766,6 +2803,7 @@ void MIGHTY_NODE::logData(bool final) {
          "total_ms,housekeeping_ms,global_stage_ms,global_planner_core_ms,local_stage_ms,"
          "append_plan_ms,final_housekeeping_ms,initial_guess_ms,optimizer_ms,"
          "sc_total_ms,sc_input_prepare_ms,sc_primary_ms,sc_secondary_ms,sc_validation_ms,"
+         "sc_method,sc_result_class,sc_fallback_used,sc_fallback_success,"
          "sc_primary_success,sc_secondary_success,sc_seed_valid,sc_obstacles_valid,"
          "sc_segments,sc_primary_obstacles,sc_secondary_obstacles,sc_primary_hyperplanes,"
          "sc_secondary_hyperplanes,sc_obstacle_violations,sc_max_obstacle_penetration_m,"
@@ -2808,7 +2846,9 @@ void MIGHTY_NODE::logData(bool final) {
              << s.append_plan_ms << ',' << s.final_housekeeping_ms << ',' << row.initial_guess_ms
              << ',' << row.optimizer_ms << ',' << s.sc_total_ms << ',' << s.sc_input_prepare_ms
              << ',' << s.sc_primary_ms << ',' << s.sc_secondary_ms << ',' << s.sc_validation_ms
-             << ',' << s.sc_primary_success << ',' << s.sc_secondary_success << ','
+             << ',' << s.sc_method << ',' << s.sc_result_class << ',' << s.sc_fallback_used << ','
+             << s.sc_fallback_success << ',' << s.sc_primary_success << ','
+             << s.sc_secondary_success << ','
              << s.sc_seed_validation_success << ',' << s.sc_obstacle_validation_success << ','
              << s.sc_segment_count << ',' << s.sc_primary_obstacle_count << ','
              << s.sc_secondary_obstacle_count << ',' << s.sc_primary_hyperplanes << ','
@@ -3195,7 +3235,8 @@ void MIGHTY_NODE::logData(bool final) {
            "generated_plan_points,plan_points_after_append,plan_points_finish,min_plan_points,"
            "housekeeping_ms,global_stage_ms,global_planner_core_ms,local_stage_ms,"
            "append_plan_ms,initial_guess_ms,optimizer_ms,sc_total_ms,sc_input_prepare_ms,"
-           "sc_primary_ms,sc_secondary_ms,sc_validation_ms,sc_method,sc_primary_success,"
+           "sc_primary_ms,sc_secondary_ms,sc_validation_ms,sc_method,sc_result_class,"
+           "sc_fallback_used,sc_fallback_success,sc_primary_success,"
            "sc_secondary_success,sc_segments,sc_primary_obstacles,sc_secondary_obstacles,"
            "sc_primary_hyperplanes,sc_secondary_hyperplanes,sc_primary_failure_reason,"
            "sc_secondary_failure_reason,hgp_static_jps_ms,"
@@ -3233,7 +3274,9 @@ void MIGHTY_NODE::logData(bool final) {
                   << event.sc_total_ms << ',' << event.sc_input_prepare_ms << ','
                   << event.sc_primary_ms << ',' << event.sc_secondary_ms << ','
                   << event.sc_validation_ms << ',' << event.sc_method << ','
-                  << event.sc_primary_success << ',' << event.sc_secondary_success << ','
+                  << event.sc_result_class << ',' << event.sc_fallback_used << ','
+                  << event.sc_fallback_success << ',' << event.sc_primary_success << ','
+                  << event.sc_secondary_success << ','
                   << event.sc_segments << ',' << event.sc_primary_obstacles << ','
                   << event.sc_secondary_obstacles << ',' << event.sc_primary_hyperplanes << ','
                   << event.sc_secondary_hyperplanes << ',' << event.sc_primary_failure_reason

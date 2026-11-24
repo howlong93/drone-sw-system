@@ -8,6 +8,7 @@
 
 #include "mighty/mighty.hpp"
 #include "mighty/path_utils.hpp"
+#include "mighty/risp_corridor.hpp"
 
 using namespace mighty;
 using namespace termcolor;
@@ -538,6 +539,10 @@ bool MIGHTY::getSafeCorridor(const vec_Vecf<3>& global_path, const state& A) {
   (void)A;
   MyTimer sc_total_timer(true);
   benchmark_data_.sc_segment_count = global_path.size() > 1 ? global_path.size() - 1 : 0;
+  benchmark_data_.sc_method = par_.sc_method;
+  benchmark_data_.sc_result_class.clear();
+  benchmark_data_.sc_fallback_used = false;
+  benchmark_data_.sc_fallback_success = false;
 
   // Skip decomposition entirely when static obstacle weight is zero
   if (par_.stat_weight <= 0.0) {
@@ -549,6 +554,7 @@ bool MIGHTY::getSafeCorridor(const vec_Vecf<3>& global_path, const state& A) {
     benchmark_data_.sc_secondary_success = true;
     benchmark_data_.sc_seed_validation_success = true;
     benchmark_data_.sc_obstacle_validation_success = true;
+    benchmark_data_.sc_result_class = "disabled_static_weight";
     benchmark_data_.sc_total_ms = sc_total_timer.getElapsedMicros() / 1000.0;
     return true;
   }
@@ -557,15 +563,6 @@ bool MIGHTY::getSafeCorridor(const vec_Vecf<3>& global_path, const state& A) {
 
   // Debug
   if (par_.debug_verbose) std::cout << "Convex decomposition" << std::endl;
-
-  // Set up ellipsoid decomposition utility
-  EllipsoidDecomp3D ellip;
-  ellip.set_local_bbox(
-      Vec3f(par_.local_box_size[0], par_.local_box_size[1], par_.local_box_size[2]));
-  ellip.set_z_min_and_max(par_.z_min, par_.z_max);
-  // Retain the inflated planning map and add the configured vehicle radius as
-  // an explicit corridor clearance margin.
-  ellip.set_inflate_distance(par_.drone_radius);
 
   // Get obstacle points for decomposition
   vec_Vec3f base_uo;
@@ -580,19 +577,191 @@ bool MIGHTY::getSafeCorridor(const vec_Vecf<3>& global_path, const state& A) {
   benchmark_data_.sc_primary_obstacle_count = base_uo.size();
   benchmark_data_.sc_input_prepare_ms = input_prepare_timer.getElapsedMicros() / 1000.0;
 
-  // Check if the convex decomposition failed
   CorridorDecompStats primary_stats;
-  if (!hgp_manager_.cvxEllipsoidDecomp(ellip, global_path, base_uo, obst_pos, obst_bbox,
-                                       seg_end_times, safe_corridor_polytopes_whole_,
-                                       poly_out_whole_, &primary_stats)) {
+  auto apply_primary_stats = [&]() {
     benchmark_data_.sc_primary_ms = primary_stats.total_ms;
-    benchmark_data_.sc_primary_success = false;
     benchmark_data_.sc_primary_obstacle_copy_ms = primary_stats.obstacle_copy_ms;
     benchmark_data_.sc_primary_dilation_ms = primary_stats.dilation_ms;
     benchmark_data_.sc_primary_constraint_ms = primary_stats.constraint_ms;
     benchmark_data_.sc_primary_hyperplanes = primary_stats.total_hyperplanes;
     benchmark_data_.sc_primary_segment_ms = primary_stats.segment_ms;
     benchmark_data_.sc_primary_failure_reason = primary_stats.failure_reason;
+  };
+  auto apply_secondary_stats = [&](const CorridorDecompStats& stats) {
+    benchmark_data_.sc_secondary_ms = stats.total_ms;
+    benchmark_data_.sc_secondary_success = stats.success;
+    benchmark_data_.sc_secondary_obstacle_copy_ms = stats.obstacle_copy_ms;
+    benchmark_data_.sc_secondary_dilation_ms = stats.dilation_ms;
+    benchmark_data_.sc_secondary_constraint_ms = stats.constraint_ms;
+    benchmark_data_.sc_secondary_hyperplanes = stats.total_hyperplanes;
+    benchmark_data_.sc_secondary_segment_ms = stats.segment_ms;
+    benchmark_data_.sc_secondary_failure_reason = stats.failure_reason;
+  };
+
+  auto run_risp = [&](const vec_Vec3f& obstacles,
+                      std::vector<LinearConstraint3D>& constraints,
+                      vec_E<Polyhedron<3>>& polytopes, CorridorDecompStats& stats) {
+    MyTimer total_timer(true);
+    stats = CorridorDecompStats{};
+    stats.input_obstacle_count = obstacles.size();
+    stats.segment_count = global_path.size() > 1 ? global_path.size() - 1 : 0;
+    constraints.clear();
+    polytopes.clear();
+    constraints.reserve(stats.segment_count);
+    polytopes.reserve(stats.segment_count);
+
+    auto fail = [&](const std::string& reason) {
+      stats.success = false;
+      stats.failure_reason = reason;
+      stats.total_ms = total_timer.getElapsedMicros() / 1000.0;
+      constraints.clear();
+      polytopes.clear();
+      return false;
+    };
+    if (global_path.size() < 2) return fail("path_too_short");
+
+    const Eigen::Vector3d local_extent(par_.local_box_size[0], par_.local_box_size[1],
+                                       par_.local_box_size[2]);
+    const Eigen::Vector3d global_lower(par_.x_min, par_.y_min, par_.z_min);
+    const Eigen::Vector3d global_upper(par_.x_max, par_.y_max, par_.z_max);
+
+    for (size_t segment = 0; segment + 1 < global_path.size(); ++segment) {
+      MyTimer segment_timer(true);
+      const Eigen::Vector3d start = global_path[segment].template cast<double>();
+      const Eigen::Vector3d end = global_path[segment + 1].template cast<double>();
+      Eigen::Vector3d lower = start.cwiseMin(end) - local_extent;
+      Eigen::Vector3d upper = start.cwiseMax(end) + local_extent;
+      lower = lower.cwiseMax(global_lower);
+      upper = upper.cwiseMin(global_upper);
+      if (!lower.allFinite() || !upper.allFinite() || (lower.array() >= upper.array()).any()) {
+        return fail("segment_" + std::to_string(segment) + "_invalid_local_bounds");
+      }
+
+      mighty::risp::MatX3 A_bound(6, 3);
+      A_bound << -1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 1.0,
+          0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 1.0;
+      Eigen::VectorXd b_bound(6);
+      b_bound << -lower.x(), upper.x(), -lower.y(), upper.y(), -lower.z(), upper.z();
+
+      MyTimer copy_timer(true);
+      std::vector<Eigen::Vector3d> local_obstacles;
+      local_obstacles.reserve(obstacles.size());
+      for (const auto& obstacle_raw : obstacles) {
+        const Eigen::Vector3d obstacle = obstacle_raw.template cast<double>();
+        if ((obstacle.array() >= lower.array()).all() &&
+            (obstacle.array() <= upper.array()).all()) {
+          local_obstacles.push_back(obstacle);
+        }
+      }
+      stats.obstacle_copy_ms += copy_timer.getElapsedMicros() / 1000.0;
+
+      std::seed_seq seed_sequence{
+          static_cast<uint32_t>(par_.risp_random_seed), static_cast<uint32_t>(segment),
+          static_cast<uint32_t>(0x9e3779b9U)};
+      std::mt19937 rng(seed_sequence);
+      mighty::risp::Result result;
+      std::string reason;
+      MyTimer generation_timer(true);
+      const bool generated =
+          par_.sc_method == "risp_line"
+              ? mighty::risp::lineSeed(local_obstacles, start, end, A_bound, b_bound,
+                                        par_.risp_alpha, rng, result, reason)
+              : mighty::risp::pointSeed(local_obstacles, 0.5 * (start + end), A_bound, b_bound,
+                                         par_.risp_alpha, rng, result, reason);
+      stats.dilation_ms += generation_timer.getElapsedMicros() / 1000.0;
+      if (!generated) {
+        return fail("segment_" + std::to_string(segment) + "_" + reason);
+      }
+
+      constexpr double containment_tolerance = 1e-7;
+      auto contains = [&](const Eigen::Vector3d& point) {
+        return ((result.A * point - result.b).array() <= containment_tolerance).all();
+      };
+      if (!contains(start) || !contains(end)) {
+        return fail("segment_" + std::to_string(segment) + "_seed_endpoint_outside");
+      }
+      for (const auto& obstacle : local_obstacles) {
+        if (((result.A * obstacle - result.b).array() <= containment_tolerance).all()) {
+          return fail("segment_" + std::to_string(segment) + "_obstacle_inside");
+        }
+      }
+
+      MyTimer constraint_timer(true);
+      LinearConstraint3D constraint(result.A, result.b);
+      Polyhedron<3> polytope;
+      for (Eigen::Index row = 0; row < result.A.rows(); ++row) {
+        const Eigen::Vector3d normal = result.A.row(row).transpose();
+        const double squared_norm = normal.squaredNorm();
+        if (!(squared_norm > 1e-16) || !std::isfinite(squared_norm)) {
+          return fail("segment_" + std::to_string(segment) + "_degenerate_plane");
+        }
+        const Eigen::Vector3d point = (result.b(row) / squared_norm) * normal;
+        polytope.add(Hyperplane3D(point, normal));
+      }
+      constraint.poly_ = polytope;
+      constraints.push_back(std::move(constraint));
+      polytopes.push_back(std::move(polytope));
+      stats.constraint_ms += constraint_timer.getElapsedMicros() / 1000.0;
+      stats.total_hyperplanes += static_cast<size_t>(result.A.rows());
+      ++stats.completed_segment_count;
+      stats.segment_ms.push_back(segment_timer.getElapsedMicros() / 1000.0);
+    }
+
+    stats.success = true;
+    stats.total_ms = total_timer.getElapsedMicros() / 1000.0;
+    return true;
+  };
+
+  const bool risp_requested = par_.sc_method == "risp_point" || par_.sc_method == "risp_line";
+  bool primary_ok = false;
+  std::string risp_failure_reason;
+  if (risp_requested) {
+    primary_ok = run_risp(base_uo, safe_corridor_polytopes_whole_, poly_out_whole_, primary_stats);
+    apply_primary_stats();
+    benchmark_data_.sc_primary_success = primary_ok;
+    if (!primary_ok) {
+      risp_failure_reason = primary_stats.failure_reason;
+      benchmark_data_.sc_result_class = "risp_failed";
+      if (!par_.sc_ellipsoid_fallback) {
+        std::cout << bold << red << "RISP corridor generation failed: " << risp_failure_reason
+                  << reset << std::endl;
+        poly_out_whole_.clear();
+        poly_out_safe_.clear();
+        benchmark_data_.sc_total_ms = sc_total_timer.getElapsedMicros() / 1000.0;
+        cvx_decomp_time_ = benchmark_data_.sc_total_ms;
+        return false;
+      }
+      benchmark_data_.sc_fallback_used = true;
+    } else {
+      benchmark_data_.sc_result_class = "risp_success";
+    }
+  }
+
+  if (!risp_requested || !primary_ok) {
+    EllipsoidDecomp3D ellip;
+    ellip.set_local_bbox(
+        Vec3f(par_.local_box_size[0], par_.local_box_size[1], par_.local_box_size[2]));
+    ellip.set_z_min_and_max(par_.z_min, par_.z_max);
+    ellip.set_inflate_distance(par_.drone_radius);
+    primary_ok = hgp_manager_.cvxEllipsoidDecomp(
+        ellip, global_path, base_uo, obst_pos, obst_bbox, seg_end_times,
+        safe_corridor_polytopes_whole_, poly_out_whole_, &primary_stats);
+    apply_primary_stats();
+    benchmark_data_.sc_primary_success = primary_ok;
+    if (benchmark_data_.sc_fallback_used) {
+      benchmark_data_.sc_fallback_success = primary_ok;
+      benchmark_data_.sc_result_class =
+          primary_ok ? "risp_failed_fallback_success" : "risp_failed_fallback_failed";
+      benchmark_data_.sc_primary_failure_reason =
+          "risp:" + risp_failure_reason +
+          (primary_ok ? ";ellipsoid:success"
+                      : ";ellipsoid:" + primary_stats.failure_reason);
+    } else {
+      benchmark_data_.sc_result_class = primary_ok ? "ellipsoid_success" : "ellipsoid_failed";
+    }
+  }
+
+  if (!primary_ok) {
     std::cout << bold << red << "Convex decomposition failed" << reset << std::endl;
     poly_out_whole_.clear();
     poly_out_safe_.clear();
@@ -600,13 +769,6 @@ bool MIGHTY::getSafeCorridor(const vec_Vecf<3>& global_path, const state& A) {
     cvx_decomp_time_ = benchmark_data_.sc_total_ms;
     return false;
   }
-  benchmark_data_.sc_primary_ms = primary_stats.total_ms;
-  benchmark_data_.sc_primary_success = true;
-  benchmark_data_.sc_primary_obstacle_copy_ms = primary_stats.obstacle_copy_ms;
-  benchmark_data_.sc_primary_dilation_ms = primary_stats.dilation_ms;
-  benchmark_data_.sc_primary_constraint_ms = primary_stats.constraint_ms;
-  benchmark_data_.sc_primary_hyperplanes = primary_stats.total_hyperplanes;
-  benchmark_data_.sc_primary_segment_ms = primary_stats.segment_ms;
 
   if (detailed_benchmark_enabled_) {
     // Optional independent corridor audit. This is O(corridors * obstacles),
@@ -652,33 +814,30 @@ bool MIGHTY::getSafeCorridor(const vec_Vecf<3>& global_path, const state& A) {
 
   // Generate safe corridor (treat unknown regions as occupied)
   {
-    MyTimer secondary_timer(true);
-    EllipsoidDecomp3D ellip_safe;
-    ellip_safe.set_local_bbox(
-        Vec3f(par_.local_box_size[0], par_.local_box_size[1], par_.local_box_size[2]));
-    ellip_safe.set_z_min_and_max(par_.z_min, par_.z_max);
-    ellip_safe.set_inflate_distance(par_.drone_radius);
-
     vec_Vec3f base_uo_safe;
     hgp_manager_.getPlanningObstacleCloud(global_path, par_.local_box_size, true, base_uo_safe);
     benchmark_data_.sc_secondary_obstacle_count = base_uo_safe.size();
 
     std::vector<LinearConstraint3D> safe_constraints;
     CorridorDecompStats secondary_stats;
-    if (!hgp_manager_.cvxEllipsoidDecomp(ellip_safe, global_path, base_uo_safe, obst_pos, obst_bbox,
-                                         seg_end_times, safe_constraints, poly_out_safe_,
-                                         &secondary_stats)) {
+    bool secondary_ok = false;
+    if (risp_requested && !benchmark_data_.sc_fallback_used) {
+      secondary_ok = run_risp(base_uo_safe, safe_constraints, poly_out_safe_, secondary_stats);
+    } else {
+      EllipsoidDecomp3D ellip_safe;
+      ellip_safe.set_local_bbox(
+          Vec3f(par_.local_box_size[0], par_.local_box_size[1], par_.local_box_size[2]));
+      ellip_safe.set_z_min_and_max(par_.z_min, par_.z_max);
+      ellip_safe.set_inflate_distance(par_.drone_radius);
+      secondary_ok = hgp_manager_.cvxEllipsoidDecomp(
+          ellip_safe, global_path, base_uo_safe, obst_pos, obst_bbox, seg_end_times,
+          safe_constraints, poly_out_safe_, &secondary_stats);
+    }
+    if (!secondary_ok) {
       // Fallback: use whole corridor if safe decomposition fails
       poly_out_safe_ = poly_out_whole_;
     }
-    benchmark_data_.sc_secondary_ms = secondary_timer.getElapsedMicros() / 1000.0;
-    benchmark_data_.sc_secondary_success = secondary_stats.success;
-    benchmark_data_.sc_secondary_obstacle_copy_ms = secondary_stats.obstacle_copy_ms;
-    benchmark_data_.sc_secondary_dilation_ms = secondary_stats.dilation_ms;
-    benchmark_data_.sc_secondary_constraint_ms = secondary_stats.constraint_ms;
-    benchmark_data_.sc_secondary_hyperplanes = secondary_stats.total_hyperplanes;
-    benchmark_data_.sc_secondary_segment_ms = secondary_stats.segment_ms;
-    benchmark_data_.sc_secondary_failure_reason = secondary_stats.failure_reason;
+    apply_secondary_stats(secondary_stats);
   }
 
   // Get computation time [ms]

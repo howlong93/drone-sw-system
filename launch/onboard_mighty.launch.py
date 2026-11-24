@@ -44,6 +44,16 @@ def generate_launch_description():
     enable_safety_gate_arg = DeclareLaunchArgument(
         'enable_safety_gate', default_value='true',
         description='Reject unsafe candidate trajectories before publication')
+    sc_method_arg = DeclareLaunchArgument(
+        'sc_method', default_value='ellipsoid',
+        description='Safe-corridor generator: ellipsoid, risp_point, or risp_line')
+    risp_alpha_arg = DeclareLaunchArgument(
+        'risp_alpha', default_value='0.05', description='RISP separation margin fraction')
+    sc_ellipsoid_fallback_arg = DeclareLaunchArgument(
+        'sc_ellipsoid_fallback', default_value='false',
+        description='Use ellipsoid decomposition if RISP fails')
+    risp_random_seed_arg = DeclareLaunchArgument(
+        'risp_random_seed', default_value='1', description='Deterministic RISP base seed')
     use_hardware_arg = DeclareLaunchArgument('use_hardware', default_value='false', description='Flag to indicate whether to use hardware or simulation') # flag to indicte if this is hardware or simulation
     publish_odom_arg  = DeclareLaunchArgument('publish_odom', default_value='true')
     odom_topic_arg    = DeclareLaunchArgument('odom_topic', default_value='visual_slam/odom')
@@ -109,6 +119,11 @@ def generate_launch_description():
             LaunchConfiguration('benchmark_replan_details').perform(context))
         enable_safety_gate = convert_str_to_bool(
             LaunchConfiguration('enable_safety_gate').perform(context))
+        sc_method = LaunchConfiguration('sc_method').perform(context)
+        risp_alpha = float(LaunchConfiguration('risp_alpha').perform(context))
+        sc_ellipsoid_fallback = convert_str_to_bool(
+            LaunchConfiguration('sc_ellipsoid_fallback').perform(context))
+        risp_random_seed = int(LaunchConfiguration('risp_random_seed').perform(context))
         use_hardware = convert_str_to_bool(LaunchConfiguration('use_hardware').perform(context))
         publish_odom = convert_str_to_bool(LaunchConfiguration('publish_odom').perform(context))
         odom_topic = LaunchConfiguration('odom_topic').perform(context)
@@ -174,6 +189,10 @@ def generate_launch_description():
         parameters['use_benchmark'] = bool(use_benchmark)
         parameters['benchmark_replan_details'] = bool(benchmark_replan_details)
         parameters['enable_safety_gate'] = bool(enable_safety_gate)
+        parameters['sc_method'] = sc_method
+        parameters['risp_alpha'] = risp_alpha
+        parameters['sc_ellipsoid_fallback'] = bool(sc_ellipsoid_fallback)
+        parameters['risp_random_seed'] = risp_random_seed
         if use_benchmark:
             parameters['global_planner'] = global_planner
    
@@ -419,6 +438,10 @@ def generate_launch_description():
         use_benchmark_arg,
         benchmark_replan_details_arg,
         enable_safety_gate_arg,
+        sc_method_arg,
+        risp_alpha_arg,
+        sc_ellipsoid_fallback_arg,
+        risp_random_seed_arg,
         use_hardware_arg,
         publish_odom_arg,
         odom_topic_arg,

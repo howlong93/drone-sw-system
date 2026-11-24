@@ -141,4 +141,34 @@ TEST(RispCorridor, PathCoverLineRejectsIncompleteHorizon) {
   EXPECT_EQ(reason, "max_corridors_exceeded");
 }
 
+TEST(RispCorridor, ExpandsOptimizerPathWithoutDiscardingHgpBends) {
+  MatX3 A_bound;
+  Eigen::VectorXd b_bound;
+  makeBounds(A_bound, b_bound);
+  const std::vector<Vec3> path = {Vec3(0.0, 0.0, 0.0), Vec3(1.0, 0.0, 0.0),
+                                  Vec3(2.0, 0.0, 0.0), Vec3(3.0, 1.0, 0.0)};
+  const Vec3 seam(2.5, 0.5, 0.0);
+
+  mighty::risp::PathCoverResult cover;
+  Result corridor;
+  corridor.A = A_bound;
+  corridor.b = b_bound;
+  cover.corridors = {corridor, corridor};
+  cover.waypoints = {path.front(), seam, path.back()};
+  cover.reference_length = 2.0 + std::sqrt(2.0);
+  cover.waypoint_distances = {0.0, 2.0 + std::sqrt(0.5), cover.reference_length};
+  cover.full_coverage = true;
+
+  mighty::risp::ExpandedPathCover expanded;
+  std::string reason;
+  ASSERT_TRUE(mighty::risp::expandPathCoverForOptimizer(path, cover, expanded, reason))
+      << reason;
+  ASSERT_EQ(expanded.waypoints.size(), 5U);
+  EXPECT_TRUE(expanded.waypoints[1].isApprox(path[1]));
+  EXPECT_TRUE(expanded.waypoints[2].isApprox(path[2]));
+  EXPECT_TRUE(expanded.waypoints[3].isApprox(seam));
+  EXPECT_EQ(expanded.inserted_seams, 1U);
+  EXPECT_EQ(expanded.corridor_indices, (std::vector<size_t>{0, 0, 0, 1}));
+}
+
 }  // namespace

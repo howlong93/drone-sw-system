@@ -818,6 +818,52 @@ bool MIGHTY::getSafeCorridor(const vec_Vecf<3>& global_path, const state& A,
       stats.total_hyperplanes += static_cast<size_t>(result.A.rows());
       ++stats.completed_segment_count;
     }
+
+    mighty::risp::ExpandedPathCover expanded;
+    std::string expansion_reason;
+    if (!mighty::risp::expandPathCoverForOptimizer(global_path, pathcover_result, expanded,
+                                                    expansion_reason)) {
+      stats.failure_reason = "optimizer_expansion_" + expansion_reason;
+      constraints.clear();
+      polytopes.clear();
+      stats.total_ms = total_timer.getElapsedMicros() / 1000.0;
+      return false;
+    }
+
+    const auto geometric_constraints = constraints;
+    const auto geometric_polytopes = polytopes;
+    constraints.clear();
+    polytopes.clear();
+    constraints.reserve(expanded.corridor_indices.size());
+    polytopes.reserve(expanded.corridor_indices.size());
+    stats.total_hyperplanes = 0;
+    for (const size_t corridor_index : expanded.corridor_indices) {
+      constraints.push_back(geometric_constraints[corridor_index]);
+      polytopes.push_back(geometric_polytopes[corridor_index]);
+      stats.total_hyperplanes +=
+          static_cast<size_t>(geometric_constraints[corridor_index].A_.rows());
+    }
+    optimizer_path.clear();
+    optimizer_path.reserve(expanded.waypoints.size());
+    for (const auto& waypoint : expanded.waypoints)
+      optimizer_path.push_back(waypoint);
+    std::vector<size_t> splines_per_corridor(pathcover_result.corridors.size(), 0U);
+    for (const size_t corridor_index : expanded.corridor_indices)
+      ++splines_per_corridor[corridor_index];
+    benchmark_data_.sc_pathcover_corridor_count = pathcover_result.corridors.size();
+    benchmark_data_.sc_optimizer_segment_count = expanded.corridor_indices.size();
+    benchmark_data_.sc_pathcover_inserted_seams = expanded.inserted_seams;
+    benchmark_data_.sc_pathcover_splines_per_corridor_mean =
+        pathcover_result.corridors.empty()
+            ? 0.0
+            : static_cast<double>(expanded.corridor_indices.size()) /
+                  static_cast<double>(pathcover_result.corridors.size());
+    benchmark_data_.sc_pathcover_splines_per_corridor_max =
+        splines_per_corridor.empty()
+            ? 0U
+            : *std::max_element(splines_per_corridor.begin(), splines_per_corridor.end());
+    stats.segment_count = constraints.size();
+    stats.completed_segment_count = constraints.size();
     stats.constraint_ms = constraint_timer.getElapsedMicros() / 1000.0;
     stats.success = true;
     stats.total_ms = total_timer.getElapsedMicros() / 1000.0;
@@ -852,9 +898,7 @@ bool MIGHTY::getSafeCorridor(const vec_Vecf<3>& global_path, const state& A,
       benchmark_data_.sc_fallback_used = true;
     } else {
       if (pathcover_requested) {
-        optimizer_path.assign(pathcover_result.waypoints.begin(),
-                              pathcover_result.waypoints.end());
-        benchmark_data_.sc_segment_count = pathcover_result.corridors.size();
+        benchmark_data_.sc_segment_count = safe_corridor_polytopes_whole_.size();
         benchmark_data_.sc_pathcover_compression_ratio =
             benchmark_data_.sc_reference_segments > 0
                 ? static_cast<double>(pathcover_result.corridors.size()) /
@@ -2290,10 +2334,13 @@ bool MIGHTY::generateLocalTrajectory(const state& local_A, double A_time, vec_Ve
   // Pass ESDF grid to solver (ground robot only, thread-safe immutable snapshot)
   if (esdf_grid_) whole_traj_solver_ptr->setEsdfGrid(esdf_grid_);
 
+  const bool preserve_pathcover_segmentation =
+      par_.sc_method == "pathcover_line" && !benchmark_data_.sc_fallback_used;
+
   whole_traj_solver_ptr->prepareSolverForReplan(
       A_time, global_path, safe_corridor_polytopes_whole_, local_trajs, local_A, local_E,
       initial_guess_computation_time, par_.use_multiple_initial_guesses, true,
-      anchor_reference_path);
+      anchor_reference_path, preserve_pathcover_segmentation);
 
   // Skip the solver's pushed path — use the original HGP path instead
   // whole_traj_solver_ptr->getGlobalPath(global_path);
@@ -2363,7 +2410,8 @@ bool MIGHTY::generateLocalTrajectory(const state& local_A, double A_time, vec_Ve
         solver_ptr->prepareSolverForReplan(
             A_time, global_path, safe_corridor_polytopes_whole_, local_trajs, local_A, local_E,
             initial_guess_computation_time, false, true,
-            anchor_reference_path);  // initial time t0 = 0.0
+            anchor_reference_path,
+            preserve_pathcover_segmentation);  // initial time t0 = 0.0
 
         // copy initial guess
         Eigen::VectorXd z0 = list_z0[i];

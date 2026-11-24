@@ -811,7 +811,8 @@ void SolverLBFGS::prepareSolverForReplan(double t0, const vec_Vec3f& global_wps,
                                          double& initial_guess_computation_time,
                                          bool use_for_safe_path,
                                          bool use_multiple_initial_guesses,
-                                         const vec_Vec3f* anchor_reference_path) {
+                                         const vec_Vec3f* anchor_reference_path,
+                                         bool preserve_input_segmentation) {
   // Initialize the solver with parameters that changes for replanning
   t0_ = t0;  // Current time in the trajectory
 
@@ -873,13 +874,18 @@ void SolverLBFGS::prepareSolverForReplan(double t0, const vec_Vec3f& global_wps,
 
   // Stash original HGP waypoints before corridor replacement can modify them
   std::vector<Vec3> original_hgp_wps;
-  const vec_Vec3f& anchor_source = anchor_reference_path ? *anchor_reference_path : global_wps;
+  // PathCover-expanded input already contains every original HGP bend plus
+  // corridor seams. Keep this exact knot layout as both initialization and
+  // positional anchor instead of uniformly resampling it.
+  const vec_Vec3f& anchor_source =
+      preserve_input_segmentation ? global_wps
+                                  : (anchor_reference_path ? *anchor_reference_path : global_wps);
   original_hgp_wps.reserve(anchor_source.size());
   for (const auto& wp : anchor_source) original_hgp_wps.emplace_back(wp.x(), wp.y(), wp.z());
   if (original_hgp_wps.size() < 2) original_hgp_wps = global_wps_;
 
   // ---- REPLACE HEURISTIC ROUTE WITH SHORTEST-PATH THROUGH THE CORRIDOR ----
-  if (!use_for_safe_path) {
+  if (!use_for_safe_path && !preserve_input_segmentation) {
     if (!replaceGlobalPathWithCorridorShortest(/*do_shortcut=*/false, /*smooth_eps=*/1e-6)) {
       if (verbose_)
         std::cout << "[init] Corridor-shortest init failed; "

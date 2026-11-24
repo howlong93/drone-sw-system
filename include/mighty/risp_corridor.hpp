@@ -32,6 +32,10 @@ struct Result {
 struct PathCoverResult {
   std::vector<Result> corridors;
   std::vector<Vec3> waypoints;
+  // Arc-length positions of `waypoints` on the reference polyline. Keeping
+  // these positions avoids recovering seam ordering from floating-point
+  // geometry when the optimizer path is expanded later.
+  std::vector<double> waypoint_distances;
   std::vector<std::pair<Vec3, Vec3>> seed_segments;
   size_t reference_waypoints{0};
   double reference_length{0.0};
@@ -41,6 +45,13 @@ struct PathCoverResult {
   size_t unreduced_retry_count{0};
   bool full_coverage{false};
   bool horizon_exceeded{false};
+};
+
+struct ExpandedPathCover {
+  std::vector<Vec3> waypoints;
+  // One geometric PathCover corridor index for every optimizer segment.
+  std::vector<size_t> corridor_indices;
+  size_t inserted_seams{0};
 };
 
 inline bool isStrictlyInside(const MatX3& A, const Eigen::VectorXd& b, const Vec3& point,
@@ -320,7 +331,11 @@ inline bool pathCoverLineSeed(const std::vector<Vec3>& obstacles,
 
   output.reference_waypoints = path.size();
   output.reference_length = polylineLength(path);
+  std::vector<double> reference_distances(path.size(), 0.0);
+  for (size_t i = 1; i < path.size(); ++i)
+    reference_distances[i] = reference_distances[i - 1] + (path[i] - path[i - 1]).norm();
   output.waypoints.push_back(path.front());
+  output.waypoint_distances.push_back(0.0);
 
   auto generate_corridor = [&](size_t corridor_index, const Vec3& start, const Vec3& end,
                                Result& result, std::string& reason) {
@@ -414,6 +429,8 @@ inline bool pathCoverLineSeed(const std::vector<Vec3>& obstacles,
     output.min_overlap_margin = std::min(output.min_overlap_margin, overlap_margin);
     output.unreduced_retry_count += next.used_unreduced_retry ? 1U : 0U;
     output.waypoints.push_back(transition);
+    output.waypoint_distances.push_back(
+        reference_distances[path_index - 1] + (transition - last_inside).norm());
     output.seed_segments.emplace_back(transition, target);
     output.corridors.push_back(std::move(next));
     last_inside = target;
@@ -472,6 +489,9 @@ inline bool pathCoverLineSeed(const std::vector<Vec3>& obstacles,
     output.waypoints.clear();
     output.waypoints.push_back(path.front());
     output.waypoints.push_back(seam);
+    output.waypoint_distances.clear();
+    output.waypoint_distances.push_back(0.0);
+    output.waypoint_distances.push_back(target_length);
     output.min_overlap_margin = split_margin;
     output.unreduced_retry_count =
         (output.corridors[0].used_unreduced_retry ? 1U : 0U) +
@@ -479,8 +499,10 @@ inline bool pathCoverLineSeed(const std::vector<Vec3>& obstacles,
   }
 
   output.waypoints.push_back(path.back());
+  output.waypoint_distances.push_back(output.reference_length);
   output.covered_length = output.reference_length;
-  output.full_coverage = output.waypoints.size() == output.corridors.size() + 1;
+  output.full_coverage = output.waypoints.size() == output.corridors.size() + 1 &&
+                         output.waypoint_distances.size() == output.waypoints.size();
   if (output.corridors.size() == 1)
     output.min_overlap_margin = std::numeric_limits<double>::infinity();
   if (!output.full_coverage) {
@@ -488,6 +510,118 @@ inline bool pathCoverLineSeed(const std::vector<Vec3>& obstacles,
     return false;
   }
   return true;
+}
+
+// Preserve every bend of the HGP reference path while inserting PathCover
+// transition seams. Each resulting optimizer segment is mapped to the
+// geometric corridor that covers its arc-length interval. A corridor may
+// therefore constrain several quintic spline pieces.
+template <typename PathContainer>
+inline bool expandPathCoverForOptimizer(const PathContainer& reference_path,
+                                        const PathCoverResult& cover,
+                                        ExpandedPathCover& output,
+                                        std::string& failure_reason) {
+  output = ExpandedPathCover{};
+  failure_reason.clear();
+  if (cover.corridors.empty() || cover.waypoints.size() != cover.corridors.size() + 1 ||
+      cover.waypoint_distances.size() != cover.waypoints.size()) {
+    failure_reason = "invalid_pathcover_result";
+    return false;
+  }
+
+  std::vector<Vec3> path;
+  path.reserve(reference_path.size());
+  for (const auto& point_raw : reference_path) {
+    const Vec3 point = point_raw.template cast<double>();
+    if (!point.allFinite()) {
+      failure_reason = "nonfinite_reference_path";
+      return false;
+    }
+    if (path.empty() || (point - path.back()).norm() > 1e-8) path.push_back(point);
+  }
+  if (path.size() < 2) {
+    failure_reason = "path_too_short";
+    return false;
+  }
+
+  std::vector<double> path_distance(path.size(), 0.0);
+  for (size_t i = 1; i < path.size(); ++i)
+    path_distance[i] = path_distance[i - 1] + (path[i] - path[i - 1]).norm();
+  const double total_length = path_distance.back();
+  const double distance_tolerance = std::max(1e-8, total_length * 1e-9);
+  if (std::abs(cover.waypoint_distances.front()) > distance_tolerance ||
+      std::abs(cover.waypoint_distances.back() - total_length) > distance_tolerance) {
+    failure_reason = "pathcover_length_mismatch";
+    return false;
+  }
+  for (size_t i = 1; i < cover.waypoint_distances.size(); ++i) {
+    if (!(cover.waypoint_distances[i] >
+          cover.waypoint_distances[i - 1] + distance_tolerance)) {
+      failure_reason = "nonmonotonic_pathcover_seams";
+      return false;
+    }
+  }
+
+  std::vector<double> expanded_distances;
+  output.waypoints.reserve(path.size() + cover.corridors.size());
+  expanded_distances.reserve(path.size() + cover.corridors.size());
+  auto append = [&](const Vec3& point, double distance, bool seam) {
+    if (!output.waypoints.empty() &&
+        (point - output.waypoints.back()).norm() <= 1e-8) {
+      return;
+    }
+    output.waypoints.push_back(point);
+    expanded_distances.push_back(distance);
+    if (seam) ++output.inserted_seams;
+  };
+
+  append(path.front(), 0.0, false);
+  size_t seam_index = 1;
+  for (size_t path_index = 1; path_index < path.size(); ++path_index) {
+    while (seam_index + 1 < cover.waypoint_distances.size() &&
+           cover.waypoint_distances[seam_index] <
+               path_distance[path_index] - distance_tolerance) {
+      if (cover.waypoint_distances[seam_index] <
+          path_distance[path_index - 1] - distance_tolerance) {
+        failure_reason = "pathcover_seam_out_of_order";
+        return false;
+      }
+      append(cover.waypoints[seam_index], cover.waypoint_distances[seam_index], true);
+      ++seam_index;
+    }
+    if (seam_index + 1 < cover.waypoint_distances.size() &&
+        std::abs(cover.waypoint_distances[seam_index] - path_distance[path_index]) <=
+            distance_tolerance) {
+      append(cover.waypoints[seam_index], cover.waypoint_distances[seam_index], true);
+      ++seam_index;
+    } else {
+      append(path[path_index], path_distance[path_index], false);
+    }
+  }
+  if (seam_index + 1 != cover.waypoint_distances.size() || output.waypoints.size() < 3) {
+    failure_reason = "pathcover_seam_merge_failed";
+    return false;
+  }
+
+  output.corridor_indices.reserve(output.waypoints.size() - 1);
+  for (size_t segment = 0; segment + 1 < output.waypoints.size(); ++segment) {
+    const double midpoint = 0.5 * (expanded_distances[segment] +
+                                   expanded_distances[segment + 1]);
+    const auto first_seam = cover.waypoint_distances.begin() + 1;
+    const auto last_seam = cover.waypoint_distances.end() - 1;
+    const size_t corridor = static_cast<size_t>(
+        std::upper_bound(first_seam, last_seam, midpoint) - first_seam);
+    if (corridor >= cover.corridors.size() ||
+        !contains(cover.corridors[corridor].A, cover.corridors[corridor].b,
+                  output.waypoints[segment]) ||
+        !contains(cover.corridors[corridor].A, cover.corridors[corridor].b,
+                  output.waypoints[segment + 1])) {
+      failure_reason = "expanded_segment_outside_corridor";
+      return false;
+    }
+    output.corridor_indices.push_back(corridor);
+  }
+  return output.corridor_indices.size() + 1 == output.waypoints.size();
 }
 
 }  // namespace mighty::risp

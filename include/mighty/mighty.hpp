@@ -114,6 +114,11 @@ struct ReplanBenchmarkData {
   size_t sc_reference_waypoints = 0;
   size_t sc_reference_segments = 0;
   double sc_pathcover_compression_ratio = 1.0;
+  size_t sc_pathcover_corridor_count = 0;
+  size_t sc_optimizer_segment_count = 0;
+  size_t sc_pathcover_inserted_seams = 0;
+  double sc_pathcover_splines_per_corridor_mean = 0.0;
+  size_t sc_pathcover_splines_per_corridor_max = 0;
   double sc_pathcover_segmentation_ms = 0.0;
   double sc_pathcover_reference_length = 0.0;
   double sc_pathcover_covered_length = 0.0;

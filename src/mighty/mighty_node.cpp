@@ -1790,6 +1790,13 @@ void MIGHTY_NODE::replanCallback() {
     event.sc_reference_waypoints = benchmark_sample.sc_reference_waypoints;
     event.sc_reference_segments = benchmark_sample.sc_reference_segments;
     event.sc_pathcover_compression_ratio = benchmark_sample.sc_pathcover_compression_ratio;
+    event.sc_pathcover_corridor_count = benchmark_sample.sc_pathcover_corridor_count;
+    event.sc_optimizer_segment_count = benchmark_sample.sc_optimizer_segment_count;
+    event.sc_pathcover_inserted_seams = benchmark_sample.sc_pathcover_inserted_seams;
+    event.sc_pathcover_splines_per_corridor_mean =
+        benchmark_sample.sc_pathcover_splines_per_corridor_mean;
+    event.sc_pathcover_splines_per_corridor_max =
+        benchmark_sample.sc_pathcover_splines_per_corridor_max;
     event.sc_pathcover_segmentation_ms = benchmark_sample.sc_pathcover_segmentation_ms;
     event.sc_pathcover_reference_length = benchmark_sample.sc_pathcover_reference_length;
     event.sc_pathcover_covered_length = benchmark_sample.sc_pathcover_covered_length;
@@ -2847,7 +2854,10 @@ void MIGHTY_NODE::logData(bool final) {
          "sc_method,sc_result_class,sc_fallback_used,sc_fallback_success,"
          "sc_primary_success,sc_secondary_success,sc_seed_valid,sc_obstacles_valid,"
          "sc_segments,sc_reference_waypoints,sc_reference_segments,"
-         "sc_pathcover_compression_ratio,sc_pathcover_segmentation_ms,"
+         "sc_pathcover_compression_ratio,sc_pathcover_corridor_count,"
+         "sc_optimizer_segment_count,sc_pathcover_inserted_seams,"
+         "sc_pathcover_splines_per_corridor_mean,sc_pathcover_splines_per_corridor_max,"
+         "sc_pathcover_segmentation_ms,"
          "sc_pathcover_reference_length_m,sc_pathcover_covered_length_m,"
          "sc_pathcover_coverage_ratio,sc_pathcover_min_overlap_margin_m,"
          "sc_unreduced_retry_count,sc_pathcover_full_coverage,"
@@ -2899,6 +2909,10 @@ void MIGHTY_NODE::logData(bool final) {
              << s.sc_seed_validation_success << ',' << s.sc_obstacle_validation_success << ','
              << s.sc_segment_count << ',' << s.sc_reference_waypoints << ','
              << s.sc_reference_segments << ',' << s.sc_pathcover_compression_ratio << ','
+             << s.sc_pathcover_corridor_count << ',' << s.sc_optimizer_segment_count << ','
+             << s.sc_pathcover_inserted_seams << ','
+             << s.sc_pathcover_splines_per_corridor_mean << ','
+             << s.sc_pathcover_splines_per_corridor_max << ','
              << s.sc_pathcover_segmentation_ms << ',' << s.sc_pathcover_reference_length << ','
              << s.sc_pathcover_covered_length << ',' << s.sc_pathcover_coverage_ratio << ','
              << s.sc_pathcover_min_overlap_margin << ',' << s.sc_unreduced_retry_count << ','
@@ -3291,7 +3305,10 @@ void MIGHTY_NODE::logData(bool final) {
            "sc_primary_ms,sc_secondary_ms,sc_validation_ms,sc_method,sc_result_class,"
            "sc_fallback_used,sc_fallback_success,sc_primary_success,"
            "sc_secondary_success,sc_segments,sc_reference_waypoints,sc_reference_segments,"
-           "sc_pathcover_compression_ratio,sc_pathcover_segmentation_ms,"
+           "sc_pathcover_compression_ratio,sc_pathcover_corridor_count,"
+           "sc_optimizer_segment_count,sc_pathcover_inserted_seams,"
+           "sc_pathcover_splines_per_corridor_mean,sc_pathcover_splines_per_corridor_max,"
+           "sc_pathcover_segmentation_ms,"
            "sc_pathcover_reference_length_m,sc_pathcover_covered_length_m,"
            "sc_pathcover_coverage_ratio,sc_pathcover_min_overlap_margin_m,"
            "sc_unreduced_retry_count,sc_pathcover_full_coverage,"
@@ -3338,6 +3355,11 @@ void MIGHTY_NODE::logData(bool final) {
                   << event.sc_segments << ',' << event.sc_reference_waypoints << ','
                   << event.sc_reference_segments << ','
                   << event.sc_pathcover_compression_ratio << ','
+                  << event.sc_pathcover_corridor_count << ','
+                  << event.sc_optimizer_segment_count << ','
+                  << event.sc_pathcover_inserted_seams << ','
+                  << event.sc_pathcover_splines_per_corridor_mean << ','
+                  << event.sc_pathcover_splines_per_corridor_max << ','
                   << event.sc_pathcover_segmentation_ms << ','
                   << event.sc_pathcover_reference_length << ','
                   << event.sc_pathcover_covered_length << ','

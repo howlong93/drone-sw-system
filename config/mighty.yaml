@@ -112,6 +112,11 @@ mighty_node:
         dyn_constr_jerk_weight: 1e+3                    # [-] Jerk constraint violation weight
         planner_Co: 0.1                                 # [m] Additional static-obstacle clearance in trajectory optimization
         planner_Cw: 1.3                                 # [m] Collision clearance for dynamic obstacles
+        corridor_three_tier_optimization: true          # hard acceptance, bounded relaxation, then original soft fallback
+        corridor_hard_weight_scale: 100.0               # multiplier on stat_weight for the hard-acceptance attempt
+        corridor_bounded_weight_scale: 10.0             # multiplier for bounded-relaxation attempt
+        corridor_hard_tolerance: 1.0e-5                 # [m] accepted corridor violation in hard tier
+        corridor_bounded_violation: 0.02                # [m] maximum accepted violation in bounded tier
 
         # --- Safety Corridors ---
         local_box_size: [3.0, 3.0, 3.0]                 # [m] Local planning window (smaller = faster, larger = smoother)
@@ -201,13 +206,15 @@ mighty_node:
         use_shrinked_box: false                         # [-] Use shrunk box for decomposition
         shrinked_box_size: 0.0                          # [m] Shrunk box size
         sfc_use_unknown_as_obstacle: false              # [-] Treat unknown cells as obstacles in SFC generation
-        sc_method: "ellipsoid"                          # [ellipsoid, risp_point, risp_line, pathcover_line]
+        sc_method: "ellipsoid"                          # [ellipsoid, risp_point, risp_line, pathcover_line, pathcover_point, pathcover_line_reuse]
         risp_alpha: 0.05                                # [-] Algorithmic separator; safety comes from map inflation
         sc_ellipsoid_fallback: false                    # [-] Use ellipsoid only after a RISP failure
         risp_random_seed: 1                             # [-] Deterministic per-segment RISP sampling seed
         pathcover_max_corridors: 12                     # [-] Reject incomplete local-path coverage at this limit
         pathcover_overlap_distance: 0.25                # [m] Backtrack from each corridor exit to create overlap
         pathcover_min_overlap_margin: 0.001             # [m] Required inscribed margin at every corridor seam
+        pathcover_min_progress: 0.05                    # [m] Required new coverage per point-seeded corridor
+        pathcover_point_max_retries: 3                  # [-] Deterministic retries after the initial point seed
 
         # --- L-BFGS Solver Internals ---
         spline_degree: 5                                # [-] Hermite spline degree (3=cubic, 5=quintic)

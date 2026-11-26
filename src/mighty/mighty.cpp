@@ -547,6 +547,14 @@ bool MIGHTY::getSafeCorridor(const vec_Vecf<3>& global_path, const state& A,
   benchmark_data_.sc_result_class.clear();
   benchmark_data_.sc_fallback_used = false;
   benchmark_data_.sc_fallback_success = false;
+  if (debug_testing_enabled_) {
+    debug_corridor_generation_obstacles_.clear();
+    debug_corridor_local_obstacles_.clear();
+    debug_corridor_reference_path_.clear();
+    debug_corridor_bounds_valid_ = false;
+    debug_geometric_corridors_.clear();
+    debug_segment_corridor_indices_.clear();
+  }
 
   // Skip decomposition entirely when static obstacle weight is zero
   if (par_.stat_weight <= 0.0) {
@@ -573,6 +581,10 @@ bool MIGHTY::getSafeCorridor(const vec_Vecf<3>& global_path, const state& A,
   hgp_manager_.getPlanningObstacleCloud(global_path, par_.local_box_size,
                                         par_.sfc_use_unknown_as_obstacle, base_uo);
   if (detailed_benchmark_enabled_) benchmark_obstacle_snapshot_ = base_uo;
+  if (debug_testing_enabled_) {
+    debug_corridor_generation_obstacles_ = base_uo;
+    debug_corridor_reference_path_ = global_path;
+  }
 
   // Empty obstacle arrays (dynamic obstacles handled via heat map, not corridors)
   vec_Vecf<3> obst_pos, obst_bbox;
@@ -602,9 +614,16 @@ bool MIGHTY::getSafeCorridor(const vec_Vecf<3>& global_path, const state& A,
     benchmark_data_.sc_secondary_failure_reason = stats.failure_reason;
   };
 
+  // RISP receives voxel centers from the post-inflation planning map.  Model
+  // each voxel by its circumscribed sphere so every generated plane excludes
+  // the complete voxel volume, independent of plane orientation.
+  const double risp_voxel_support_radius =
+      0.5 * std::sqrt(3.0) * par_.factor_hgp * par_.res;
+
   auto run_risp = [&](const vec_Vecf<3>& segment_path, const vec_Vec3f& obstacles,
                       std::vector<LinearConstraint3D>& constraints,
-                      vec_E<Polyhedron<3>>& polytopes, CorridorDecompStats& stats) {
+                      vec_E<Polyhedron<3>>& polytopes, CorridorDecompStats& stats,
+                      bool force_line_seed = false) {
     MyTimer total_timer(true);
     stats = CorridorDecompStats{};
     stats.input_obstacle_count = obstacles.size();
@@ -667,11 +686,15 @@ bool MIGHTY::getSafeCorridor(const vec_Vecf<3>& global_path, const state& A,
       std::string reason;
       MyTimer generation_timer(true);
       const bool generated =
-          (par_.sc_method == "risp_line" || par_.sc_method == "pathcover_line")
+          (force_line_seed || par_.sc_method == "risp_line" ||
+           par_.sc_method == "pathcover_line" ||
+           par_.sc_method == "pathcover_line_reuse")
               ? mighty::risp::lineSeed(local_obstacles, start, end, A_bound, b_bound,
-                                        par_.risp_alpha, rng, result, reason)
+                                        par_.risp_alpha, rng, result, reason,
+                                        risp_voxel_support_radius)
               : mighty::risp::pointSeed(local_obstacles, 0.5 * (start + end), A_bound, b_bound,
-                                         par_.risp_alpha, rng, result, reason);
+                                         par_.risp_alpha, rng, result, reason,
+                                         risp_voxel_support_radius);
       stats.dilation_ms += generation_timer.getElapsedMicros() / 1000.0;
       if (!generated) {
         return fail("segment_" + std::to_string(segment) + "_" + reason);
@@ -717,6 +740,9 @@ bool MIGHTY::getSafeCorridor(const vec_Vecf<3>& global_path, const state& A,
   };
 
   mighty::risp::PathCoverResult pathcover_result;
+  mighty::risp::PathCoverReuseResult pathcover_reuse_result;
+  size_t active_pathcover_corridor_count = 0;
+  size_t active_pathcover_unreduced_retry_count = 0;
   auto run_pathcover = [&](const vec_Vec3f& obstacles,
                            std::vector<LinearConstraint3D>& constraints,
                            vec_E<Polyhedron<3>>& polytopes, CorridorDecompStats& stats) {
@@ -764,40 +790,120 @@ bool MIGHTY::getSafeCorridor(const vec_Vecf<3>& global_path, const state& A,
       }
     }
     stats.obstacle_copy_ms = copy_timer.getElapsedMicros() / 1000.0;
+    if (debug_testing_enabled_) {
+      debug_corridor_local_obstacles_.clear();
+      debug_corridor_local_obstacles_.reserve(local_obstacles.size());
+      for (const auto& obstacle : local_obstacles)
+        debug_corridor_local_obstacles_.push_back(obstacle);
+      debug_corridor_lower_ = lower;
+      debug_corridor_upper_ = upper;
+      debug_corridor_bounds_valid_ = true;
+    }
 
     MyTimer pathcover_timer(true);
     std::string reason;
-    const bool generated = mighty::risp::pathCoverLineSeed(
-        local_obstacles, global_path, A_bound, b_bound, par_.risp_alpha,
-        static_cast<uint32_t>(par_.risp_random_seed),
-        static_cast<size_t>(par_.pathcover_max_corridors), par_.pathcover_overlap_distance,
-        par_.pathcover_min_overlap_margin, pathcover_result, reason);
+    const bool point_pathcover = par_.sc_method == "pathcover_point";
+    const bool reuse_pathcover = par_.sc_method == "pathcover_line_reuse";
+    bool generated = false;
+    if (reuse_pathcover) {
+      generated = mighty::risp::pathCoverLineReuse(
+          local_obstacles, global_path, A_bound, b_bound, par_.risp_alpha,
+          static_cast<uint32_t>(par_.risp_random_seed),
+          static_cast<size_t>(par_.pathcover_max_corridors),
+          par_.pathcover_min_overlap_margin, pathcover_reuse_result, reason,
+          risp_voxel_support_radius);
+    } else if (point_pathcover) {
+      generated = mighty::risp::pathCoverPointSeed(
+          local_obstacles, global_path, A_bound, b_bound, par_.risp_alpha,
+          static_cast<uint32_t>(par_.risp_random_seed),
+          static_cast<size_t>(par_.pathcover_max_corridors),
+          par_.pathcover_overlap_distance, par_.pathcover_min_overlap_margin,
+          par_.pathcover_min_progress,
+          static_cast<size_t>(par_.pathcover_point_max_retries), pathcover_result,
+          reason, risp_voxel_support_radius);
+    } else {
+      generated = mighty::risp::pathCoverLineSeed(
+          local_obstacles, global_path, A_bound, b_bound, par_.risp_alpha,
+          static_cast<uint32_t>(par_.risp_random_seed),
+          static_cast<size_t>(par_.pathcover_max_corridors),
+          par_.pathcover_overlap_distance, par_.pathcover_min_overlap_margin,
+          pathcover_result, reason, risp_voxel_support_radius);
+    }
     const double pathcover_ms = pathcover_timer.getElapsedMicros() / 1000.0;
-    stats.dilation_ms = pathcover_result.risp_generation_ms;
+    const double risp_generation_ms = reuse_pathcover
+                                          ? pathcover_reuse_result.risp_generation_ms
+                                          : pathcover_result.risp_generation_ms;
+    stats.dilation_ms = risp_generation_ms;
     benchmark_data_.sc_pathcover_segmentation_ms =
-        std::max(0.0, pathcover_ms - pathcover_result.risp_generation_ms);
-    benchmark_data_.sc_pathcover_reference_length = pathcover_result.reference_length;
-    benchmark_data_.sc_pathcover_covered_length = pathcover_result.covered_length;
+        std::max(0.0, pathcover_ms - risp_generation_ms);
+    benchmark_data_.sc_pathcover_reference_length =
+        reuse_pathcover ? pathcover_reuse_result.reference_length
+                        : pathcover_result.reference_length;
+    benchmark_data_.sc_pathcover_covered_length =
+        reuse_pathcover
+            ? (pathcover_reuse_result.full_coverage
+                   ? pathcover_reuse_result.reference_length
+                   : 0.0)
+            : pathcover_result.covered_length;
     benchmark_data_.sc_pathcover_coverage_ratio =
-        pathcover_result.reference_length > 1e-9
-            ? pathcover_result.covered_length / pathcover_result.reference_length
+        benchmark_data_.sc_pathcover_reference_length > 1e-9
+            ? benchmark_data_.sc_pathcover_covered_length /
+                  benchmark_data_.sc_pathcover_reference_length
             : 0.0;
-    benchmark_data_.sc_pathcover_min_overlap_margin = pathcover_result.min_overlap_margin;
-    benchmark_data_.sc_unreduced_retry_count = pathcover_result.unreduced_retry_count;
-    benchmark_data_.sc_pathcover_full_coverage = pathcover_result.full_coverage;
-    benchmark_data_.sc_pathcover_horizon_exceeded = pathcover_result.horizon_exceeded;
+    benchmark_data_.sc_pathcover_min_overlap_margin =
+        reuse_pathcover ? pathcover_reuse_result.min_transition_margin
+                        : pathcover_result.min_overlap_margin;
+    benchmark_data_.sc_unreduced_retry_count =
+        reuse_pathcover ? pathcover_reuse_result.unreduced_retry_count
+                        : pathcover_result.unreduced_retry_count;
+    benchmark_data_.sc_pathcover_point_retry_count =
+        reuse_pathcover ? 0U : pathcover_result.point_retry_count;
+    benchmark_data_.sc_pathcover_point_no_progress_count =
+        reuse_pathcover ? 0U : pathcover_result.point_no_progress_count;
+    benchmark_data_.sc_pathcover_point_waypoint_retry_count =
+        reuse_pathcover ? 0U : pathcover_result.point_waypoint_retry_count;
+    benchmark_data_.sc_pathcover_reused_segment_count =
+        reuse_pathcover ? pathcover_reuse_result.reused_segment_count : 0U;
+    benchmark_data_.sc_pathcover_low_overlap_transition_count =
+        reuse_pathcover ? pathcover_reuse_result.low_overlap_transition_count : 0U;
+    benchmark_data_.sc_pathcover_overlap_rollback_count =
+        reuse_pathcover ? pathcover_reuse_result.overlap_rollback_count : 0U;
+    benchmark_data_.sc_pathcover_weak_overlap_transition_count =
+        reuse_pathcover ? pathcover_reuse_result.weak_overlap_transition_count : 0U;
+    benchmark_data_.sc_pathcover_min_transition_margin =
+        reuse_pathcover ? pathcover_reuse_result.min_transition_margin
+                        : std::numeric_limits<double>::infinity();
+    if (!reuse_pathcover && !pathcover_result.corridor_progress_lengths.empty()) {
+      benchmark_data_.sc_pathcover_progress_mean =
+          std::accumulate(pathcover_result.corridor_progress_lengths.begin(),
+                          pathcover_result.corridor_progress_lengths.end(), 0.0) /
+          static_cast<double>(pathcover_result.corridor_progress_lengths.size());
+      benchmark_data_.sc_pathcover_progress_min =
+          *std::min_element(pathcover_result.corridor_progress_lengths.begin(),
+                            pathcover_result.corridor_progress_lengths.end());
+    }
+    benchmark_data_.sc_pathcover_full_coverage =
+        reuse_pathcover ? pathcover_reuse_result.full_coverage
+                        : pathcover_result.full_coverage;
+    benchmark_data_.sc_pathcover_horizon_exceeded =
+        reuse_pathcover ? pathcover_reuse_result.horizon_exceeded
+                        : pathcover_result.horizon_exceeded;
     if (!generated) {
       stats.failure_reason = reason;
       stats.total_ms = total_timer.getElapsedMicros() / 1000.0;
       return false;
     }
 
-    stats.segment_count = pathcover_result.corridors.size();
+    const std::vector<mighty::risp::Result>& corridor_results =
+        reuse_pathcover ? pathcover_reuse_result.corridors : pathcover_result.corridors;
+    active_pathcover_corridor_count = corridor_results.size();
+    active_pathcover_unreduced_retry_count = benchmark_data_.sc_unreduced_retry_count;
+    stats.segment_count = corridor_results.size();
     constraints.reserve(stats.segment_count);
     polytopes.reserve(stats.segment_count);
     MyTimer constraint_timer(true);
-    for (size_t segment = 0; segment < pathcover_result.corridors.size(); ++segment) {
-      const auto& result = pathcover_result.corridors[segment];
+    for (size_t segment = 0; segment < corridor_results.size(); ++segment) {
+      const auto& result = corridor_results[segment];
       LinearConstraint3D constraint(result.A, result.b);
       Polyhedron<3> polytope;
       for (Eigen::Index row = 0; row < result.A.rows(); ++row) {
@@ -821,8 +927,42 @@ bool MIGHTY::getSafeCorridor(const vec_Vecf<3>& global_path, const state& A,
 
     mighty::risp::ExpandedPathCover expanded;
     std::string expansion_reason;
-    if (!mighty::risp::expandPathCoverForOptimizer(global_path, pathcover_result, expanded,
-                                                    expansion_reason)) {
+    bool expansion_ok = true;
+    if (reuse_pathcover) {
+      expanded.waypoints.reserve(global_path.size());
+      for (const auto& waypoint : global_path)
+        expanded.waypoints.push_back(waypoint.template cast<double>());
+      expanded.corridor_indices = pathcover_reuse_result.segment_corridor_indices;
+      expanded.inserted_seams = 0;
+      if (expanded.waypoints.size() < 2 ||
+          expanded.corridor_indices.size() + 1 != expanded.waypoints.size()) {
+        expansion_reason = "reuse_mapping_size_mismatch";
+        expansion_ok = false;
+      }
+      constexpr double containment_tolerance = 1e-7;
+      for (size_t segment = 0; expansion_ok && segment < expanded.corridor_indices.size();
+           ++segment) {
+        const size_t corridor_index = expanded.corridor_indices[segment];
+        if (corridor_index >= corridor_results.size()) {
+          expansion_reason = "reuse_corridor_index_out_of_range";
+          expansion_ok = false;
+          break;
+        }
+        const auto& corridor = corridor_results[corridor_index];
+        const auto contains_point = [&](const Eigen::Vector3d& point) {
+          return ((corridor.A * point - corridor.b).array() <= containment_tolerance).all();
+        };
+        if (!contains_point(expanded.waypoints[segment]) ||
+            !contains_point(expanded.waypoints[segment + 1])) {
+          expansion_reason = "reuse_seed_segment_outside";
+          expansion_ok = false;
+        }
+      }
+    } else {
+      expansion_ok = mighty::risp::expandPathCoverForOptimizer(
+          global_path, pathcover_result, expanded, expansion_reason);
+    }
+    if (!expansion_ok) {
       stats.failure_reason = "optimizer_expansion_" + expansion_reason;
       constraints.clear();
       polytopes.clear();
@@ -832,6 +972,10 @@ bool MIGHTY::getSafeCorridor(const vec_Vecf<3>& global_path, const state& A,
 
     const auto geometric_constraints = constraints;
     const auto geometric_polytopes = polytopes;
+    if (debug_testing_enabled_ && reuse_pathcover) {
+      debug_geometric_corridors_ = geometric_constraints;
+      debug_segment_corridor_indices_ = expanded.corridor_indices;
+    }
     constraints.clear();
     polytopes.clear();
     constraints.reserve(expanded.corridor_indices.size());
@@ -847,17 +991,17 @@ bool MIGHTY::getSafeCorridor(const vec_Vecf<3>& global_path, const state& A,
     optimizer_path.reserve(expanded.waypoints.size());
     for (const auto& waypoint : expanded.waypoints)
       optimizer_path.push_back(waypoint);
-    std::vector<size_t> splines_per_corridor(pathcover_result.corridors.size(), 0U);
+    std::vector<size_t> splines_per_corridor(corridor_results.size(), 0U);
     for (const size_t corridor_index : expanded.corridor_indices)
       ++splines_per_corridor[corridor_index];
-    benchmark_data_.sc_pathcover_corridor_count = pathcover_result.corridors.size();
+    benchmark_data_.sc_pathcover_corridor_count = corridor_results.size();
     benchmark_data_.sc_optimizer_segment_count = expanded.corridor_indices.size();
     benchmark_data_.sc_pathcover_inserted_seams = expanded.inserted_seams;
     benchmark_data_.sc_pathcover_splines_per_corridor_mean =
-        pathcover_result.corridors.empty()
+        corridor_results.empty()
             ? 0.0
             : static_cast<double>(expanded.corridor_indices.size()) /
-                  static_cast<double>(pathcover_result.corridors.size());
+                  static_cast<double>(corridor_results.size());
     benchmark_data_.sc_pathcover_splines_per_corridor_max =
         splines_per_corridor.empty()
             ? 0U
@@ -870,7 +1014,9 @@ bool MIGHTY::getSafeCorridor(const vec_Vecf<3>& global_path, const state& A,
     return true;
   };
 
-  const bool pathcover_requested = par_.sc_method == "pathcover_line";
+  const bool pathcover_requested = par_.sc_method == "pathcover_line" ||
+                                   par_.sc_method == "pathcover_point" ||
+                                   par_.sc_method == "pathcover_line_reuse";
   const bool risp_requested = pathcover_requested || par_.sc_method == "risp_point" ||
                               par_.sc_method == "risp_line";
   bool primary_ok = false;
@@ -901,10 +1047,10 @@ bool MIGHTY::getSafeCorridor(const vec_Vecf<3>& global_path, const state& A,
         benchmark_data_.sc_segment_count = safe_corridor_polytopes_whole_.size();
         benchmark_data_.sc_pathcover_compression_ratio =
             benchmark_data_.sc_reference_segments > 0
-                ? static_cast<double>(pathcover_result.corridors.size()) /
+                ? static_cast<double>(active_pathcover_corridor_count) /
                       static_cast<double>(benchmark_data_.sc_reference_segments)
                 : 1.0;
-        benchmark_data_.sc_result_class = pathcover_result.unreduced_retry_count > 0
+        benchmark_data_.sc_result_class = active_pathcover_unreduced_retry_count > 0
                                                ? "pathcover_success_unreduced_retry"
                                                : "pathcover_success";
       } else {
@@ -1003,7 +1149,9 @@ bool MIGHTY::getSafeCorridor(const vec_Vecf<3>& global_path, const state& A,
     bool secondary_ok = false;
     if (risp_requested && !benchmark_data_.sc_fallback_used) {
       secondary_ok = run_risp(optimizer_path, base_uo_safe, safe_constraints, poly_out_safe_,
-                              secondary_stats);
+                              secondary_stats,
+                              par_.sc_method == "pathcover_point" ||
+                                  par_.sc_method == "pathcover_line_reuse");
     } else {
       EllipsoidDecomp3D ellip_safe;
       ellip_safe.set_local_bbox(
@@ -1869,11 +2017,82 @@ bool MIGHTY::planLocalTrajectory(vec_Vecf<3>& global_path) {
     local_A.pos[2] = par_.default_goal_z;
   }
 
+  auto reconstruct_solution = [&]() {
+    whole_traj_solver_ptr_->reconstructPVATCPopt(zopt_);
+    whole_traj_solver_ptr_->getGoalSetpoints(goal_setpoints_);
+    whole_traj_solver_ptr_->getPieceWisePol(pwp_to_share_);
+    whole_traj_solver_ptr_->getControlPoints(cps_);
+  };
+  auto max_control_point_corridor_violation = [&]() {
+    if (cps_.size() != safe_corridor_polytopes_whole_.size())
+      return std::numeric_limits<double>::infinity();
+    double maximum = -std::numeric_limits<double>::infinity();
+    for (size_t segment = 0; segment < cps_.size(); ++segment) {
+      const auto& corridor = safe_corridor_polytopes_whole_[segment];
+      if (corridor.A_.rows() == 0 || corridor.b_.size() != corridor.A_.rows() ||
+          !corridor.A_.allFinite() || !corridor.b_.allFinite())
+        return std::numeric_limits<double>::infinity();
+      for (Eigen::Index cp = 0; cp < cps_[segment].cols(); ++cp) {
+        for (Eigen::Index row = 0; row < corridor.A_.rows(); ++row) {
+          const double norm = corridor.A_.row(row).norm();
+          if (!(norm > 1e-12) || !std::isfinite(norm))
+            return std::numeric_limits<double>::infinity();
+          maximum = std::max(maximum,
+                             (corridor.A_.row(row).dot(cps_[segment].col(cp)) -
+                              corridor.b_(row)) /
+                                 norm);
+        }
+      }
+    }
+    return maximum;
+  };
+
+  struct CorridorOptimizationTier {
+    const char* name;
+    double static_weight_scale;
+    double accepted_violation_m;
+  };
+  std::vector<CorridorOptimizationTier> tiers;
+  if (par_.corridor_three_tier_optimization) {
+    tiers.push_back({"hard", par_.corridor_hard_weight_scale,
+                     par_.corridor_hard_tolerance});
+    tiers.push_back({"bounded", par_.corridor_bounded_weight_scale,
+                     par_.corridor_bounded_violation});
+  }
+  tiers.push_back({"soft", 1.0, std::numeric_limits<double>::infinity()});
+
   MyTimer timer_opt(true);
-  optimization_succeeded =
-      generateLocalTrajectory(local_A, A_time, optimizer_path, initial_guess_computation_time_,
-                              local_traj_computation_time_, whole_traj_solver_ptr_,
-                              &hgp_reference_path);
+  double total_initial_guess_ms = 0.0;
+  double total_local_optimization_ms = 0.0;
+  for (const auto& tier : tiers) {
+    double tier_initial_guess_ms = 0.0;
+    double tier_optimization_ms = 0.0;
+    const bool solved = generateLocalTrajectory(
+        local_A, A_time, optimizer_path, tier_initial_guess_ms, tier_optimization_ms,
+        whole_traj_solver_ptr_, &hgp_reference_path,
+        par_.stat_weight * tier.static_weight_scale);
+    total_initial_guess_ms += std::max(0.0, tier_initial_guess_ms);
+    total_local_optimization_ms += std::max(0.0, tier_optimization_ms);
+    if (!solved) continue;
+
+    reconstruct_solution();
+    const double maximum_violation = max_control_point_corridor_violation();
+    if (maximum_violation <= tier.accepted_violation_m) {
+      optimization_succeeded = true;
+      if (par_.debug_verbose) {
+        std::cout << "[CorridorOptimization] accepted tier=" << tier.name
+                  << " max_control_point_violation_m=" << maximum_violation << std::endl;
+      }
+      break;
+    }
+    if (par_.debug_verbose) {
+      std::cout << "[CorridorOptimization] rejected tier=" << tier.name
+                << " max_control_point_violation_m=" << maximum_violation
+                << " limit_m=" << tier.accepted_violation_m << std::endl;
+    }
+  }
+  initial_guess_computation_time_ = total_initial_guess_ms;
+  local_traj_computation_time_ = total_local_optimization_ms;
   if (par_.debug_verbose)
     printf("[TIMING]   L-BFGS optimization: %.2f ms\n", timer_opt.getElapsedMicros() / 1000.0);
 
@@ -1884,12 +2103,6 @@ bool MIGHTY::planLocalTrajectory(vec_Vecf<3>& global_path) {
   }
 
   if (optimization_succeeded) {
-    auto reconstruct_solution = [&]() {
-      whole_traj_solver_ptr_->reconstructPVATCPopt(zopt_);
-      whole_traj_solver_ptr_->getGoalSetpoints(goal_setpoints_);
-      whole_traj_solver_ptr_->getPieceWisePol(pwp_to_share_);
-      whole_traj_solver_ptr_->getControlPoints(cps_);
-    };
     reconstruct_solution();
 
     // Publication gate for the newly optimized candidate. The HGP manager
@@ -2019,6 +2232,119 @@ bool MIGHTY::planLocalTrajectory(vec_Vecf<3>& global_path) {
           first_occupied_corridor_max_plane;
       benchmark_data_.first_unsafe_distance_from_start =
           first_occupied_distance_from_start;
+
+      // Targeted debug-only classification for the PathCover-reuse case. This
+      // intentionally runs only after an unsafe candidate has already been
+      // detected, so normal flight and normal benchmark timing are unchanged.
+      benchmark_data_.debug_testing_enabled = debug_testing_enabled_;
+      if (debug_testing_enabled_) {
+        const auto nearest_obstacle = [](const vec_Vec3f& obstacles,
+                                         const Eigen::Vector3d& query,
+                                         Eigen::Vector3d* nearest) {
+          double best = std::numeric_limits<double>::infinity();
+          for (const auto& raw : obstacles) {
+            const Eigen::Vector3d obstacle = raw.cast<double>();
+            const double distance = (obstacle - query).norm();
+            if (distance < best) {
+              best = distance;
+              if (nearest != nullptr) *nearest = obstacle;
+            }
+          }
+          return best;
+        };
+        const auto inside = [](const LinearConstraint3D& corridor,
+                               const Eigen::Vector3d& point) {
+          return corridor.A_.rows() > 0 && corridor.b_.size() == corridor.A_.rows() &&
+                 corridor.A_.allFinite() && corridor.b_.allFinite() &&
+                 ((corridor.A_ * point - corridor.b_).array() <= 1e-6).all();
+        };
+
+        Eigen::Vector3d nearest_generation = Eigen::Vector3d::Zero();
+        benchmark_data_.debug_nearest_generation_obstacle_m = nearest_obstacle(
+            debug_corridor_generation_obstacles_, first_occupied_position,
+            &nearest_generation);
+        Vec3f matched_generation = Vec3f::Zero();
+        benchmark_data_.debug_generation_snapshot_match =
+            hgp_manager_.planningObstacleCloudContainsVoxel(
+                debug_corridor_generation_obstacles_, first_occupied_position,
+                &matched_generation);
+        benchmark_data_.debug_local_obstacle_match =
+            hgp_manager_.planningObstacleCloudContainsVoxel(
+                debug_corridor_local_obstacles_, first_occupied_position);
+        benchmark_data_.debug_local_bounds_contain_unsafe =
+            debug_corridor_bounds_valid_ &&
+            (first_occupied_position.array() >= debug_corridor_lower_.array()).all() &&
+            (first_occupied_position.array() <= debug_corridor_upper_.array()).all();
+
+        vec_Vec3f current_obstacles;
+        if (!debug_corridor_reference_path_.empty()) {
+          hgp_manager_.getPlanningObstacleCloud(
+              debug_corridor_reference_path_, par_.local_box_size,
+              par_.sfc_use_unknown_as_obstacle, current_obstacles);
+        }
+        benchmark_data_.debug_nearest_current_obstacle_m =
+            nearest_obstacle(current_obstacles, first_occupied_position, nullptr);
+        benchmark_data_.debug_current_snapshot_match =
+            hgp_manager_.planningObstacleCloudContainsVoxel(
+                current_obstacles, first_occupied_position);
+
+        const bool reuse_debug = par_.sc_method == "pathcover_line_reuse";
+        const bool segment_valid =
+            first_occupied_segment < debug_segment_corridor_indices_.size();
+        size_t assigned_corridor = std::numeric_limits<size_t>::max();
+        if (segment_valid) {
+          assigned_corridor = debug_segment_corridor_indices_[first_occupied_segment];
+          if (assigned_corridor < debug_geometric_corridors_.size())
+            benchmark_data_.debug_assigned_corridor =
+                static_cast<int>(assigned_corridor);
+        }
+        if (segment_valid && assigned_corridor < debug_geometric_corridors_.size() &&
+            first_occupied_segment < safe_corridor_polytopes_whole_.size()) {
+          const auto& expected = debug_geometric_corridors_[assigned_corridor];
+          const auto& actual = safe_corridor_polytopes_whole_[first_occupied_segment];
+          benchmark_data_.debug_mapping_valid =
+              expected.A_.rows() == actual.A_.rows() &&
+              expected.b_.size() == actual.b_.size() &&
+              (expected.A_ - actual.A_).norm() <= 1e-10 &&
+              (expected.b_ - actual.b_).norm() <= 1e-10;
+          benchmark_data_.debug_unsafe_inside_assigned_corridor =
+              inside(actual, first_occupied_position);
+          if (benchmark_data_.debug_generation_snapshot_match) {
+            benchmark_data_.debug_generation_obstacle_inside_assigned_corridor =
+                inside(actual, matched_generation);
+          }
+        }
+        for (const auto& corridor : debug_geometric_corridors_) {
+          if (inside(corridor, first_occupied_position)) {
+            benchmark_data_.debug_unsafe_inside_any_corridor = true;
+            break;
+          }
+        }
+
+        if (!reuse_debug) {
+          benchmark_data_.debug_corridor_classification = "not_pathcover_line_reuse";
+        } else if (!benchmark_data_.debug_generation_snapshot_match) {
+          benchmark_data_.debug_corridor_classification =
+              benchmark_data_.debug_current_snapshot_match
+                  ? "late_map_update_after_corridor_generation"
+                  : "occupied_voxel_missing_from_corridor_cloud";
+        } else if (!benchmark_data_.debug_local_obstacle_match) {
+          benchmark_data_.debug_corridor_classification =
+              "generation_obstacle_filtered_by_local_bounds";
+        } else if (!benchmark_data_.debug_mapping_valid) {
+          benchmark_data_.debug_corridor_classification =
+              "segment_corridor_mapping_mismatch";
+        } else if (benchmark_data_.debug_generation_obstacle_inside_assigned_corridor) {
+          benchmark_data_.debug_corridor_classification =
+              "corridor_contains_generation_obstacle";
+        } else if (benchmark_data_.debug_unsafe_inside_assigned_corridor) {
+          benchmark_data_.debug_corridor_classification =
+              "occupied_voxel_volume_crosses_corridor";
+        } else {
+          benchmark_data_.debug_corridor_classification =
+              "optimizer_left_assigned_corridor";
+        }
+      }
 
       if (!safety_gate_enabled_) {
         consecutive_safety_rejections_ = 0;
@@ -2308,7 +2634,8 @@ bool MIGHTY::generateLocalTrajectory(const state& local_A, double A_time, vec_Ve
                                      double& initial_guess_computation_time,
                                      double& local_traj_computation_time,
                                      std::shared_ptr<lbfgs::SolverLBFGS>& whole_traj_solver_ptr,
-                                     const vec_Vec3f* anchor_reference_path) {
+                                     const vec_Vec3f* anchor_reference_path,
+                                     double static_weight_override) {
   if (par_.debug_verbose) std::cout << "Preparing solver for replan" << std::endl;
 
   auto local_trajs = getTrajs();  // RVO/NRVO elides copy
@@ -2333,9 +2660,13 @@ bool MIGHTY::generateLocalTrajectory(const state& local_A, double A_time, vec_Ve
 
   // Pass ESDF grid to solver (ground robot only, thread-safe immutable snapshot)
   if (esdf_grid_) whole_traj_solver_ptr->setEsdfGrid(esdf_grid_);
+  if (static_weight_override > 0.0)
+    whole_traj_solver_ptr->setStaticWeight(static_weight_override);
 
   const bool preserve_pathcover_segmentation =
-      par_.sc_method == "pathcover_line" && !benchmark_data_.sc_fallback_used;
+      (par_.sc_method == "pathcover_line" || par_.sc_method == "pathcover_point" ||
+       par_.sc_method == "pathcover_line_reuse") &&
+      !benchmark_data_.sc_fallback_used;
 
   whole_traj_solver_ptr->prepareSolverForReplan(
       A_time, global_path, safe_corridor_polytopes_whole_, local_trajs, local_A, local_E,
@@ -2405,6 +2736,8 @@ bool MIGHTY::generateLocalTrajectory(const state& local_A, double A_time, vec_Ve
         // make a fresh solver for thread-safety
         std::shared_ptr<lbfgs::SolverLBFGS> solver_ptr = std::make_shared<lbfgs::SolverLBFGS>();
         solver_ptr->initializeSolver(planner_params_);
+        if (static_weight_override > 0.0)
+          solver_ptr->setStaticWeight(static_weight_override);
         if (esdf_grid_) solver_ptr->setEsdfGrid(esdf_grid_);
         double initial_guess_computation_time = 0.0;
         solver_ptr->prepareSolverForReplan(

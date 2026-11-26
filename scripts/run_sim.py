@@ -748,13 +748,16 @@ def generate_gazebo_yaml(setup_bash: Path, goal: tuple, sim_env: str,
                          benchmark_file: str = None,
                          benchmark_replan_details: bool = False,
                          enable_safety_gate: bool = True,
+                         debug_testing: bool = False,
                          sc_method: str = 'ellipsoid',
                          risp_alpha: float = 0.05,
                          sc_ellipsoid_fallback: bool = False,
                          risp_random_seed: int = 1,
                          pathcover_max_corridors: int = 12,
                          pathcover_overlap_distance: float = 0.25,
-                         pathcover_min_overlap_margin: float = 0.001) -> str:
+                         pathcover_min_overlap_margin: float = 0.001,
+                         pathcover_min_progress: float = 0.05,
+                         pathcover_point_max_retries: int = 3) -> str:
     """Generate YAML for single-agent Gazebo simulation.
 
     exploration_enabled=False is what makes this mode mean "drive to the goal"
@@ -808,12 +811,15 @@ def generate_gazebo_yaml(setup_bash: Path, goal: tuple, sim_env: str,
                 f'ros2 launch mighty onboard_mighty.launch.py x:={start_x} y:={start_y} z:={start_z} yaw:={start_yaw} '
                 f'sim_env:={sim_env} use_ground_robot:={str(use_ground_robot).lower()} '
                 f'enable_safety_gate:={str(enable_safety_gate).lower()} '
+                f'debug_testing:={str(debug_testing).lower()} '
                 f'sc_method:={sc_method} risp_alpha:={risp_alpha} '
                 f'sc_ellipsoid_fallback:={str(sc_ellipsoid_fallback).lower()} '
                 f'risp_random_seed:={risp_random_seed} '
                 f'pathcover_max_corridors:={pathcover_max_corridors} '
                 f'pathcover_overlap_distance:={pathcover_overlap_distance} '
-                f'pathcover_min_overlap_margin:={pathcover_min_overlap_margin}'
+                f'pathcover_min_overlap_margin:={pathcover_min_overlap_margin} '
+                f'pathcover_min_progress:={pathcover_min_progress} '
+                f'pathcover_point_max_retries:={pathcover_point_max_retries}'
                 + ('' if exploration_enabled is None
                    else f' exploration_enabled:={str(exploration_enabled).lower()}')
                 + benchmark_args
@@ -1009,8 +1015,15 @@ def main():
     )
 
     parser.add_argument(
+        '--debug-testing',
+        action='store_true',
+        help='Enable targeted PathCover/corridor diagnostics for controlled tests.'
+    )
+
+    parser.add_argument(
         '--sc-method',
-        choices=['ellipsoid', 'risp_point', 'risp_line', 'pathcover_line'],
+        choices=['ellipsoid', 'risp_point', 'risp_line', 'pathcover_line', 'pathcover_point',
+                 'pathcover_line_reuse'],
         default='ellipsoid',
         help='Safe-corridor generator (default: ellipsoid)'
     )
@@ -1037,6 +1050,14 @@ def main():
     parser.add_argument(
         '--pathcover-min-overlap-margin', type=float, default=0.001,
         help='Minimum normalized seam margin required in both adjacent corridors'
+    )
+    parser.add_argument(
+        '--pathcover-min-progress', type=float, default=0.05,
+        help='Minimum new path coverage per point-seeded PathCover corridor'
+    )
+    parser.add_argument(
+        '--pathcover-point-max-retries', type=int, default=3,
+        help='Deterministic retries after the initial point-seed attempt'
     )
 
     parser.add_argument(
@@ -1094,6 +1115,10 @@ def main():
         parser.error('--pathcover-overlap-distance must be non-negative')
     if args.pathcover_min_overlap_margin < 0.0:
         parser.error('--pathcover-min-overlap-margin must be non-negative')
+    if args.pathcover_min_progress <= 0.0:
+        parser.error('--pathcover-min-progress must be positive')
+    if args.pathcover_point_max_retries < 0:
+        parser.error('--pathcover-point-max-retries must be non-negative')
 
     # Find setup.bash path and rviz config
     setup_bash = find_setup_bash(args.setup_bash)
@@ -1287,13 +1312,16 @@ def main():
             benchmark_file=args.benchmark_file,
             benchmark_replan_details=args.benchmark_replan_details,
             enable_safety_gate=not args.disable_safety_gate,
+            debug_testing=args.debug_testing,
             sc_method=args.sc_method,
             risp_alpha=args.risp_alpha,
             sc_ellipsoid_fallback=args.sc_ellipsoid_fallback,
             risp_random_seed=args.risp_random_seed,
             pathcover_max_corridors=args.pathcover_max_corridors,
             pathcover_overlap_distance=args.pathcover_overlap_distance,
-            pathcover_min_overlap_margin=args.pathcover_min_overlap_margin
+            pathcover_min_overlap_margin=args.pathcover_min_overlap_margin,
+            pathcover_min_progress=args.pathcover_min_progress,
+            pathcover_point_max_retries=args.pathcover_point_max_retries
         )
         print(f"[INFO] Mode: Single-agent Gazebo simulation (sim_env={sim_env})")
         print(f"[INFO] Environment: {args.env} (world: {world_name})")

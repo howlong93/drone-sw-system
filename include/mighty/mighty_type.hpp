@@ -176,9 +176,16 @@ struct parameters {
   double risp_alpha{0.05};
   bool sc_ellipsoid_fallback{false};
   int risp_random_seed{1};
+  bool corridor_three_tier_optimization{true};
+  double corridor_hard_weight_scale{100.0};
+  double corridor_bounded_weight_scale{10.0};
+  double corridor_hard_tolerance{1e-5};
+  double corridor_bounded_violation{0.02};
   int pathcover_max_corridors{12};
   double pathcover_overlap_distance{0.25};
   double pathcover_min_overlap_margin{0.001};
+  double pathcover_min_progress{0.05};
+  int pathcover_point_max_retries{3};
 
   // Communication delay parameters
   bool use_comm_delay_inflation;

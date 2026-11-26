@@ -43,6 +43,10 @@ struct PathCoverResult {
   double min_overlap_margin{std::numeric_limits<double>::infinity()};
   double risp_generation_ms{0.0};
   size_t unreduced_retry_count{0};
+  size_t point_retry_count{0};
+  size_t point_no_progress_count{0};
+  size_t point_waypoint_retry_count{0};
+  std::vector<double> corridor_progress_lengths;
   bool full_coverage{false};
   bool horizon_exceeded{false};
 };
@@ -52,6 +56,25 @@ struct ExpandedPathCover {
   // One geometric PathCover corridor index for every optimizer segment.
   std::vector<size_t> corridor_indices;
   size_t inserted_seams{0};
+};
+
+struct PathCoverReuseResult {
+  std::vector<Result> corridors;
+  // One corridor index for every original HGP segment. No waypoint is added.
+  std::vector<size_t> segment_corridor_indices;
+  std::vector<std::pair<Vec3, Vec3>> seed_segments;
+  std::vector<size_t> segments_per_corridor;
+  size_t reference_waypoints{0};
+  double reference_length{0.0};
+  double risp_generation_ms{0.0};
+  size_t unreduced_retry_count{0};
+  size_t reused_segment_count{0};
+  size_t low_overlap_transition_count{0};
+  size_t overlap_rollback_count{0};
+  size_t weak_overlap_transition_count{0};
+  double min_transition_margin{std::numeric_limits<double>::infinity()};
+  bool full_coverage{false};
+  bool horizon_exceeded{false};
 };
 
 inline bool isStrictlyInside(const MatX3& A, const Eigen::VectorXd& b, const Vec3& point,
@@ -83,9 +106,23 @@ inline bool contains(const MatX3& A, const Eigen::VectorXd& b, const Vec3& point
 
 inline bool excludesAllObstacles(const MatX3& A, const Eigen::VectorXd& b,
                                  const std::vector<Vec3>& obstacles,
-                                 double tolerance_m = 1e-8) {
+                                 double tolerance_m = 1e-8,
+                                 double obstacle_support_radius_m = 0.0) {
   return std::none_of(obstacles.begin(), obstacles.end(), [&](const Vec3& obstacle) {
-    return contains(A, b, obstacle, tolerance_m);
+    if (!(obstacle_support_radius_m > 0.0)) return contains(A, b, obstacle, tolerance_m);
+    // The corridor intersects the conservative spherical support of this
+    // voxel unless every separating plane still leaves some part of the
+    // support on the corridor side.  A voxel is excluded only when at least
+    // one plane places the complete support outside.
+    for (Eigen::Index row = 0; row < A.rows(); ++row) {
+      const double normal_norm = A.row(row).norm();
+      if (!(normal_norm > 1e-12) || !std::isfinite(normal_norm)) return true;
+      if (A.row(row).dot(obstacle) - obstacle_support_radius_m * normal_norm >
+          b(row) + tolerance_m) {
+        return false;
+      }
+    }
+    return true;
   });
 }
 
@@ -147,11 +184,16 @@ template <typename ProjectionFn>
 inline bool generate(const std::vector<Vec3>& obstacles, const MatX3& A_bound,
                      const Eigen::VectorXd& b_bound, const Vec3& reduction_seed, double alpha,
                      std::mt19937& rng, ProjectionFn&& project, Result& result,
-                     std::string& failure_reason) {
+                     std::string& failure_reason, double obstacle_support_radius_m = 0.0) {
   result = Result{};
   failure_reason.clear();
   if (!(alpha > 0.0 && alpha < 1.0) || !std::isfinite(alpha)) {
     failure_reason = "alpha_out_of_range";
+    return false;
+  }
+  if (!(obstacle_support_radius_m >= 0.0) ||
+      !std::isfinite(obstacle_support_radius_m)) {
+    failure_reason = "invalid_obstacle_support_radius";
     return false;
   }
   if (A_bound.rows() != b_bound.size() || A_bound.cols() != 3 || A_bound.rows() < 6 ||
@@ -180,16 +222,26 @@ inline bool generate(const std::vector<Vec3>& obstacles, const MatX3& A_bound,
     std::uniform_int_distribution<size_t> choose(0, remaining.size() - 1);
     const Vec3 pivot = remaining[choose(rng)];
     const Vec3 projection = project(pivot);
-    const Vec3 normal = pivot - projection;
-    const double distance_squared = normal.squaredNorm();
+    const Vec3 center_direction = pivot - projection;
+    const double center_distance = center_direction.norm();
     const double coordinate_scale =
         std::max(1.0, std::max(pivot.squaredNorm(), projection.squaredNorm()));
     const double degenerate_threshold =
         64.0 * std::numeric_limits<double>::epsilon() * coordinate_scale;
-    if (!(distance_squared > degenerate_threshold) || !std::isfinite(distance_squared)) {
+    if (!(center_distance * center_distance > degenerate_threshold) ||
+        !std::isfinite(center_distance) ||
+        !(center_distance > obstacle_support_radius_m)) {
       failure_reason = "seed_intersects_obstacle";
       return false;
     }
+
+    // Treat every occupied voxel as a conservative sphere whose radius is
+    // half the voxel diagonal.  The effective pivot is the closest point of
+    // that support to the seed; the plane orientation is unchanged.
+    const Vec3 unit_direction = center_direction / center_distance;
+    const Vec3 supported_pivot = pivot - obstacle_support_radius_m * unit_direction;
+    const Vec3 normal = supported_pivot - projection;
+    const double distance_squared = normal.squaredNorm();
 
     const double offset = normal.dot(projection) + one_minus_alpha * distance_squared;
     generated.row(static_cast<Eigen::Index>(plane_count)) = normal.transpose();
@@ -199,7 +251,9 @@ inline bool generate(const std::vector<Vec3>& obstacles, const MatX3& A_bound,
     const size_t before = remaining.size();
     remaining.erase(std::remove_if(remaining.begin(), remaining.end(),
                                    [&](const Vec3& obstacle) {
-                                     return normal.dot(obstacle) > offset;
+                                     return normal.dot(obstacle) -
+                                                obstacle_support_radius_m * normal.norm() >
+                                            offset;
                                    }),
                     remaining.end());
     if (remaining.size() == before) {
@@ -222,8 +276,9 @@ inline bool generate(const std::vector<Vec3>& obstacles, const MatX3& A_bound,
   result.generated_planes = plane_count;
 
   // Qhull redundancy removal is a numerical optimization, not part of RISP's
-  // safety argument. Preserve the complete constraint set and fall back to it
-  // whenever reduction fails or accidentally admits an obstacle.
+  // safety argument. Keep the complete constraint set as a fallback, but do
+  // not rescan every obstacle after a successful reduction on the planning
+  // hot path. Only a genuine reduction failure pays for fallback validation.
   const MatX3 complete_A = result.A;
   const Eigen::VectorXd complete_b = result.b;
   MatX3 reduced_A = complete_A;
@@ -231,13 +286,13 @@ inline bool generate(const std::vector<Vec3>& obstacles, const MatX3& A_bound,
   std::string reduction_reason;
   const bool reduced =
       reduceRedundantPlanes(reduced_A, reduced_b, reduction_seed, reduction_reason);
-  if (reduced && excludesAllObstacles(reduced_A, reduced_b, obstacles)) {
+  if (reduced) {
     result.A.swap(reduced_A);
     result.b.swap(reduced_b);
   } else {
-    if (!excludesAllObstacles(complete_A, complete_b, obstacles)) {
-      failure_reason = reduced ? "unreduced_obstacle_inside"
-                               : "reduction_failed_and_unreduced_obstacle_inside";
+    if (!excludesAllObstacles(complete_A, complete_b, obstacles, 1e-8,
+                              obstacle_support_radius_m)) {
+      failure_reason = "reduction_failed_and_unreduced_obstacle_inside";
       return false;
     }
     result.A = complete_A;
@@ -249,23 +304,27 @@ inline bool generate(const std::vector<Vec3>& obstacles, const MatX3& A_bound,
 
 inline bool pointSeed(const std::vector<Vec3>& obstacles, const Vec3& seed,
                       const MatX3& A_bound, const Eigen::VectorXd& b_bound, double alpha,
-                      std::mt19937& rng, Result& result, std::string& failure_reason) {
+                      std::mt19937& rng, Result& result, std::string& failure_reason,
+                      double obstacle_support_radius_m = 0.0) {
   return generate(obstacles, A_bound, b_bound, seed, alpha, rng,
-                  [&](const Vec3&) { return seed; }, result, failure_reason);
+                  [&](const Vec3&) { return seed; }, result, failure_reason,
+                  obstacle_support_radius_m);
 }
 
 inline bool lineSeed(const std::vector<Vec3>& obstacles, const Vec3& start, const Vec3& end,
                      const MatX3& A_bound, const Eigen::VectorXd& b_bound, double alpha,
-                     std::mt19937& rng, Result& result, std::string& failure_reason) {
+                     std::mt19937& rng, Result& result, std::string& failure_reason,
+                     double obstacle_support_radius_m = 0.0) {
   if ((end - start).squaredNorm() <= std::numeric_limits<double>::epsilon()) {
-    return pointSeed(obstacles, start, A_bound, b_bound, alpha, rng, result, failure_reason);
+    return pointSeed(obstacles, start, A_bound, b_bound, alpha, rng, result, failure_reason,
+                     obstacle_support_radius_m);
   }
   const Vec3 midpoint = 0.5 * (start + end);
   return generate(obstacles, A_bound, b_bound, midpoint, alpha, rng,
                   [&](const Vec3& obstacle) {
                     return closestPointOnSegment(obstacle, start, end);
                   },
-                  result, failure_reason);
+                  result, failure_reason, obstacle_support_radius_m);
 }
 
 inline double polylineLength(const std::vector<Vec3>& path) {
@@ -302,7 +361,8 @@ inline bool pathCoverLineSeed(const std::vector<Vec3>& obstacles,
                               const MatX3& A_bound, const Eigen::VectorXd& b_bound,
                               double alpha, uint32_t random_seed, size_t max_corridors,
                               double overlap_backtrack_m, double minimum_overlap_margin_m,
-                              PathCoverResult& output, std::string& failure_reason) {
+                              PathCoverResult& output, std::string& failure_reason,
+                              double obstacle_support_radius_m = 0.0) {
   output = PathCoverResult{};
   failure_reason.clear();
   if (max_corridors == 0) {
@@ -342,7 +402,8 @@ inline bool pathCoverLineSeed(const std::vector<Vec3>& obstacles,
     std::seed_seq sequence{random_seed, static_cast<uint32_t>(corridor_index), 0x70617468U};
     std::mt19937 rng(sequence);
     const auto begin = std::chrono::steady_clock::now();
-    const bool ok = lineSeed(obstacles, start, end, A_bound, b_bound, alpha, rng, result, reason);
+    const bool ok = lineSeed(obstacles, start, end, A_bound, b_bound, alpha, rng, result,
+                             reason, obstacle_support_radius_m);
     const double elapsed_ms =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
     output.risp_generation_ms += elapsed_ms;
@@ -509,6 +570,407 @@ inline bool pathCoverLineSeed(const std::vector<Vec3>& obstacles,
     failure_reason = "corridor_waypoint_count_mismatch";
     return false;
   }
+  return true;
+}
+
+// Build a PathCover chain from point-seeded RISP corridors.  Each accepted
+// corridor is followed along the HGP polyline until its first exit.  The next
+// seed is placed before that exit to create deterministic overlap; if that
+// candidate cannot make forward progress, the last fully covered HGP waypoint
+// is tried as a conservative point-seed candidate.  This function never
+// silently changes to line seeding.
+template <typename PathContainer>
+inline bool pathCoverPointSeed(const std::vector<Vec3>& obstacles,
+                               const PathContainer& reference_path,
+                               const MatX3& A_bound, const Eigen::VectorXd& b_bound,
+                               double alpha, uint32_t random_seed, size_t max_corridors,
+                               double overlap_backtrack_m, double minimum_overlap_margin_m,
+                               double minimum_progress_m, size_t max_retries,
+                               PathCoverResult& output, std::string& failure_reason,
+                               double obstacle_support_radius_m = 0.0) {
+  output = PathCoverResult{};
+  failure_reason.clear();
+  if (max_corridors == 0) {
+    failure_reason = "invalid_max_corridors";
+    return false;
+  }
+  if (!(overlap_backtrack_m >= 0.0) || !(minimum_overlap_margin_m >= 0.0) ||
+      !(minimum_progress_m > 0.0) || !std::isfinite(overlap_backtrack_m) ||
+      !std::isfinite(minimum_overlap_margin_m) || !std::isfinite(minimum_progress_m)) {
+    failure_reason = "invalid_point_pathcover_parameters";
+    return false;
+  }
+
+  std::vector<Vec3> path;
+  path.reserve(reference_path.size());
+  for (const auto& point_raw : reference_path) {
+    const Vec3 point = point_raw.template cast<double>();
+    if (!point.allFinite()) {
+      failure_reason = "nonfinite_reference_path";
+      return false;
+    }
+    if (path.empty() || (point - path.back()).norm() > 1e-8) path.push_back(point);
+  }
+  if (path.size() < 2) {
+    failure_reason = "path_too_short";
+    return false;
+  }
+
+  std::vector<double> distances(path.size(), 0.0);
+  for (size_t i = 1; i < path.size(); ++i)
+    distances[i] = distances[i - 1] + (path[i] - path[i - 1]).norm();
+  const double total_length = distances.back();
+  if (!(total_length > minimum_progress_m)) {
+    failure_reason = "reference_path_too_short";
+    return false;
+  }
+  output.reference_waypoints = path.size();
+  output.reference_length = total_length;
+
+  auto point_at_distance = [&](double distance) -> Vec3 {
+    const double clamped = std::clamp(distance, 0.0, total_length);
+    const auto upper = std::upper_bound(distances.begin(), distances.end(), clamped);
+    if (upper == distances.begin()) return path.front();
+    if (upper == distances.end()) return path.back();
+    const size_t index = static_cast<size_t>(upper - distances.begin());
+    const double edge_length = distances[index] - distances[index - 1];
+    const double fraction = edge_length > 1e-12
+                                ? (clamped - distances[index - 1]) / edge_length
+                                : 0.0;
+    return (path[index - 1] + fraction * (path[index] - path[index - 1])).eval();
+  };
+
+  struct Coverage {
+    double exit_distance{0.0};
+    double last_waypoint_distance{0.0};
+    bool reaches_end{false};
+  };
+  auto measure_coverage = [&](const Result& corridor, double seed_distance,
+                              Coverage& coverage) {
+    const Vec3 seed = point_at_distance(seed_distance);
+    if (!contains(corridor.A, corridor.b, seed)) return false;
+    coverage.exit_distance = seed_distance;
+    coverage.last_waypoint_distance = seed_distance;
+    coverage.reaches_end = false;
+    Vec3 segment_start = seed;
+    double segment_start_distance = seed_distance;
+    size_t target_index = static_cast<size_t>(
+        std::upper_bound(distances.begin(), distances.end(), seed_distance + 1e-10) -
+        distances.begin());
+    for (; target_index < path.size(); ++target_index) {
+      const Vec3& target = path[target_index];
+      const double target_distance = distances[target_index];
+      if (contains(corridor.A, corridor.b, target)) {
+        segment_start = target;
+        segment_start_distance = target_distance;
+        coverage.last_waypoint_distance = target_distance;
+        coverage.exit_distance = target_distance;
+        continue;
+      }
+      double exit_parameter = 0.0;
+      if (!segmentExitParameter(corridor, segment_start, target, exit_parameter)) return false;
+      coverage.exit_distance =
+          segment_start_distance + exit_parameter * (target_distance - segment_start_distance);
+      return true;
+    }
+    coverage.exit_distance = total_length;
+    coverage.reaches_end = true;
+    return true;
+  };
+
+  auto generate_corridor = [&](size_t corridor_index, size_t candidate_index,
+                               size_t attempt, double seed_distance, Result& result,
+                               std::string& reason) {
+    std::seed_seq sequence{random_seed, static_cast<uint32_t>(corridor_index),
+                           static_cast<uint32_t>(candidate_index),
+                           static_cast<uint32_t>(attempt), 0x706f696eU};
+    std::mt19937 rng(sequence);
+    const auto begin = std::chrono::steady_clock::now();
+    const bool ok = pointSeed(obstacles, point_at_distance(seed_distance), A_bound, b_bound,
+                              alpha, rng, result, reason, obstacle_support_radius_m);
+    output.risp_generation_ms +=
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin)
+            .count();
+    return ok;
+  };
+
+  double previous_exit_distance = 0.0;
+  double previous_seed_distance = -minimum_progress_m;
+  Result previous_corridor;
+  bool have_previous_corridor = false;
+  std::vector<double> candidates{0.0};
+
+  while (!candidates.empty()) {
+    if (output.corridors.size() >= max_corridors) {
+      output.horizon_exceeded = true;
+      output.covered_length = previous_exit_distance;
+      failure_reason = "max_corridors_exceeded";
+      return false;
+    }
+
+    bool accepted = false;
+    Result accepted_corridor;
+    Coverage accepted_coverage;
+    double accepted_seed_distance = 0.0;
+    double accepted_overlap = std::numeric_limits<double>::infinity();
+    std::string last_reason = "point_generation_failed";
+    const size_t corridor_index = output.corridors.size();
+    for (size_t candidate_index = 0; candidate_index < candidates.size() && !accepted;
+         ++candidate_index) {
+      const double candidate_distance = candidates[candidate_index];
+      if (candidate_index > 0) ++output.point_waypoint_retry_count;
+      if (candidate_distance <= previous_seed_distance + 1e-8) {
+        ++output.point_no_progress_count;
+        last_reason = "nonmonotonic_seed";
+        continue;
+      }
+      const Vec3 candidate = point_at_distance(candidate_distance);
+      const double previous_margin =
+          have_previous_corridor
+              ? normalizedMinimumSlack(previous_corridor.A, previous_corridor.b, candidate)
+              : std::numeric_limits<double>::infinity();
+      if (have_previous_corridor && previous_margin < minimum_overlap_margin_m) {
+        last_reason = "degenerate_overlap";
+        continue;
+      }
+
+      for (size_t attempt = 0; attempt <= max_retries && !accepted; ++attempt) {
+        if (attempt > 0) ++output.point_retry_count;
+        Result generated;
+        std::string reason;
+        if (!generate_corridor(corridor_index, candidate_index, attempt,
+                               candidate_distance, generated, reason)) {
+          last_reason = reason;
+          continue;
+        }
+        const double new_margin = normalizedMinimumSlack(generated.A, generated.b, candidate);
+        const double overlap_margin = std::min(previous_margin, new_margin);
+        if (have_previous_corridor && overlap_margin < minimum_overlap_margin_m) {
+          last_reason = "degenerate_overlap";
+          continue;
+        }
+        Coverage coverage;
+        if (!measure_coverage(generated, candidate_distance, coverage)) {
+          last_reason = "exit_not_found";
+          continue;
+        }
+        const double new_progress = coverage.exit_distance - previous_exit_distance;
+        if (!coverage.reaches_end && new_progress < minimum_progress_m) {
+          ++output.point_no_progress_count;
+          last_reason = "no_forward_progress";
+          continue;
+        }
+        accepted = true;
+        accepted_corridor = std::move(generated);
+        accepted_coverage = coverage;
+        accepted_seed_distance = candidate_distance;
+        accepted_overlap = overlap_margin;
+      }
+    }
+
+    if (!accepted) {
+      output.covered_length = previous_exit_distance;
+      failure_reason = "corridor_" + std::to_string(corridor_index) + "_" + last_reason;
+      return false;
+    }
+
+    if (have_previous_corridor) {
+      output.waypoints.push_back(point_at_distance(accepted_seed_distance));
+      output.waypoint_distances.push_back(accepted_seed_distance);
+      output.min_overlap_margin = std::min(output.min_overlap_margin, accepted_overlap);
+    } else {
+      output.waypoints.push_back(path.front());
+      output.waypoint_distances.push_back(0.0);
+    }
+    output.seed_segments.emplace_back(point_at_distance(accepted_seed_distance),
+                                      point_at_distance(accepted_seed_distance));
+    output.unreduced_retry_count += accepted_corridor.used_unreduced_retry ? 1U : 0U;
+    output.corridor_progress_lengths.push_back(
+        std::max(0.0, accepted_coverage.exit_distance - previous_exit_distance));
+    output.corridors.push_back(accepted_corridor);
+    previous_corridor = std::move(accepted_corridor);
+    have_previous_corridor = true;
+    previous_seed_distance = accepted_seed_distance;
+    previous_exit_distance = accepted_coverage.exit_distance;
+    output.covered_length = previous_exit_distance;
+
+    if (accepted_coverage.reaches_end ||
+        previous_exit_distance >= total_length - 1e-8) {
+      output.waypoints.push_back(path.back());
+      output.waypoint_distances.push_back(total_length);
+      output.covered_length = total_length;
+      output.full_coverage = output.waypoints.size() == output.corridors.size() + 1;
+      if (output.corridors.size() == 1)
+        output.min_overlap_margin = std::numeric_limits<double>::infinity();
+      if (!output.full_coverage) {
+        failure_reason = "corridor_waypoint_count_mismatch";
+        return false;
+      }
+      return true;
+    }
+
+    const double primary = std::max(previous_seed_distance + 1e-8,
+                                    previous_exit_distance - overlap_backtrack_m);
+    candidates.clear();
+    if (primary < previous_exit_distance - 1e-8) candidates.push_back(primary);
+    const double waypoint = accepted_coverage.last_waypoint_distance;
+    if (waypoint > previous_seed_distance + 1e-8 &&
+        waypoint < previous_exit_distance - 1e-8 &&
+        (candidates.empty() || std::abs(waypoint - candidates.front()) > 1e-8)) {
+      candidates.push_back(waypoint);
+    }
+    if (candidates.empty()) {
+      ++output.point_no_progress_count;
+      failure_reason = "corridor_" + std::to_string(corridor_index) +
+                       "_no_overlap_seed_candidate";
+      return false;
+    }
+  }
+
+  failure_reason = "point_pathcover_internal_error";
+  return false;
+}
+
+// Reuse one line-seeded RISP corridor for as many consecutive original HGP
+// segments as it contains. The optimizer path remains exactly the HGP path.
+// If the last absorbed segment ends too close to the current corridor boundary,
+// reserve that segment as the next seed instead of inserting a seam waypoint.
+template <typename PathContainer>
+inline bool pathCoverLineReuse(const std::vector<Vec3>& obstacles,
+                               const PathContainer& reference_path,
+                               const MatX3& A_bound, const Eigen::VectorXd& b_bound,
+                               double alpha, uint32_t random_seed, size_t max_corridors,
+                               double minimum_overlap_margin_m,
+                               PathCoverReuseResult& output, std::string& failure_reason,
+                               double obstacle_support_radius_m = 0.0) {
+  output = PathCoverReuseResult{};
+  failure_reason.clear();
+  if (max_corridors == 0) {
+    failure_reason = "invalid_max_corridors";
+    return false;
+  }
+  if (!(minimum_overlap_margin_m >= 0.0) ||
+      !std::isfinite(minimum_overlap_margin_m)) {
+    failure_reason = "invalid_overlap_margin";
+    return false;
+  }
+
+  std::vector<Vec3> path;
+  path.reserve(reference_path.size());
+  for (const auto& point_raw : reference_path) {
+    const Vec3 point = point_raw.template cast<double>();
+    if (!point.allFinite()) {
+      failure_reason = "nonfinite_reference_path";
+      return false;
+    }
+    if (!path.empty() && (point - path.back()).norm() <= 1e-8) {
+      failure_reason = "degenerate_reference_segment";
+      return false;
+    }
+    path.push_back(point);
+  }
+  if (path.size() < 2) {
+    failure_reason = "path_too_short";
+    return false;
+  }
+  output.reference_waypoints = path.size();
+  output.reference_length = polylineLength(path);
+  const size_t segment_count = path.size() - 1;
+  output.segment_corridor_indices.reserve(segment_count);
+
+  auto generate_corridor = [&](size_t corridor_index, size_t seed_segment,
+                               Result& result, std::string& reason) {
+    std::seed_seq sequence{random_seed, static_cast<uint32_t>(corridor_index),
+                           static_cast<uint32_t>(seed_segment), 0x72657573U};
+    std::mt19937 rng(sequence);
+    const auto begin = std::chrono::steady_clock::now();
+    const bool ok = lineSeed(obstacles, path[seed_segment], path[seed_segment + 1],
+                             A_bound, b_bound, alpha, rng, result, reason,
+                             obstacle_support_radius_m);
+    output.risp_generation_ms +=
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin)
+            .count();
+    return ok;
+  };
+
+  size_t first_unassigned = 0;
+  while (first_unassigned < segment_count) {
+    if (output.corridors.size() >= max_corridors) {
+      output.horizon_exceeded = true;
+      failure_reason = "max_corridors_exceeded";
+      return false;
+    }
+
+    const size_t seed_segment = first_unassigned;
+    const size_t corridor_index = output.corridors.size();
+    Result corridor;
+    std::string reason;
+    if (!generate_corridor(corridor_index, seed_segment, corridor, reason)) {
+      failure_reason = "corridor_" + std::to_string(corridor_index) + "_" + reason;
+      return false;
+    }
+    if (!contains(corridor.A, corridor.b, path[seed_segment]) ||
+        !contains(corridor.A, corridor.b, path[seed_segment + 1])) {
+      failure_reason = "corridor_" + std::to_string(corridor_index) +
+                       "_seed_segment_outside";
+      return false;
+    }
+
+    if (!output.corridors.empty()) {
+      const Vec3& transition = path[first_unassigned];
+      const Result& previous = output.corridors.back();
+      const double transition_margin =
+          std::min(normalizedMinimumSlack(previous.A, previous.b, transition),
+                   normalizedMinimumSlack(corridor.A, corridor.b, transition));
+      output.min_transition_margin =
+          std::min(output.min_transition_margin, transition_margin);
+      if (transition_margin < minimum_overlap_margin_m)
+        ++output.weak_overlap_transition_count;
+    }
+
+    size_t last_contained = seed_segment;
+    while (last_contained + 1 < segment_count &&
+           contains(corridor.A, corridor.b, path[last_contained + 1]) &&
+           contains(corridor.A, corridor.b, path[last_contained + 2])) {
+      ++last_contained;
+    }
+
+    size_t last_assigned = last_contained;
+    if (last_contained + 1 < segment_count) {
+      const double outgoing_margin =
+          normalizedMinimumSlack(corridor.A, corridor.b, path[last_contained + 1]);
+      if (outgoing_margin < minimum_overlap_margin_m) {
+        ++output.low_overlap_transition_count;
+        if (last_contained > seed_segment) {
+          // Keep the final absorbed segment unassigned. It becomes the next
+          // line seed, so the two corridors overlap along that entire segment.
+          --last_assigned;
+          ++output.overlap_rollback_count;
+        }
+      }
+    }
+
+    const size_t assigned_count = last_assigned - seed_segment + 1;
+    output.corridors.push_back(std::move(corridor));
+    output.seed_segments.emplace_back(path[seed_segment], path[seed_segment + 1]);
+    output.segments_per_corridor.push_back(assigned_count);
+    output.unreduced_retry_count +=
+        output.corridors.back().used_unreduced_retry ? 1U : 0U;
+    output.reused_segment_count += assigned_count > 1 ? assigned_count - 1 : 0;
+    for (size_t segment = seed_segment; segment <= last_assigned; ++segment)
+      output.segment_corridor_indices.push_back(corridor_index);
+    first_unassigned = last_assigned + 1;
+  }
+
+  output.full_coverage =
+      output.segment_corridor_indices.size() == segment_count &&
+      output.corridors.size() == output.segments_per_corridor.size();
+  if (!output.full_coverage) {
+    failure_reason = "segment_corridor_mapping_mismatch";
+    return false;
+  }
+  if (output.corridors.size() == 1)
+    output.min_transition_margin = std::numeric_limits<double>::infinity();
   return true;
 }
 

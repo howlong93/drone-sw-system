@@ -8,6 +8,7 @@
 
 #include "hgp/hgp_manager.hpp"
 
+#include <algorithm>
 #include <mutex>
 
 /// The type of map data Tmap is defined as a 1D array
@@ -524,6 +525,22 @@ void HGPManager::getPlanningObstacleCloud(const vec_Vecf<3>& path,
   obstacles = include_unknown
                   ? map->getOccupiedCloudWithUnknownAsOccupied(path, local_box_size_f)
                   : map->getOccupiedCloud(path, local_box_size_f);
+}
+
+bool HGPManager::planningObstacleCloudContainsVoxel(const vec_Vec3f& obstacles,
+                                                    const Vec3f& query,
+                                                    Vec3f* matched_obstacle) {
+  std::lock_guard<std::mutex> lock(mtx_map_util_);
+  const auto& map = map_util_for_planning_ ? map_util_for_planning_ : map_util_;
+  if (!map) return false;
+  const Veci<3> query_index = map->floatToInt(query);
+  for (const Vec3f& obstacle : obstacles) {
+    if ((map->floatToInt(obstacle).array() == query_index.array()).all()) {
+      if (matched_obstacle != nullptr) *matched_obstacle = obstacle;
+      return true;
+    }
+  }
+  return false;
 }
 
 void HGPManager::updateVecOccupied(const vec_Vec3f& vec_o) {

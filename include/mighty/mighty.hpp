@@ -125,6 +125,16 @@ struct ReplanBenchmarkData {
   double sc_pathcover_coverage_ratio = 0.0;
   double sc_pathcover_min_overlap_margin = std::numeric_limits<double>::infinity();
   size_t sc_unreduced_retry_count = 0;
+  size_t sc_pathcover_point_retry_count = 0;
+  size_t sc_pathcover_point_no_progress_count = 0;
+  size_t sc_pathcover_point_waypoint_retry_count = 0;
+  double sc_pathcover_progress_mean = 0.0;
+  double sc_pathcover_progress_min = 0.0;
+  size_t sc_pathcover_reused_segment_count = 0;
+  size_t sc_pathcover_low_overlap_transition_count = 0;
+  size_t sc_pathcover_overlap_rollback_count = 0;
+  size_t sc_pathcover_weak_overlap_transition_count = 0;
+  double sc_pathcover_min_transition_margin = std::numeric_limits<double>::infinity();
   bool sc_pathcover_full_coverage = false;
   bool sc_pathcover_horizon_exceeded = false;
   size_t sc_primary_obstacle_count = 0;
@@ -164,6 +174,19 @@ struct ReplanBenchmarkData {
   int first_unsafe_segment = -1;
   double first_unsafe_corridor_max_plane = std::numeric_limits<double>::quiet_NaN();
   double first_unsafe_distance_from_start = std::numeric_limits<double>::quiet_NaN();
+  bool debug_testing_enabled = false;
+  std::string debug_corridor_classification;
+  bool debug_generation_snapshot_match = false;
+  bool debug_current_snapshot_match = false;
+  bool debug_local_obstacle_match = false;
+  bool debug_local_bounds_contain_unsafe = false;
+  bool debug_mapping_valid = false;
+  int debug_assigned_corridor = -1;
+  bool debug_unsafe_inside_assigned_corridor = false;
+  bool debug_generation_obstacle_inside_assigned_corridor = false;
+  bool debug_unsafe_inside_any_corridor = false;
+  double debug_nearest_generation_obstacle_m = std::numeric_limits<double>::infinity();
+  double debug_nearest_current_obstacle_m = std::numeric_limits<double>::infinity();
   uint64_t consecutive_safety_rejections = 0;
   bool committed_plan_safety_checked = false;
   bool committed_plan_unsafe = false;
@@ -453,7 +476,8 @@ class MIGHTY {
                                double& initial_guess_computation_time,
                                double& local_traj_computation_time,
                                std::shared_ptr<lbfgs::SolverLBFGS>& whole_traj_solver_ptr,
-                               const vec_Vec3f* anchor_reference_path = nullptr);
+                               const vec_Vec3f* anchor_reference_path = nullptr,
+                               double static_weight_override = -1.0);
 
   /** @brief Reset all internal timing and cost data to zero. */
   void resetData();
@@ -484,6 +508,9 @@ class MIGHTY {
 
   /** Enable expensive per-replan audit metrics. Mission/path logging does not require this. */
   void setDetailedBenchmarkEnabled(bool enabled) { detailed_benchmark_enabled_ = enabled; }
+
+  /** Enable targeted PathCover/corridor diagnostics for controlled debug runs only. */
+  void setDebugTestingEnabled(bool enabled) { debug_testing_enabled_ = enabled; }
   void setSafetyGateEnabled(bool enabled) { safety_gate_enabled_ = enabled; }
 
   /** Distance to the nearest occupied voxel center; infinity if no occupied points exist. */
@@ -672,6 +699,15 @@ class MIGHTY {
   ReplanBenchmarkData benchmark_data_;
   vec_Vec3f benchmark_obstacle_snapshot_;
   bool detailed_benchmark_enabled_ = false;
+  bool debug_testing_enabled_ = false;
+  vec_Vec3f debug_corridor_generation_obstacles_;
+  vec_Vec3f debug_corridor_local_obstacles_;
+  vec_Vecf<3> debug_corridor_reference_path_;
+  Eigen::Vector3d debug_corridor_lower_{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d debug_corridor_upper_{Eigen::Vector3d::Zero()};
+  bool debug_corridor_bounds_valid_ = false;
+  std::vector<LinearConstraint3D> debug_geometric_corridors_;
+  std::vector<size_t> debug_segment_corridor_indices_;
   bool safety_gate_enabled_ = true;
   vec_E<Polyhedron<3>> poly_out_whole_;
   vec_E<Polyhedron<3>> poly_out_safe_;

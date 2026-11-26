@@ -258,6 +258,7 @@ MIGHTY_NODE::MIGHTY_NODE() : Node("mighty_node") {
   mighty_ptr_ = std::make_shared<MIGHTY>(par_);
   mighty_ptr_->setDetailedBenchmarkEnabled(use_benchmark_ && benchmark_replan_details_);
   mighty_ptr_->setSafetyGateEnabled(enable_safety_gate_);
+  mighty_ptr_->setDebugTestingEnabled(debug_testing_);
 
   // Initialize the tf2 buffer and listener
   tf2_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
@@ -531,6 +532,7 @@ void MIGHTY_NODE::declareParameters() {
   this->declare_parameter("use_benchmark", false);
   this->declare_parameter("benchmark_replan_details", false);
   this->declare_parameter("enable_safety_gate", true);
+  this->declare_parameter("debug_testing", false);
   this->declare_parameter("safety_recovery_rejection_threshold", 15);
   this->declare_parameter("safety_recovery_buffer_threshold_s", 1.0);
   this->declare_parameter("safety_recovery_goal_offset_m", 1.0);
@@ -593,6 +595,8 @@ void MIGHTY_NODE::declareParameters() {
   this->declare_parameter("pathcover_max_corridors", 12);
   this->declare_parameter("pathcover_overlap_distance", 0.25);
   this->declare_parameter("pathcover_min_overlap_margin", 0.001);
+  this->declare_parameter("pathcover_min_progress", 0.05);
+  this->declare_parameter("pathcover_point_max_retries", 3);
 
   // Map parameters
   this->declare_parameter("map_buffer", 6.0);
@@ -679,6 +683,11 @@ void MIGHTY_NODE::declareParameters() {
   this->declare_parameter("num_dyn_obst_samples", 10);
   this->declare_parameter("planner_Co", 0.5);
   this->declare_parameter("planner_Cw", 1.0);
+  this->declare_parameter("corridor_three_tier_optimization", true);
+  this->declare_parameter("corridor_hard_weight_scale", 100.0);
+  this->declare_parameter("corridor_bounded_weight_scale", 10.0);
+  this->declare_parameter("corridor_hard_tolerance", 1e-5);
+  this->declare_parameter("corridor_bounded_violation", 0.02);
   this->declare_parameter("verbose_computation_time", false);
   this->declare_parameter("drone_bbox", std::vector<double>{0.5, 0.5, 0.5});
   this->declare_parameter("goal_radius", 0.5);
@@ -901,6 +910,7 @@ void MIGHTY_NODE::setParameters() {
   use_benchmark_ = this->get_parameter("use_benchmark").as_bool();
   benchmark_replan_details_ = this->get_parameter("benchmark_replan_details").as_bool();
   enable_safety_gate_ = this->get_parameter("enable_safety_gate").as_bool();
+  debug_testing_ = this->get_parameter("debug_testing").as_bool();
   par_.safety_recovery_rejection_threshold =
       this->get_parameter("safety_recovery_rejection_threshold").as_int();
   par_.safety_recovery_buffer_threshold_s =
@@ -978,8 +988,13 @@ void MIGHTY_NODE::setParameters() {
       this->get_parameter("pathcover_overlap_distance").as_double();
   par_.pathcover_min_overlap_margin =
       this->get_parameter("pathcover_min_overlap_margin").as_double();
+  par_.pathcover_min_progress = this->get_parameter("pathcover_min_progress").as_double();
+  par_.pathcover_point_max_retries =
+      this->get_parameter("pathcover_point_max_retries").as_int();
   if (par_.sc_method != "ellipsoid" && par_.sc_method != "risp_point" &&
-      par_.sc_method != "risp_line" && par_.sc_method != "pathcover_line") {
+      par_.sc_method != "risp_line" && par_.sc_method != "pathcover_line" &&
+      par_.sc_method != "pathcover_point" &&
+      par_.sc_method != "pathcover_line_reuse") {
     RCLCPP_WARN(this->get_logger(),
                 "Unknown sc_method '%s'; falling back to the MIGHTY ellipsoid baseline",
                 par_.sc_method.c_str());
@@ -1009,6 +1024,17 @@ void MIGHTY_NODE::setParameters() {
     RCLCPP_WARN(this->get_logger(),
                 "pathcover_min_overlap_margin must be finite and non-negative; using 0.001");
     par_.pathcover_min_overlap_margin = 0.001;
+  }
+  if (!(par_.pathcover_min_progress > 0.0) ||
+      !std::isfinite(par_.pathcover_min_progress)) {
+    RCLCPP_WARN(this->get_logger(),
+                "pathcover_min_progress must be finite and positive; using 0.05");
+    par_.pathcover_min_progress = 0.05;
+  }
+  if (par_.pathcover_point_max_retries < 0) {
+    RCLCPP_WARN(this->get_logger(),
+                "pathcover_point_max_retries must be non-negative; using 3");
+    par_.pathcover_point_max_retries = 3;
   }
 
   // Map parameters
@@ -1097,6 +1123,26 @@ void MIGHTY_NODE::setParameters() {
   par_.num_dyn_obst_samples = this->get_parameter("num_dyn_obst_samples").as_int();
   par_.planner_Co = this->get_parameter("planner_Co").as_double();
   par_.planner_Cw = this->get_parameter("planner_Cw").as_double();
+  par_.corridor_three_tier_optimization =
+      this->get_parameter("corridor_three_tier_optimization").as_bool();
+  par_.corridor_hard_weight_scale =
+      this->get_parameter("corridor_hard_weight_scale").as_double();
+  par_.corridor_bounded_weight_scale =
+      this->get_parameter("corridor_bounded_weight_scale").as_double();
+  par_.corridor_hard_tolerance =
+      this->get_parameter("corridor_hard_tolerance").as_double();
+  par_.corridor_bounded_violation =
+      this->get_parameter("corridor_bounded_violation").as_double();
+  if (!(par_.corridor_hard_weight_scale >= par_.corridor_bounded_weight_scale &&
+        par_.corridor_bounded_weight_scale >= 1.0 &&
+        par_.corridor_hard_tolerance >= 0.0 &&
+        par_.corridor_bounded_violation >= par_.corridor_hard_tolerance)) {
+    RCLCPP_WARN(this->get_logger(), "Invalid corridor tier settings; restoring defaults");
+    par_.corridor_hard_weight_scale = 100.0;
+    par_.corridor_bounded_weight_scale = 10.0;
+    par_.corridor_hard_tolerance = 1e-5;
+    par_.corridor_bounded_violation = 0.02;
+  }
   verbose_computation_time_ = this->get_parameter("verbose_computation_time").as_bool();
   par_.drone_bbox = this->get_parameter("drone_bbox").as_double_array();
   par_.drone_radius = par_.drone_bbox[0] / 2.0;
@@ -1362,6 +1408,10 @@ void MIGHTY_NODE::printParameters() {
               par_.pathcover_overlap_distance);
   RCLCPP_INFO(this->get_logger(), "PathCover Minimum Overlap Margin: %.4f m",
               par_.pathcover_min_overlap_margin);
+  RCLCPP_INFO(this->get_logger(), "PathCover Minimum Point Progress: %.3f m",
+              par_.pathcover_min_progress);
+  RCLCPP_INFO(this->get_logger(), "PathCover Point Maximum Retries: %d",
+              par_.pathcover_point_max_retries);
   if (par_.sc_method != "ellipsoid" && par_.inflation_hgp < par_.drone_radius) {
     RCLCPP_WARN(this->get_logger(),
                 "RISP uses the inflated planning map without adding drone_radius: "
@@ -1428,6 +1478,11 @@ void MIGHTY_NODE::printParameters() {
   RCLCPP_INFO(this->get_logger(), "Num Dynamic Obstacles Samples: %d", par_.num_dyn_obst_samples);
   RCLCPP_INFO(this->get_logger(), "Local Traj Co: %f", par_.planner_Co);
   RCLCPP_INFO(this->get_logger(), "Local Traj Cw: %f", par_.planner_Cw);
+  RCLCPP_INFO(this->get_logger(),
+              "Corridor three-tier optimization: %d (hard x%.1f <= %.6f m, bounded x%.1f <= %.3f m)",
+              par_.corridor_three_tier_optimization, par_.corridor_hard_weight_scale,
+              par_.corridor_hard_tolerance, par_.corridor_bounded_weight_scale,
+              par_.corridor_bounded_violation);
   RCLCPP_INFO(this->get_logger(), "Verbose Computation Time: %d", verbose_computation_time_);
   RCLCPP_INFO(this->get_logger(), "Drone Bbox: (%f, %f, %f)", par_.drone_bbox[0],
               par_.drone_bbox[1], par_.drone_bbox[2]);
@@ -1803,6 +1858,23 @@ void MIGHTY_NODE::replanCallback() {
     event.sc_pathcover_coverage_ratio = benchmark_sample.sc_pathcover_coverage_ratio;
     event.sc_pathcover_min_overlap_margin = benchmark_sample.sc_pathcover_min_overlap_margin;
     event.sc_unreduced_retry_count = benchmark_sample.sc_unreduced_retry_count;
+    event.sc_pathcover_point_retry_count = benchmark_sample.sc_pathcover_point_retry_count;
+    event.sc_pathcover_point_no_progress_count =
+        benchmark_sample.sc_pathcover_point_no_progress_count;
+    event.sc_pathcover_point_waypoint_retry_count =
+        benchmark_sample.sc_pathcover_point_waypoint_retry_count;
+    event.sc_pathcover_progress_mean = benchmark_sample.sc_pathcover_progress_mean;
+    event.sc_pathcover_progress_min = benchmark_sample.sc_pathcover_progress_min;
+    event.sc_pathcover_reused_segment_count =
+        benchmark_sample.sc_pathcover_reused_segment_count;
+    event.sc_pathcover_low_overlap_transition_count =
+        benchmark_sample.sc_pathcover_low_overlap_transition_count;
+    event.sc_pathcover_overlap_rollback_count =
+        benchmark_sample.sc_pathcover_overlap_rollback_count;
+    event.sc_pathcover_weak_overlap_transition_count =
+        benchmark_sample.sc_pathcover_weak_overlap_transition_count;
+    event.sc_pathcover_min_transition_margin =
+        benchmark_sample.sc_pathcover_min_transition_margin;
     event.sc_pathcover_full_coverage = benchmark_sample.sc_pathcover_full_coverage;
     event.sc_pathcover_horizon_exceeded = benchmark_sample.sc_pathcover_horizon_exceeded;
     event.sc_primary_obstacles = benchmark_sample.sc_primary_obstacle_count;
@@ -1838,6 +1910,26 @@ void MIGHTY_NODE::replanCallback() {
         benchmark_sample.first_unsafe_corridor_max_plane;
     event.first_unsafe_distance_from_start =
         benchmark_sample.first_unsafe_distance_from_start;
+    event.debug_testing_enabled = benchmark_sample.debug_testing_enabled;
+    event.debug_corridor_classification = benchmark_sample.debug_corridor_classification;
+    event.debug_generation_snapshot_match =
+        benchmark_sample.debug_generation_snapshot_match;
+    event.debug_current_snapshot_match = benchmark_sample.debug_current_snapshot_match;
+    event.debug_local_obstacle_match = benchmark_sample.debug_local_obstacle_match;
+    event.debug_local_bounds_contain_unsafe =
+        benchmark_sample.debug_local_bounds_contain_unsafe;
+    event.debug_mapping_valid = benchmark_sample.debug_mapping_valid;
+    event.debug_assigned_corridor = benchmark_sample.debug_assigned_corridor;
+    event.debug_unsafe_inside_assigned_corridor =
+        benchmark_sample.debug_unsafe_inside_assigned_corridor;
+    event.debug_generation_obstacle_inside_assigned_corridor =
+        benchmark_sample.debug_generation_obstacle_inside_assigned_corridor;
+    event.debug_unsafe_inside_any_corridor =
+        benchmark_sample.debug_unsafe_inside_any_corridor;
+    event.debug_nearest_generation_obstacle_m =
+        benchmark_sample.debug_nearest_generation_obstacle_m;
+    event.debug_nearest_current_obstacle_m =
+        benchmark_sample.debug_nearest_current_obstacle_m;
     event.safety_rejection_buffer_points = benchmark_sample.plan_points_start;
     event.consecutive_safety_rejections =
         benchmark_sample.consecutive_safety_rejections;
@@ -2860,7 +2952,13 @@ void MIGHTY_NODE::logData(bool final) {
          "sc_pathcover_segmentation_ms,"
          "sc_pathcover_reference_length_m,sc_pathcover_covered_length_m,"
          "sc_pathcover_coverage_ratio,sc_pathcover_min_overlap_margin_m,"
-         "sc_unreduced_retry_count,sc_pathcover_full_coverage,"
+         "sc_unreduced_retry_count,sc_pathcover_point_retry_count,"
+         "sc_pathcover_point_no_progress_count,sc_pathcover_point_waypoint_retry_count,"
+         "sc_pathcover_progress_mean_m,sc_pathcover_progress_min_m,"
+         "sc_pathcover_reused_segment_count,sc_pathcover_low_overlap_transition_count,"
+         "sc_pathcover_overlap_rollback_count,sc_pathcover_weak_overlap_transition_count,"
+         "sc_pathcover_min_transition_margin_m,"
+         "sc_pathcover_full_coverage,"
          "sc_pathcover_horizon_exceeded,sc_primary_obstacles,sc_secondary_obstacles,"
          "sc_primary_hyperplanes,"
          "sc_secondary_hyperplanes,sc_obstacle_violations,sc_max_obstacle_penetration_m,"
@@ -2916,6 +3014,15 @@ void MIGHTY_NODE::logData(bool final) {
              << s.sc_pathcover_segmentation_ms << ',' << s.sc_pathcover_reference_length << ','
              << s.sc_pathcover_covered_length << ',' << s.sc_pathcover_coverage_ratio << ','
              << s.sc_pathcover_min_overlap_margin << ',' << s.sc_unreduced_retry_count << ','
+             << s.sc_pathcover_point_retry_count << ','
+             << s.sc_pathcover_point_no_progress_count << ','
+             << s.sc_pathcover_point_waypoint_retry_count << ','
+             << s.sc_pathcover_progress_mean << ',' << s.sc_pathcover_progress_min << ','
+             << s.sc_pathcover_reused_segment_count << ','
+             << s.sc_pathcover_low_overlap_transition_count << ','
+             << s.sc_pathcover_overlap_rollback_count << ','
+             << s.sc_pathcover_weak_overlap_transition_count << ','
+             << s.sc_pathcover_min_transition_margin << ','
              << s.sc_pathcover_full_coverage << ',' << s.sc_pathcover_horizon_exceeded << ','
              << s.sc_primary_obstacle_count << ','
              << s.sc_secondary_obstacle_count << ',' << s.sc_primary_hyperplanes << ','
@@ -3311,7 +3418,13 @@ void MIGHTY_NODE::logData(bool final) {
            "sc_pathcover_segmentation_ms,"
            "sc_pathcover_reference_length_m,sc_pathcover_covered_length_m,"
            "sc_pathcover_coverage_ratio,sc_pathcover_min_overlap_margin_m,"
-           "sc_unreduced_retry_count,sc_pathcover_full_coverage,"
+           "sc_unreduced_retry_count,sc_pathcover_point_retry_count,"
+           "sc_pathcover_point_no_progress_count,sc_pathcover_point_waypoint_retry_count,"
+           "sc_pathcover_progress_mean_m,sc_pathcover_progress_min_m,"
+           "sc_pathcover_reused_segment_count,sc_pathcover_low_overlap_transition_count,"
+           "sc_pathcover_overlap_rollback_count,sc_pathcover_weak_overlap_transition_count,"
+           "sc_pathcover_min_transition_margin_m,"
+           "sc_pathcover_full_coverage,"
            "sc_pathcover_horizon_exceeded,sc_primary_obstacles,sc_secondary_obstacles,"
            "sc_primary_hyperplanes,sc_secondary_hyperplanes,sc_primary_failure_reason,"
            "sc_secondary_failure_reason,hgp_static_jps_ms,"
@@ -3366,6 +3479,16 @@ void MIGHTY_NODE::logData(bool final) {
                   << event.sc_pathcover_coverage_ratio << ','
                   << event.sc_pathcover_min_overlap_margin << ','
                   << event.sc_unreduced_retry_count << ','
+                  << event.sc_pathcover_point_retry_count << ','
+                  << event.sc_pathcover_point_no_progress_count << ','
+                  << event.sc_pathcover_point_waypoint_retry_count << ','
+                  << event.sc_pathcover_progress_mean << ','
+                  << event.sc_pathcover_progress_min << ','
+                  << event.sc_pathcover_reused_segment_count << ','
+                  << event.sc_pathcover_low_overlap_transition_count << ','
+                  << event.sc_pathcover_overlap_rollback_count << ','
+                  << event.sc_pathcover_weak_overlap_transition_count << ','
+                  << event.sc_pathcover_min_transition_margin << ','
                   << event.sc_pathcover_full_coverage << ','
                   << event.sc_pathcover_horizon_exceeded << ','
                   << event.sc_primary_obstacles << ','
@@ -3461,6 +3584,49 @@ void MIGHTY_NODE::logData(bool final) {
                                        : "reject_candidate_keep_safe_committed_plan")
                                 : "publish_candidate_gate_disabled")
                         << '\n';
+    }
+  }
+
+  // Targeted PathCover-reuse diagnosis. The file is created only for explicit
+  // DEBUG_TESTING runs; normal benchmark runs pay no diagnostic cost.
+  if (debug_testing_) {
+    std::string debug_path = file_path_;
+    const auto debug_extension = debug_path.rfind(".csv");
+    if (debug_extension != std::string::npos)
+      debug_path.replace(debug_extension, 4, "_corridor_debug.csv");
+    else
+      debug_path += "_corridor_debug.csv";
+    std::ofstream debug_file(debug_path, std::ios::trunc);
+    if (debug_file.is_open()) {
+      debug_file
+          << "event_index,replan_id,start_elapsed_s,reason,unsafe_x_m,unsafe_y_m,"
+             "unsafe_z_m,trajectory_segment,corridor_max_plane,classification,"
+             "generation_snapshot_match,current_snapshot_match,local_obstacle_match,"
+             "local_bounds_contain_unsafe,mapping_valid,assigned_corridor,"
+             "unsafe_inside_assigned_corridor,"
+             "generation_obstacle_inside_assigned_corridor,"
+             "unsafe_inside_any_corridor,nearest_generation_obstacle_m,"
+             "nearest_current_obstacle_m\n";
+      size_t debug_index = 0;
+      for (const auto& event : plan_buffer_events) {
+        if (!event.candidate_safety_unsafe_detected || !event.debug_testing_enabled) continue;
+        debug_file << ++debug_index << ',' << event.replan_id << ','
+                   << event.start_elapsed_s << ',' << event.candidate_safety_failure_reason
+                   << ',' << event.first_unsafe_x << ',' << event.first_unsafe_y << ','
+                   << event.first_unsafe_z << ',' << event.first_unsafe_segment << ','
+                   << event.first_unsafe_corridor_max_plane << ','
+                   << event.debug_corridor_classification << ','
+                   << event.debug_generation_snapshot_match << ','
+                   << event.debug_current_snapshot_match << ','
+                   << event.debug_local_obstacle_match << ','
+                   << event.debug_local_bounds_contain_unsafe << ','
+                   << event.debug_mapping_valid << ',' << event.debug_assigned_corridor << ','
+                   << event.debug_unsafe_inside_assigned_corridor << ','
+                   << event.debug_generation_obstacle_inside_assigned_corridor << ','
+                   << event.debug_unsafe_inside_any_corridor << ','
+                   << event.debug_nearest_generation_obstacle_m << ','
+                   << event.debug_nearest_current_obstacle_m << '\n';
+      }
     }
   }
 

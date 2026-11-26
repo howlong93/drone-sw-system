@@ -473,6 +473,16 @@ class MIGHTY_NODE : public rclcpp::Node {
     double sc_pathcover_coverage_ratio = 0.0;
     double sc_pathcover_min_overlap_margin = std::numeric_limits<double>::infinity();
     size_t sc_unreduced_retry_count = 0;
+    size_t sc_pathcover_point_retry_count = 0;
+    size_t sc_pathcover_point_no_progress_count = 0;
+    size_t sc_pathcover_point_waypoint_retry_count = 0;
+    double sc_pathcover_progress_mean = 0.0;
+    double sc_pathcover_progress_min = 0.0;
+    size_t sc_pathcover_reused_segment_count = 0;
+    size_t sc_pathcover_low_overlap_transition_count = 0;
+    size_t sc_pathcover_overlap_rollback_count = 0;
+    size_t sc_pathcover_weak_overlap_transition_count = 0;
+    double sc_pathcover_min_transition_margin = std::numeric_limits<double>::infinity();
     bool sc_pathcover_full_coverage = false;
     bool sc_pathcover_horizon_exceeded = false;
     size_t sc_primary_obstacles = 0;
@@ -500,6 +510,19 @@ class MIGHTY_NODE : public rclcpp::Node {
     int first_unsafe_segment = -1;
     double first_unsafe_corridor_max_plane = std::numeric_limits<double>::quiet_NaN();
     double first_unsafe_distance_from_start = std::numeric_limits<double>::quiet_NaN();
+    bool debug_testing_enabled = false;
+    std::string debug_corridor_classification;
+    bool debug_generation_snapshot_match = false;
+    bool debug_current_snapshot_match = false;
+    bool debug_local_obstacle_match = false;
+    bool debug_local_bounds_contain_unsafe = false;
+    bool debug_mapping_valid = false;
+    int debug_assigned_corridor = -1;
+    bool debug_unsafe_inside_assigned_corridor = false;
+    bool debug_generation_obstacle_inside_assigned_corridor = false;
+    bool debug_unsafe_inside_any_corridor = false;
+    double debug_nearest_generation_obstacle_m = std::numeric_limits<double>::infinity();
+    double debug_nearest_current_obstacle_m = std::numeric_limits<double>::infinity();
     size_t safety_rejection_buffer_points = 0;
     uint64_t consecutive_safety_rejections = 0;
     bool committed_plan_safety_checked = false;
@@ -648,6 +671,7 @@ class MIGHTY_NODE : public rclcpp::Node {
   bool use_benchmark_ = false;               // Use benchmark
   bool benchmark_replan_details_ = false;    // Expensive per-replan audit metrics
   bool enable_safety_gate_ = true;            // Reject unsafe candidate trajectories
+  bool debug_testing_ = false;                // Targeted corridor diagnostics for debug runs
   // Hover monitoring is sampled with the 10 Hz trajectory recorder.
   // It never writes from stateCallback.
 

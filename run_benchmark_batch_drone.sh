@@ -11,6 +11,7 @@ GAZEBO_GUI="${BATCH_GAZEBO_GUI:-0}"
 RECORD_STATISTICS="${BATCH_RECORD_STATISTICS:-1}"
 BENCHMARK_REPLAN_DETAILS="${BATCH_BENCHMARK_REPLAN_DETAILS:-0}"
 ENABLE_SAFETY_GATE="${BATCH_ENABLE_SAFETY_GATE:-1}"
+DEBUG_TESTING="${BATCH_DEBUG_TESTING:-0}"
 SC_METHOD="${BATCH_SC_METHOD:-pathcover_line}"
 RISP_ALPHA="${BATCH_RISP_ALPHA:-0.05}"
 SC_ELLIPSOID_FALLBACK="${BATCH_SC_ELLIPSOID_FALLBACK:-0}"
@@ -18,6 +19,8 @@ RISP_RANDOM_SEED="${BATCH_RISP_RANDOM_SEED:-1}"
 PATHCOVER_MAX_CORRIDORS="${BATCH_PATHCOVER_MAX_CORRIDORS:-12}"
 PATHCOVER_OVERLAP_DISTANCE="${BATCH_PATHCOVER_OVERLAP_DISTANCE:-0.25}"
 PATHCOVER_MIN_OVERLAP_MARGIN="${BATCH_PATHCOVER_MIN_OVERLAP_MARGIN:-0.001}"
+PATHCOVER_MIN_PROGRESS="${BATCH_PATHCOVER_MIN_PROGRESS:-0.05}"
+PATHCOVER_POINT_MAX_RETRIES="${BATCH_PATHCOVER_POINT_MAX_RETRIES:-3}"
 WORLD="${ENV:-hard_forest}"
 TIMEOUT_S="${TIMEOUT_S:-330}"
 FLIGHT_TIMEOUT_S="${FLIGHT_TIMEOUT_S:-270}"
@@ -34,13 +37,17 @@ STATISTICS_DIR="${STATISTICS_DIR:-${REPO_DIR}/statistics}"
 [[ "${RECORD_STATISTICS}" == "0" || "${RECORD_STATISTICS}" == "1" ]] || { echo "[ERROR] BATCH_RECORD_STATISTICS must be 0 or 1." >&2; exit 2; }
 [[ "${BENCHMARK_REPLAN_DETAILS}" == "0" || "${BENCHMARK_REPLAN_DETAILS}" == "1" ]] || { echo "[ERROR] BATCH_BENCHMARK_REPLAN_DETAILS must be 0 or 1." >&2; exit 2; }
 [[ "${ENABLE_SAFETY_GATE}" == "0" || "${ENABLE_SAFETY_GATE}" == "1" ]] || { echo "[ERROR] BATCH_ENABLE_SAFETY_GATE must be 0 or 1." >&2; exit 2; }
-[[ "${SC_METHOD}" == "ellipsoid" || "${SC_METHOD}" == "risp_point" || "${SC_METHOD}" == "risp_line" || "${SC_METHOD}" == "pathcover_line" ]] || { echo "[ERROR] BATCH_SC_METHOD is invalid." >&2; exit 2; }
+[[ "${DEBUG_TESTING}" == "0" || "${DEBUG_TESTING}" == "1" ]] || { echo "[ERROR] BATCH_DEBUG_TESTING must be 0 or 1." >&2; exit 2; }
+[[ "${DEBUG_TESTING}" == "0" || "${RECORD_STATISTICS}" == "1" ]] || { echo "[ERROR] BATCH_DEBUG_TESTING=1 requires statistics recording." >&2; exit 2; }
+[[ "${SC_METHOD}" == "ellipsoid" || "${SC_METHOD}" == "risp_point" || "${SC_METHOD}" == "risp_line" || "${SC_METHOD}" == "pathcover_line" || "${SC_METHOD}" == "pathcover_point" || "${SC_METHOD}" == "pathcover_line_reuse" ]] || { echo "[ERROR] BATCH_SC_METHOD is invalid." >&2; exit 2; }
 awk -v value="${RISP_ALPHA}" 'BEGIN { exit !(value > 0 && value < 1) }' || { echo "[ERROR] BATCH_RISP_ALPHA must be in (0, 1)." >&2; exit 2; }
 [[ "${SC_ELLIPSOID_FALLBACK}" == "0" || "${SC_ELLIPSOID_FALLBACK}" == "1" ]] || { echo "[ERROR] BATCH_SC_ELLIPSOID_FALLBACK must be 0 or 1." >&2; exit 2; }
 [[ "${RISP_RANDOM_SEED}" =~ ^[0-9]+$ ]] || { echo "[ERROR] BATCH_RISP_RANDOM_SEED must be non-negative." >&2; exit 2; }
 [[ "${PATHCOVER_MAX_CORRIDORS}" =~ ^([2-9]|[1-9][0-9]+)$ ]] || { echo "[ERROR] BATCH_PATHCOVER_MAX_CORRIDORS must be at least 2." >&2; exit 2; }
 awk -v value="${PATHCOVER_OVERLAP_DISTANCE}" 'BEGIN { exit !(value >= 0) }' || { echo "[ERROR] BATCH_PATHCOVER_OVERLAP_DISTANCE must be non-negative." >&2; exit 2; }
 awk -v value="${PATHCOVER_MIN_OVERLAP_MARGIN}" 'BEGIN { exit !(value >= 0) }' || { echo "[ERROR] BATCH_PATHCOVER_MIN_OVERLAP_MARGIN must be non-negative." >&2; exit 2; }
+awk -v value="${PATHCOVER_MIN_PROGRESS}" 'BEGIN { exit !(value > 0) }' || { echo "[ERROR] BATCH_PATHCOVER_MIN_PROGRESS must be positive." >&2; exit 2; }
+[[ "${PATHCOVER_POINT_MAX_RETRIES}" =~ ^[0-9]+$ ]] || { echo "[ERROR] BATCH_PATHCOVER_POINT_MAX_RETRIES must be non-negative." >&2; exit 2; }
 [[ "${TIMEOUT_S}" =~ ^[1-9][0-9]*([.][0-9]+)?$ ]] || { echo "[ERROR] TIMEOUT_S must be positive." >&2; exit 2; }
 [[ "${FLIGHT_TIMEOUT_S}" =~ ^[1-9][0-9]*([.][0-9]+)?$ ]] || { echo "[ERROR] FLIGHT_TIMEOUT_S must be positive." >&2; exit 2; }
 [[ "${AUTO_EXIT_DELAY}" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "[ERROR] AUTO_EXIT_DELAY must be non-negative for batch runs." >&2; exit 2; }
@@ -75,6 +82,7 @@ echo "  Gazebo GUI      : ${GAZEBO_GUI}"
 echo "  Statistics      : ${RECORD_STATISTICS}"
 echo "  Heavy details   : ${BENCHMARK_REPLAN_DETAILS}"
 echo "  Safety gate     : ${ENABLE_SAFETY_GATE}"
+echo "  Debug testing   : ${DEBUG_TESTING}"
 echo "  SC method       : ${SC_METHOD}"
 echo "  RISP alpha      : ${RISP_ALPHA}"
 echo "  SC fallback     : ${SC_ELLIPSOID_FALLBACK}"
@@ -82,6 +90,8 @@ echo "  RISP seed       : ${RISP_RANDOM_SEED}"
 echo "  PC max corridors: ${PATHCOVER_MAX_CORRIDORS}"
 echo "  PC overlap dist : ${PATHCOVER_OVERLAP_DISTANCE}"
 echo "  PC min margin   : ${PATHCOVER_MIN_OVERLAP_MARGIN}"
+echo "  PC min progress : ${PATHCOVER_MIN_PROGRESS}"
+echo "  PC point retries: ${PATHCOVER_POINT_MAX_RETRIES}"
 echo "  Folder name     : ${BATCH_ID}"
 echo "  World           : ${WORLD}"
 echo "  Timeout/run     : ${TIMEOUT_S} second(s)"
@@ -107,6 +117,7 @@ for ((index = 1; index <= COUNT; index++)); do
     "BENCHMARK=${RECORD_STATISTICS}"
     "BENCHMARK_REPLAN_DETAILS=${BENCHMARK_REPLAN_DETAILS}"
     "ENABLE_SAFETY_GATE=${ENABLE_SAFETY_GATE}"
+    "DEBUG_TESTING=${DEBUG_TESTING}"
     "SC_METHOD=${SC_METHOD}"
     "RISP_ALPHA=${RISP_ALPHA}"
     "SC_ELLIPSOID_FALLBACK=${SC_ELLIPSOID_FALLBACK}"
@@ -114,6 +125,8 @@ for ((index = 1; index <= COUNT; index++)); do
     "PATHCOVER_MAX_CORRIDORS=${PATHCOVER_MAX_CORRIDORS}"
     "PATHCOVER_OVERLAP_DISTANCE=${PATHCOVER_OVERLAP_DISTANCE}"
     "PATHCOVER_MIN_OVERLAP_MARGIN=${PATHCOVER_MIN_OVERLAP_MARGIN}"
+    "PATHCOVER_MIN_PROGRESS=${PATHCOVER_MIN_PROGRESS}"
+    "PATHCOVER_POINT_MAX_RETRIES=${PATHCOVER_POINT_MAX_RETRIES}"
     "BENCHMARK_RUN_ID=${run_id}"
     "BENCHMARK_RUN_DIR=${run_dir}"
     "CONTAINER_NAME=${container_name}"

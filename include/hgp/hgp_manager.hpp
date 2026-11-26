@@ -332,6 +332,14 @@ class HGPManager {
                                 const std::vector<double>& local_box_size,
                                 bool include_unknown, vec_Vec3f& obstacles);
 
+  /** Return true when an exported planning obstacle belongs to the exact same
+   * planning-map voxel as the query point.  Intended for debug diagnostics;
+   * unlike a Euclidean threshold this follows VoxelMapUtil::floatToInt.
+   */
+  bool planningObstacleCloudContainsVoxel(const vec_Vec3f& obstacles,
+                                          const Vec3f& query,
+                                          Vec3f* matched_obstacle = nullptr);
+
   /** @brief Update the internal occupied point vector (thread-safe).
    *  @param vec_o New occupied point vector.
    */

@@ -54,9 +54,9 @@ mighty_node:
         formation_neighbor_offsets: []                  # [m] flat 3*N: δ_ij for each neighbor in same order as ids
 
         # --- Vehicle Dynamic Limits ---
-        v_max: 2.0                                      # [m/s]   Max velocity
-        a_max: 5.0                                      # [m/s^2] Max acceleration
-        j_max: 10.0                                     # [m/s^3] Max jerk
+        v_max: 4.0                                      # [m/s]   Max velocity
+        a_max: 10.0                                     # [m/s^2] Max acceleration
+        j_max: 30.0                                     # [m/s^3] Max jerk
         w_max: 1.0                                      # [rad/s] Max yaw rate (~4.0 for hardware)
         drone_bbox: [0.5, 0.5, 0.5]                     # [m] Vehicle bounding box (include prop guards for hardware)
 
@@ -112,11 +112,11 @@ mighty_node:
         dyn_constr_jerk_weight: 1e+3                    # [-] Jerk constraint violation weight
         planner_Co: 0.1                                 # [m] Additional static-obstacle clearance in trajectory optimization
         planner_Cw: 1.3                                 # [m] Collision clearance for dynamic obstacles
-        corridor_three_tier_optimization: true          # hard acceptance, bounded relaxation, then original soft fallback
-        corridor_hard_weight_scale: 100.0               # multiplier on stat_weight for the hard-acceptance attempt
-        corridor_bounded_weight_scale: 10.0             # multiplier for bounded-relaxation attempt
-        corridor_hard_tolerance: 1.0e-5                 # [m] accepted corridor violation in hard tier
-        corridor_bounded_violation: 0.02                # [m] maximum accepted violation in bounded tier
+        corridor_three_tier_optimization: true          # compatibility switch: one primary solve, then fallback only if the first solve is invalid
+        corridor_hard_weight_scale: 30.0                # primary multiplier on stat_weight; finite valid output is accepted
+        corridor_bounded_weight_scale: 5.0              # fallback multiplier used only when the primary solve fails/is invalid
+        corridor_hard_tolerance: 1.0e-5                 # legacy compatibility parameter; no longer an acceptance threshold
+        corridor_bounded_violation: 0.02                # legacy compatibility parameter; no longer an acceptance threshold
 
         # --- Safety Corridors ---
         local_box_size: [3.0, 3.0, 3.0]                 # [m] Local planning window (smaller = faster, larger = smoother)
@@ -208,6 +208,8 @@ mighty_node:
         sfc_use_unknown_as_obstacle: false              # [-] Treat unknown cells as obstacles in SFC generation
         sc_method: "ellipsoid"                          # [ellipsoid, risp_point, risp_line, pathcover_line, pathcover_point, pathcover_line_reuse]
         risp_alpha: 0.05                                # [-] Algorithmic separator; safety comes from map inflation
+        hgp_voxel_aware: true                           # [-] Reject A*/shortcut edges intersecting occupied voxel volume
+        risp_voxel_aware: false                         # [-] Exclude full voxel support instead of only occupied centres
         sc_ellipsoid_fallback: false                    # [-] Use ellipsoid only after a RISP failure
         risp_random_seed: 1                             # [-] Deterministic per-segment RISP sampling seed
         pathcover_max_corridors: 12                     # [-] Reject incomplete local-path coverage at this limit

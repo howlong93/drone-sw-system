@@ -590,6 +590,8 @@ void MIGHTY_NODE::declareParameters() {
   this->declare_parameter("sfc_use_unknown_as_obstacle", false);
   this->declare_parameter("sc_method", "ellipsoid");
   this->declare_parameter("risp_alpha", 0.05);
+  this->declare_parameter("hgp_voxel_aware", true);
+  this->declare_parameter("risp_voxel_aware", false);
   this->declare_parameter("sc_ellipsoid_fallback", false);
   this->declare_parameter("risp_random_seed", 1);
   this->declare_parameter("pathcover_max_corridors", 12);
@@ -981,6 +983,8 @@ void MIGHTY_NODE::setParameters() {
   par_.sfc_use_unknown_as_obstacle = this->get_parameter("sfc_use_unknown_as_obstacle").as_bool();
   par_.sc_method = this->get_parameter("sc_method").as_string();
   par_.risp_alpha = this->get_parameter("risp_alpha").as_double();
+  par_.hgp_voxel_aware = this->get_parameter("hgp_voxel_aware").as_bool();
+  par_.risp_voxel_aware = this->get_parameter("risp_voxel_aware").as_bool();
   par_.sc_ellipsoid_fallback = this->get_parameter("sc_ellipsoid_fallback").as_bool();
   par_.risp_random_seed = this->get_parameter("risp_random_seed").as_int();
   par_.pathcover_max_corridors = this->get_parameter("pathcover_max_corridors").as_int();
@@ -1400,6 +1404,8 @@ void MIGHTY_NODE::printParameters() {
               par_.sfc_use_unknown_as_obstacle);
   RCLCPP_INFO(this->get_logger(), "SC Method: %s", par_.sc_method.c_str());
   RCLCPP_INFO(this->get_logger(), "RISP Alpha: %.6f", par_.risp_alpha);
+  RCLCPP_INFO(this->get_logger(), "HGP Voxel Aware: %d", par_.hgp_voxel_aware);
+  RCLCPP_INFO(this->get_logger(), "RISP Voxel Aware: %d", par_.risp_voxel_aware);
   RCLCPP_INFO(this->get_logger(), "SC Ellipsoid Fallback: %d", par_.sc_ellipsoid_fallback);
   RCLCPP_INFO(this->get_logger(), "RISP Random Seed: %d", par_.risp_random_seed);
   RCLCPP_INFO(this->get_logger(), "PathCover Max Corridors: %d",

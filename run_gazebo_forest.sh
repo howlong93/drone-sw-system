@@ -6,13 +6,17 @@ set -Eeuo pipefail
 # User configuration (edit these values for the next test batch)
 # =============================================================================
 TEST_RUN_COUNT="${TEST_RUN_COUNT:-5}"  # Number of simulation runs
-RVIZ_GUI_DEFAULT="${RVIZ_GUI_DEFAULT:-0}"  # 1: enable RViz, 0: disable
+RVIZ_GUI_DEFAULT="${RVIZ_GUI_DEFAULT:-1}"  # 1: enable RViz, 0: disable
 GAZEBO_GUI_DEFAULT="${GAZEBO_GUI_DEFAULT:-0}"  # 1: enable Gazebo GUI, 0: disable
 RECORD_STATISTICS="${RECORD_STATISTICS:-1}"  # 1: record benchmark data, 0: disable
 ENABLE_SAFETY_GATE="${ENABLE_SAFETY_GATE:-0}"  # 1: reject unsafe candidates, 0: observe only
-DEBUG_TESTING="${DEBUG_TESTING:-1}"  # 1: targeted corridor diagnostics; keep 0 for normal runs
+DEBUG_TESTING="${DEBUG_TESTING:-0}"  # 1: targeted corridor diagnostics; keep 0 for normal runs
 SC_METHOD="${SC_METHOD:-pathcover_line_reuse}"  # ellipsoid, risp_point, risp_line, pathcover_line, pathcover_point, or pathcover_line_reuse
 RISP_ALPHA="${RISP_ALPHA:-0.05}"  # RISP separation margin fraction in (0, 1)
+HGP_VOXEL_AWARE="${HGP_VOXEL_AWARE:-0}"  # 1: finite occupied-voxel edge checks, 0: centre-cell checks
+RISP_VOXEL_AWARE="${RISP_VOXEL_AWARE:-0}"  # 1: exclude full voxel support, 0: occupied centres only
+CORRIDOR_PRIMARY_WEIGHT_SCALE="${CORRIDOR_PRIMARY_WEIGHT_SCALE:-5}"  # first optimizer attempt: multiplier on stat_weight
+CORRIDOR_FALLBACK_WEIGHT_SCALE="${CORRIDOR_FALLBACK_WEIGHT_SCALE:-1}"  # second attempt after invalid/failed primary solve
 SC_ELLIPSOID_FALLBACK="${SC_ELLIPSOID_FALLBACK:-0}"  # 1: ellipsoid fallback after RISP failure
 RISP_RANDOM_SEED="${RISP_RANDOM_SEED:-1}"  # deterministic non-negative base seed
 PATHCOVER_MAX_CORRIDORS="${PATHCOVER_MAX_CORRIDORS:-12}"
@@ -23,9 +27,23 @@ PATHCOVER_POINT_MAX_RETRIES="${PATHCOVER_POINT_MAX_RETRIES:-3}"
 # 1 enables the older heavy O(corridors*obstacles) audit. Lightweight P0/P1/P2
 # recording is always enabled whenever RECORD_STATISTICS=1.
 BENCHMARK_REPLAN_DETAILS="${BENCHMARK_REPLAN_DETAILS:-0}"
-STATISTICS_FOLDER_NAME="${STATISTICS_FOLDER_NAME:-${SC_METHOD}_a0.05_$(date +%Y%m%d_%H%M%S)}"
+STATISTICS_FOLDER_NAME="${STATISTICS_FOLDER_NAME:-${SC_METHOD}_v3.1_g0r0_w5-1_$(date +%Y%m%d_%H%M%S)}"
 RUN_TIMEOUT_SECONDS="${RUN_TIMEOUT_SECONDS:-280}"  # Overall timeout for each run
 FLIGHT_TIMEOUT_SECONDS="${FLIGHT_TIMEOUT_SECONDS:-240}"  # Timeout after flight starts
+
+# UAV trajectory-planning dynamics. These values are written to a per-run
+# config mounted into the container, so changing them does not require an
+# image rebuild. V/A/J match the MIGHTY paper's static benchmark (Table IV).
+V_MAX="${V_MAX:-4.0}"  # [m/s]
+A_MAX="${A_MAX:-10.0}"  # [m/s^2]
+J_MAX="${J_MAX:-30.0}"  # [m/s^3]
+W_MAX="${W_MAX:-1.0}"  # [rad/s] yaw-rate limit (paper does not specify)
+OMEGA_MAX="${OMEGA_MAX:-0.10472}"  # [rad/s] body-rate limit
+TILT_MAX_RAD="${TILT_MAX_RAD:-0.610865}"  # [rad] 35 degrees
+F_MIN="${F_MIN:-2.0}"  # [N]
+F_MAX="${F_MAX:-12.0}"  # [N]
+VEHICLE_MASS="${VEHICLE_MASS:-1.0}"  # [kg]
+GRAVITY="${GRAVITY:-9.81}"  # [m/s^2]
 
 REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -42,6 +60,10 @@ if (( $# == 0 )); then
   export BATCH_DEBUG_TESTING="${DEBUG_TESTING}"
   export BATCH_SC_METHOD="${SC_METHOD}"
   export BATCH_RISP_ALPHA="${RISP_ALPHA}"
+  export BATCH_HGP_VOXEL_AWARE="${HGP_VOXEL_AWARE}"
+  export BATCH_RISP_VOXEL_AWARE="${RISP_VOXEL_AWARE}"
+  export BATCH_CORRIDOR_PRIMARY_WEIGHT_SCALE="${CORRIDOR_PRIMARY_WEIGHT_SCALE}"
+  export BATCH_CORRIDOR_FALLBACK_WEIGHT_SCALE="${CORRIDOR_FALLBACK_WEIGHT_SCALE}"
   export BATCH_SC_ELLIPSOID_FALLBACK="${SC_ELLIPSOID_FALLBACK}"
   export BATCH_RISP_RANDOM_SEED="${RISP_RANDOM_SEED}"
   export BATCH_PATHCOVER_MAX_CORRIDORS="${PATHCOVER_MAX_CORRIDORS}"
@@ -49,6 +71,16 @@ if (( $# == 0 )); then
   export BATCH_PATHCOVER_MIN_OVERLAP_MARGIN="${PATHCOVER_MIN_OVERLAP_MARGIN}"
   export BATCH_PATHCOVER_MIN_PROGRESS="${PATHCOVER_MIN_PROGRESS}"
   export BATCH_PATHCOVER_POINT_MAX_RETRIES="${PATHCOVER_POINT_MAX_RETRIES}"
+  export BATCH_V_MAX="${V_MAX}"
+  export BATCH_A_MAX="${A_MAX}"
+  export BATCH_J_MAX="${J_MAX}"
+  export BATCH_W_MAX="${W_MAX}"
+  export BATCH_OMEGA_MAX="${OMEGA_MAX}"
+  export BATCH_TILT_MAX_RAD="${TILT_MAX_RAD}"
+  export BATCH_F_MIN="${F_MIN}"
+  export BATCH_F_MAX="${F_MAX}"
+  export BATCH_VEHICLE_MASS="${VEHICLE_MASS}"
+  export BATCH_GRAVITY="${GRAVITY}"
   export TIMEOUT_S="${RUN_TIMEOUT_SECONDS}"
   export FLIGHT_TIMEOUT_S="${FLIGHT_TIMEOUT_SECONDS}"
   exec "${REPO_DIR}/run_benchmark_batch_drone.sh" "${TEST_RUN_COUNT}"
@@ -86,6 +118,10 @@ Optional environment variables:
   DEBUG_TESTING   1: enable targeted PathCover/corridor diagnosis; 0: normal flight
   SC_METHOD       Safe-corridor generator: ellipsoid, risp_point, risp_line, pathcover_line, pathcover_point, or pathcover_line_reuse
   RISP_ALPHA      RISP separation margin fraction in (0, 1)
+  HGP_VOXEL_AWARE 1: reject HGP edges intersecting voxel volume; 0: centre-cell checks
+  RISP_VOXEL_AWARE 1: exclude full voxel support in RISP; 0: occupied centres only
+  CORRIDOR_PRIMARY_WEIGHT_SCALE  First optimizer attempt's stat_weight multiplier
+  CORRIDOR_FALLBACK_WEIGHT_SCALE Second attempt's multiplier after primary failure
   SC_ELLIPSOID_FALLBACK  1: use ellipsoid after a RISP failure; 0: pure RISP
   RISP_RANDOM_SEED Deterministic non-negative RISP base seed
   PATHCOVER_MAX_CORRIDORS Maximum number of PathCover corridors
@@ -93,6 +129,11 @@ Optional environment variables:
   PATHCOVER_MIN_OVERLAP_MARGIN Required normalized seam margin (metres)
   PATHCOVER_MIN_PROGRESS Required new point-corridor coverage (metres)
   PATHCOVER_POINT_MAX_RETRIES Deterministic retries after the initial point attempt
+  V_MAX/A_MAX/J_MAX UAV trajectory speed, acceleration, and jerk limits
+  W_MAX/OMEGA_MAX  UAV yaw-rate and body-rate limits
+  TILT_MAX_RAD     UAV maximum tilt angle in radians
+  F_MIN/F_MAX      UAV thrust limits in newtons
+  VEHICLE_MASS/GRAVITY UAV mass and gravitational acceleration
   BENCHMARK_RUN_ID Identifier used for the output folder and CSV filename
   BENCHMARK_RUN_DIR Host output directory; defaults to statistics/<run-id>
   CONTAINER_NAME  Docker container name (default: mighty-gazebo-forest)
@@ -162,6 +203,21 @@ if ! awk -v value="${RISP_ALPHA}" 'BEGIN { exit !(value > 0 && value < 1) }'; th
   echo "[ERROR] RISP_ALPHA must be numeric and in (0, 1) (received: ${RISP_ALPHA})." >&2
   exit 2
 fi
+for variable in HGP_VOXEL_AWARE RISP_VOXEL_AWARE; do
+  if [[ "${!variable}" != "0" && "${!variable}" != "1" ]]; then
+    echo "[ERROR] ${variable} must be 0 or 1 (received: ${!variable})." >&2
+    exit 2
+  fi
+done
+if ! awk -v value="${CORRIDOR_PRIMARY_WEIGHT_SCALE}" 'BEGIN { exit !(value > 0) }'; then
+  echo "[ERROR] CORRIDOR_PRIMARY_WEIGHT_SCALE must be positive (received: ${CORRIDOR_PRIMARY_WEIGHT_SCALE})." >&2
+  exit 2
+fi
+if ! awk -v value="${CORRIDOR_FALLBACK_WEIGHT_SCALE}" -v primary="${CORRIDOR_PRIMARY_WEIGHT_SCALE}" \
+  'BEGIN { exit !(value > 0 && value <= primary) }'; then
+  echo "[ERROR] CORRIDOR_FALLBACK_WEIGHT_SCALE must be positive and no greater than the primary scale (received: ${CORRIDOR_FALLBACK_WEIGHT_SCALE})." >&2
+  exit 2
+fi
 if [[ "${SC_ELLIPSOID_FALLBACK}" != "0" && "${SC_ELLIPSOID_FALLBACK}" != "1" ]]; then
   echo "[ERROR] SC_ELLIPSOID_FALLBACK must be 0 or 1 (received: ${SC_ELLIPSOID_FALLBACK})." >&2
   exit 2
@@ -175,6 +231,21 @@ awk -v value="${PATHCOVER_OVERLAP_DISTANCE}" 'BEGIN { exit !(value >= 0) }' || {
 awk -v value="${PATHCOVER_MIN_OVERLAP_MARGIN}" 'BEGIN { exit !(value >= 0) }' || { echo "[ERROR] PATHCOVER_MIN_OVERLAP_MARGIN must be non-negative." >&2; exit 2; }
 awk -v value="${PATHCOVER_MIN_PROGRESS}" 'BEGIN { exit !(value > 0) }' || { echo "[ERROR] PATHCOVER_MIN_PROGRESS must be positive." >&2; exit 2; }
 [[ "${PATHCOVER_POINT_MAX_RETRIES}" =~ ^[0-9]+$ ]] || { echo "[ERROR] PATHCOVER_POINT_MAX_RETRIES must be non-negative." >&2; exit 2; }
+
+for flight_limit in V_MAX A_MAX J_MAX W_MAX OMEGA_MAX TILT_MAX_RAD VEHICLE_MASS GRAVITY; do
+  if ! awk -v value="${!flight_limit}" 'BEGIN { exit !(value > 0) }'; then
+    echo "[ERROR] ${flight_limit} must be a positive number (received: ${!flight_limit})." >&2
+    exit 2
+  fi
+done
+if ! awk -v value="${F_MIN}" 'BEGIN { exit !(value >= 0) }'; then
+  echo "[ERROR] F_MIN must be a non-negative number (received: ${F_MIN})." >&2
+  exit 2
+fi
+if ! awk -v minimum="${F_MIN}" -v maximum="${F_MAX}" 'BEGIN { exit !(maximum > minimum) }'; then
+  echo "[ERROR] F_MAX must be greater than F_MIN (received: ${F_MIN}, ${F_MAX})." >&2
+  exit 2
+fi
 
 if [[ ! "${STATISTICS_FOLDER_NAME}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
   echo "[ERROR] STATISTICS_FOLDER_NAME contains unsupported characters: ${STATISTICS_FOLDER_NAME}" >&2
@@ -272,6 +343,27 @@ if [[ "${BENCHMARK}" == "1" ]]; then
   BENCHMARK_CLEARANCE_FILE="${BENCHMARK_RUN_DIR}/${BENCHMARK_RUN_ID}_trajectory_clearance.csv"
 fi
 
+# Render the active dynamics into a per-run config and bind-mount it over the
+# image's baked config. This keeps normal DEV=0 runs reproducible while making
+# flight-limit tuning rebuild-free.
+if [[ "${BENCHMARK}" == "1" ]]; then
+  RUNTIME_CONFIG_FILE="${BENCHMARK_RUN_DIR}/${BENCHMARK_RUN_ID}_mighty.yaml"
+else
+  RUNTIME_CONFIG_FILE="${TMPDIR:-/tmp}/mighty-runtime-${UID}.yaml"
+fi
+sed -E \
+  -e "s/^([[:space:]]*v_max:[[:space:]]*)[^#[:space:]]+/\\1${V_MAX}/" \
+  -e "s/^([[:space:]]*a_max:[[:space:]]*)[^#[:space:]]+/\\1${A_MAX}/" \
+  -e "s/^([[:space:]]*j_max:[[:space:]]*)[^#[:space:]]+/\\1${J_MAX}/" \
+  -e "s/^([[:space:]]*w_max:[[:space:]]*)[^#[:space:]]+/\\1${W_MAX}/" \
+  -e "s/^([[:space:]]*omega_max:[[:space:]]*)[^#[:space:]]+/\\1${OMEGA_MAX}/" \
+  -e "s/^([[:space:]]*tilt_max_rad:[[:space:]]*)[^#[:space:]]+/\\1${TILT_MAX_RAD}/" \
+  -e "s/^([[:space:]]*f_min:[[:space:]]*)[^#[:space:]]+/\\1${F_MIN}/" \
+  -e "s/^([[:space:]]*f_max:[[:space:]]*)[^#[:space:]]+/\\1${F_MAX}/" \
+  -e "s/^([[:space:]]*mass:[[:space:]]*)[^#[:space:]]+/\\1${VEHICLE_MASS}/" \
+  -e "s/^([[:space:]]*g:[[:space:]]*)[^#[:space:]]+/\\1${GRAVITY}/" \
+  "${REPO_DIR}/config/mighty.yaml" > "${RUNTIME_CONFIG_FILE}"
+
 docker_args=(
   run
   --rm
@@ -290,6 +382,10 @@ docker_args=(
   --env "DEBUG_TESTING=${DEBUG_TESTING}"
   --env "SC_METHOD=${SC_METHOD}"
   --env "RISP_ALPHA=${RISP_ALPHA}"
+  --env "HGP_VOXEL_AWARE=${HGP_VOXEL_AWARE}"
+  --env "RISP_VOXEL_AWARE=${RISP_VOXEL_AWARE}"
+  --env "CORRIDOR_PRIMARY_WEIGHT_SCALE=${CORRIDOR_PRIMARY_WEIGHT_SCALE}"
+  --env "CORRIDOR_FALLBACK_WEIGHT_SCALE=${CORRIDOR_FALLBACK_WEIGHT_SCALE}"
   --env "SC_ELLIPSOID_FALLBACK=${SC_ELLIPSOID_FALLBACK}"
   --env "RISP_RANDOM_SEED=${RISP_RANDOM_SEED}"
   --env "PATHCOVER_MAX_CORRIDORS=${PATHCOVER_MAX_CORRIDORS}"
@@ -356,6 +452,12 @@ if [[ "${DEV}" == "1" ]]; then
   )
 fi
 
+# Keep this after the optional DEV directory mounts so the per-run file wins.
+docker_args+=(
+  --volume "${RUNTIME_CONFIG_FILE}:/home/kkondo/code/mighty_ws/install/mighty/share/mighty/config/mighty.yaml:ro"
+  --volume "${RUNTIME_CONFIG_FILE}:/home/kkondo/code/mighty_ws/src/mighty/config/mighty.yaml:ro"
+)
+
 container_command=(
   -lc
   'source /opt/ros/humble/setup.bash
@@ -375,6 +477,8 @@ fi
 
 args=(--mode gazebo -s /home/kkondo/code/mighty_ws/install/setup.bash --env "${ENV}" --auto-exit-delay "${AUTO_EXIT_DELAY}")
 args+=(--sc-method "${SC_METHOD}" --risp-alpha "${RISP_ALPHA}" --risp-random-seed "${RISP_RANDOM_SEED}")
+args+=(--hgp-voxel-aware "${HGP_VOXEL_AWARE}" --risp-voxel-aware "${RISP_VOXEL_AWARE}")
+args+=(--corridor-primary-weight-scale "${CORRIDOR_PRIMARY_WEIGHT_SCALE}" --corridor-fallback-weight-scale "${CORRIDOR_FALLBACK_WEIGHT_SCALE}")
 args+=(--pathcover-max-corridors "${PATHCOVER_MAX_CORRIDORS}" --pathcover-overlap-distance "${PATHCOVER_OVERLAP_DISTANCE}" --pathcover-min-overlap-margin "${PATHCOVER_MIN_OVERLAP_MARGIN}" --pathcover-min-progress "${PATHCOVER_MIN_PROGRESS}" --pathcover-point-max-retries "${PATHCOVER_POINT_MAX_RETRIES}")
 if [[ "${SC_ELLIPSOID_FALLBACK}" == "1" ]]; then
   args+=(--sc-ellipsoid-fallback)
@@ -425,6 +529,10 @@ echo "[MIGHTY] Safety gate: ${ENABLE_SAFETY_GATE}"
 echo "[MIGHTY] Debug testing: ${DEBUG_TESTING}"
 echo "[MIGHTY] SC method: ${SC_METHOD}"
 echo "[MIGHTY] RISP alpha: ${RISP_ALPHA}"
+echo "[MIGHTY] HGP voxel aware: ${HGP_VOXEL_AWARE}"
+echo "[MIGHTY] RISP voxel aware: ${RISP_VOXEL_AWARE}"
+echo "[MIGHTY] Corridor primary weight scale: ${CORRIDOR_PRIMARY_WEIGHT_SCALE}"
+echo "[MIGHTY] Corridor fallback weight scale: ${CORRIDOR_FALLBACK_WEIGHT_SCALE}"
 echo "[MIGHTY] Ellipsoid fallback: ${SC_ELLIPSOID_FALLBACK}"
 echo "[MIGHTY] RISP random seed: ${RISP_RANDOM_SEED}"
 echo "[MIGHTY] PathCover max corridors: ${PATHCOVER_MAX_CORRIDORS}"
@@ -432,6 +540,9 @@ echo "[MIGHTY] PathCover overlap distance: ${PATHCOVER_OVERLAP_DISTANCE}"
 echo "[MIGHTY] PathCover minimum overlap margin: ${PATHCOVER_MIN_OVERLAP_MARGIN}"
 echo "[MIGHTY] PathCover minimum point progress: ${PATHCOVER_MIN_PROGRESS}"
 echo "[MIGHTY] PathCover point max retries: ${PATHCOVER_POINT_MAX_RETRIES}"
+echo "[MIGHTY] Flight limits: v=${V_MAX} m/s, a=${A_MAX} m/s^2, j=${J_MAX} m/s^3"
+echo "[MIGHTY] Attitude limits: yaw_rate=${W_MAX} rad/s, body_rate=${OMEGA_MAX} rad/s, tilt=${TILT_MAX_RAD} rad"
+echo "[MIGHTY] Thrust/model: f=[${F_MIN}, ${F_MAX}] N, mass=${VEHICLE_MASS} kg, g=${GRAVITY} m/s^2"
 if [[ "${BENCHMARK}" == "1" ]]; then
   echo "[MIGHTY] Benchmark output: ${BENCHMARK_RUN_DIR}"
 fi
@@ -458,20 +569,19 @@ ended_at="$(date --iso-8601=seconds)"
 ended_epoch="$(date +%s)"
 duration_s=$((ended_epoch - started_epoch))
 
-# Preserve the exact run inputs. These operations happen only after flight.
-cp "${REPO_DIR}/config/mighty.yaml" \
-  "${BENCHMARK_RUN_DIR}/${BENCHMARK_RUN_ID}_mighty.yaml"
+# The exact rendered runtime config was created in the run directory before
+# launch and is already preserved as ${BENCHMARK_RUN_ID}_mighty.yaml.
 git_commit="$(git -C "${REPO_DIR}" rev-parse HEAD 2>/dev/null || echo unknown)"
 git_dirty=0
 [[ -z "$(git -C "${REPO_DIR}" status --porcelain 2>/dev/null)" ]] || git_dirty=1
 git_diff_sha256="$(git -C "${REPO_DIR}" diff --binary HEAD 2>/dev/null | sha256sum | awk '{print $1}')"
-config_sha256="$(sha256sum "${REPO_DIR}/config/mighty.yaml" | awk '{print $1}')"
+config_sha256="$(sha256sum "${RUNTIME_CONFIG_FILE}" | awk '{print $1}')"
 world_sha256="$(sha256sum "${REPO_DIR}/worlds/${WORLD}.world" | awk '{print $1}')"
 image_id="$(docker image inspect --format '{{.Id}}' "${IMAGE}" 2>/dev/null || echo unknown)"
-planner_co="$(awk '$1 == "planner_Co:" {print $2; exit}' "${REPO_DIR}/config/mighty.yaml")"
-inflation_hgp="$(awk '$1 == "inflation_hgp:" {print $2; exit}' "${REPO_DIR}/config/mighty.yaml")"
+planner_co="$(awk '$1 == "planner_Co:" {print $2; exit}' "${RUNTIME_CONFIG_FILE}")"
+inflation_hgp="$(awk '$1 == "inflation_hgp:" {print $2; exit}' "${RUNTIME_CONFIG_FILE}")"
 drone_bbox="$(sed -n 's/^[[:space:]]*drone_bbox:[[:space:]]*\([^#]*\).*$/\1/p' \
-  "${REPO_DIR}/config/mighty.yaml" | tr -d '[] ' )"
+  "${RUNTIME_CONFIG_FILE}" | tr -d '[] ' )"
 
 ground_truth_generated=0
 if [[ -s "${BENCHMARK_TRAJECTORY_FILE}" ]]; then
@@ -483,7 +593,7 @@ if [[ -s "${BENCHMARK_TRAJECTORY_FILE}" ]]; then
   if [[ -f "${world_file}" ]] && python3 "${REPO_DIR}/scripts/validate_trajectory_ground_truth.py" \
       --trajectory "${BENCHMARK_TRAJECTORY_FILE}" \
       --world "${world_file}" \
-      --config "${REPO_DIR}/config/mighty.yaml" \
+      --config "${RUNTIME_CONFIG_FILE}" \
       --output "${BENCHMARK_GROUND_TRUTH_FILE}" \
       --mission-summary "${BENCHMARK_SUMMARY_FILE}" \
       --plot-output "${BENCHMARK_OVERLAY_FILE}" \
@@ -528,6 +638,10 @@ fi
   printf 'debug_testing=%s\n' "${DEBUG_TESTING}"
   printf 'sc_method=%s\n' "${SC_METHOD}"
   printf 'risp_alpha=%s\n' "${RISP_ALPHA}"
+  printf 'hgp_voxel_aware=%s\n' "${HGP_VOXEL_AWARE}"
+  printf 'risp_voxel_aware=%s\n' "${RISP_VOXEL_AWARE}"
+  printf 'corridor_primary_weight_scale=%s\n' "${CORRIDOR_PRIMARY_WEIGHT_SCALE}"
+  printf 'corridor_fallback_weight_scale=%s\n' "${CORRIDOR_FALLBACK_WEIGHT_SCALE}"
   printf 'sc_ellipsoid_fallback=%s\n' "${SC_ELLIPSOID_FALLBACK}"
   printf 'risp_random_seed=%s\n' "${RISP_RANDOM_SEED}"
   printf 'pathcover_max_corridors=%s\n' "${PATHCOVER_MAX_CORRIDORS}"
@@ -535,6 +649,16 @@ fi
   printf 'pathcover_min_overlap_margin=%s\n' "${PATHCOVER_MIN_OVERLAP_MARGIN}"
   printf 'pathcover_min_progress=%s\n' "${PATHCOVER_MIN_PROGRESS}"
   printf 'pathcover_point_max_retries=%s\n' "${PATHCOVER_POINT_MAX_RETRIES}"
+  printf 'v_max=%s\n' "${V_MAX}"
+  printf 'a_max=%s\n' "${A_MAX}"
+  printf 'j_max=%s\n' "${J_MAX}"
+  printf 'w_max=%s\n' "${W_MAX}"
+  printf 'omega_max=%s\n' "${OMEGA_MAX}"
+  printf 'tilt_max_rad=%s\n' "${TILT_MAX_RAD}"
+  printf 'f_min=%s\n' "${F_MIN}"
+  printf 'f_max=%s\n' "${F_MAX}"
+  printf 'vehicle_mass=%s\n' "${VEHICLE_MASS}"
+  printf 'gravity=%s\n' "${GRAVITY}"
   printf 'planner_Co=%s\n' "${planner_co}"
   printf 'inflation_hgp=%s\n' "${inflation_hgp}"
   printf 'drone_bbox=%s\n' "${drone_bbox}"

@@ -14,6 +14,10 @@ ENABLE_SAFETY_GATE="${BATCH_ENABLE_SAFETY_GATE:-1}"
 DEBUG_TESTING="${BATCH_DEBUG_TESTING:-0}"
 SC_METHOD="${BATCH_SC_METHOD:-pathcover_line}"
 RISP_ALPHA="${BATCH_RISP_ALPHA:-0.05}"
+HGP_VOXEL_AWARE="${BATCH_HGP_VOXEL_AWARE:-1}"
+RISP_VOXEL_AWARE="${BATCH_RISP_VOXEL_AWARE:-0}"
+CORRIDOR_PRIMARY_WEIGHT_SCALE="${BATCH_CORRIDOR_PRIMARY_WEIGHT_SCALE:-30}"
+CORRIDOR_FALLBACK_WEIGHT_SCALE="${BATCH_CORRIDOR_FALLBACK_WEIGHT_SCALE:-5}"
 SC_ELLIPSOID_FALLBACK="${BATCH_SC_ELLIPSOID_FALLBACK:-0}"
 RISP_RANDOM_SEED="${BATCH_RISP_RANDOM_SEED:-1}"
 PATHCOVER_MAX_CORRIDORS="${BATCH_PATHCOVER_MAX_CORRIDORS:-12}"
@@ -21,6 +25,16 @@ PATHCOVER_OVERLAP_DISTANCE="${BATCH_PATHCOVER_OVERLAP_DISTANCE:-0.25}"
 PATHCOVER_MIN_OVERLAP_MARGIN="${BATCH_PATHCOVER_MIN_OVERLAP_MARGIN:-0.001}"
 PATHCOVER_MIN_PROGRESS="${BATCH_PATHCOVER_MIN_PROGRESS:-0.05}"
 PATHCOVER_POINT_MAX_RETRIES="${BATCH_PATHCOVER_POINT_MAX_RETRIES:-3}"
+V_MAX="${BATCH_V_MAX:-4.0}"
+A_MAX="${BATCH_A_MAX:-10.0}"
+J_MAX="${BATCH_J_MAX:-30.0}"
+W_MAX="${BATCH_W_MAX:-1.0}"
+OMEGA_MAX="${BATCH_OMEGA_MAX:-0.10472}"
+TILT_MAX_RAD="${BATCH_TILT_MAX_RAD:-0.610865}"
+F_MIN="${BATCH_F_MIN:-2.0}"
+F_MAX="${BATCH_F_MAX:-12.0}"
+VEHICLE_MASS="${BATCH_VEHICLE_MASS:-1.0}"
+GRAVITY="${BATCH_GRAVITY:-9.81}"
 WORLD="${ENV:-hard_forest}"
 TIMEOUT_S="${TIMEOUT_S:-330}"
 FLIGHT_TIMEOUT_S="${FLIGHT_TIMEOUT_S:-270}"
@@ -41,6 +55,10 @@ STATISTICS_DIR="${STATISTICS_DIR:-${REPO_DIR}/statistics}"
 [[ "${DEBUG_TESTING}" == "0" || "${RECORD_STATISTICS}" == "1" ]] || { echo "[ERROR] BATCH_DEBUG_TESTING=1 requires statistics recording." >&2; exit 2; }
 [[ "${SC_METHOD}" == "ellipsoid" || "${SC_METHOD}" == "risp_point" || "${SC_METHOD}" == "risp_line" || "${SC_METHOD}" == "pathcover_line" || "${SC_METHOD}" == "pathcover_point" || "${SC_METHOD}" == "pathcover_line_reuse" ]] || { echo "[ERROR] BATCH_SC_METHOD is invalid." >&2; exit 2; }
 awk -v value="${RISP_ALPHA}" 'BEGIN { exit !(value > 0 && value < 1) }' || { echo "[ERROR] BATCH_RISP_ALPHA must be in (0, 1)." >&2; exit 2; }
+[[ "${HGP_VOXEL_AWARE}" == "0" || "${HGP_VOXEL_AWARE}" == "1" ]] || { echo "[ERROR] BATCH_HGP_VOXEL_AWARE must be 0 or 1." >&2; exit 2; }
+[[ "${RISP_VOXEL_AWARE}" == "0" || "${RISP_VOXEL_AWARE}" == "1" ]] || { echo "[ERROR] BATCH_RISP_VOXEL_AWARE must be 0 or 1." >&2; exit 2; }
+awk -v value="${CORRIDOR_PRIMARY_WEIGHT_SCALE}" 'BEGIN { exit !(value > 0) }' || { echo "[ERROR] BATCH_CORRIDOR_PRIMARY_WEIGHT_SCALE must be positive." >&2; exit 2; }
+awk -v value="${CORRIDOR_FALLBACK_WEIGHT_SCALE}" -v primary="${CORRIDOR_PRIMARY_WEIGHT_SCALE}" 'BEGIN { exit !(value > 0 && value <= primary) }' || { echo "[ERROR] BATCH_CORRIDOR_FALLBACK_WEIGHT_SCALE must be positive and no greater than primary." >&2; exit 2; }
 [[ "${SC_ELLIPSOID_FALLBACK}" == "0" || "${SC_ELLIPSOID_FALLBACK}" == "1" ]] || { echo "[ERROR] BATCH_SC_ELLIPSOID_FALLBACK must be 0 or 1." >&2; exit 2; }
 [[ "${RISP_RANDOM_SEED}" =~ ^[0-9]+$ ]] || { echo "[ERROR] BATCH_RISP_RANDOM_SEED must be non-negative." >&2; exit 2; }
 [[ "${PATHCOVER_MAX_CORRIDORS}" =~ ^([2-9]|[1-9][0-9]+)$ ]] || { echo "[ERROR] BATCH_PATHCOVER_MAX_CORRIDORS must be at least 2." >&2; exit 2; }
@@ -48,6 +66,11 @@ awk -v value="${PATHCOVER_OVERLAP_DISTANCE}" 'BEGIN { exit !(value >= 0) }' || {
 awk -v value="${PATHCOVER_MIN_OVERLAP_MARGIN}" 'BEGIN { exit !(value >= 0) }' || { echo "[ERROR] BATCH_PATHCOVER_MIN_OVERLAP_MARGIN must be non-negative." >&2; exit 2; }
 awk -v value="${PATHCOVER_MIN_PROGRESS}" 'BEGIN { exit !(value > 0) }' || { echo "[ERROR] BATCH_PATHCOVER_MIN_PROGRESS must be positive." >&2; exit 2; }
 [[ "${PATHCOVER_POINT_MAX_RETRIES}" =~ ^[0-9]+$ ]] || { echo "[ERROR] BATCH_PATHCOVER_POINT_MAX_RETRIES must be non-negative." >&2; exit 2; }
+for flight_limit in V_MAX A_MAX J_MAX W_MAX OMEGA_MAX TILT_MAX_RAD VEHICLE_MASS GRAVITY; do
+  awk -v value="${!flight_limit}" 'BEGIN { exit !(value > 0) }' || { echo "[ERROR] BATCH_${flight_limit} must be positive." >&2; exit 2; }
+done
+awk -v value="${F_MIN}" 'BEGIN { exit !(value >= 0) }' || { echo "[ERROR] BATCH_F_MIN must be non-negative." >&2; exit 2; }
+awk -v minimum="${F_MIN}" -v maximum="${F_MAX}" 'BEGIN { exit !(maximum > minimum) }' || { echo "[ERROR] BATCH_F_MAX must be greater than BATCH_F_MIN." >&2; exit 2; }
 [[ "${TIMEOUT_S}" =~ ^[1-9][0-9]*([.][0-9]+)?$ ]] || { echo "[ERROR] TIMEOUT_S must be positive." >&2; exit 2; }
 [[ "${FLIGHT_TIMEOUT_S}" =~ ^[1-9][0-9]*([.][0-9]+)?$ ]] || { echo "[ERROR] FLIGHT_TIMEOUT_S must be positive." >&2; exit 2; }
 [[ "${AUTO_EXIT_DELAY}" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "[ERROR] AUTO_EXIT_DELAY must be non-negative for batch runs." >&2; exit 2; }
@@ -85,6 +108,10 @@ echo "  Safety gate     : ${ENABLE_SAFETY_GATE}"
 echo "  Debug testing   : ${DEBUG_TESTING}"
 echo "  SC method       : ${SC_METHOD}"
 echo "  RISP alpha      : ${RISP_ALPHA}"
+echo "  HGP voxel aware : ${HGP_VOXEL_AWARE}"
+echo "  RISP voxel aware: ${RISP_VOXEL_AWARE}"
+echo "  Corridor primary: ${CORRIDOR_PRIMARY_WEIGHT_SCALE}x"
+echo "  Corridor fallback: ${CORRIDOR_FALLBACK_WEIGHT_SCALE}x"
 echo "  SC fallback     : ${SC_ELLIPSOID_FALLBACK}"
 echo "  RISP seed       : ${RISP_RANDOM_SEED}"
 echo "  PC max corridors: ${PATHCOVER_MAX_CORRIDORS}"
@@ -92,6 +119,9 @@ echo "  PC overlap dist : ${PATHCOVER_OVERLAP_DISTANCE}"
 echo "  PC min margin   : ${PATHCOVER_MIN_OVERLAP_MARGIN}"
 echo "  PC min progress : ${PATHCOVER_MIN_PROGRESS}"
 echo "  PC point retries: ${PATHCOVER_POINT_MAX_RETRIES}"
+echo "  Flight limits    : v=${V_MAX} m/s, a=${A_MAX} m/s^2, j=${J_MAX} m/s^3"
+echo "  Attitude limits  : yaw_rate=${W_MAX}, body_rate=${OMEGA_MAX}, tilt=${TILT_MAX_RAD} rad"
+echo "  Thrust/model     : f=[${F_MIN}, ${F_MAX}] N, mass=${VEHICLE_MASS} kg, g=${GRAVITY} m/s^2"
 echo "  Folder name     : ${BATCH_ID}"
 echo "  World           : ${WORLD}"
 echo "  Timeout/run     : ${TIMEOUT_S} second(s)"
@@ -120,6 +150,10 @@ for ((index = 1; index <= COUNT; index++)); do
     "DEBUG_TESTING=${DEBUG_TESTING}"
     "SC_METHOD=${SC_METHOD}"
     "RISP_ALPHA=${RISP_ALPHA}"
+    "HGP_VOXEL_AWARE=${HGP_VOXEL_AWARE}"
+    "RISP_VOXEL_AWARE=${RISP_VOXEL_AWARE}"
+    "CORRIDOR_PRIMARY_WEIGHT_SCALE=${CORRIDOR_PRIMARY_WEIGHT_SCALE}"
+    "CORRIDOR_FALLBACK_WEIGHT_SCALE=${CORRIDOR_FALLBACK_WEIGHT_SCALE}"
     "SC_ELLIPSOID_FALLBACK=${SC_ELLIPSOID_FALLBACK}"
     "RISP_RANDOM_SEED=${RISP_RANDOM_SEED}"
     "PATHCOVER_MAX_CORRIDORS=${PATHCOVER_MAX_CORRIDORS}"
@@ -127,6 +161,16 @@ for ((index = 1; index <= COUNT; index++)); do
     "PATHCOVER_MIN_OVERLAP_MARGIN=${PATHCOVER_MIN_OVERLAP_MARGIN}"
     "PATHCOVER_MIN_PROGRESS=${PATHCOVER_MIN_PROGRESS}"
     "PATHCOVER_POINT_MAX_RETRIES=${PATHCOVER_POINT_MAX_RETRIES}"
+    "V_MAX=${V_MAX}"
+    "A_MAX=${A_MAX}"
+    "J_MAX=${J_MAX}"
+    "W_MAX=${W_MAX}"
+    "OMEGA_MAX=${OMEGA_MAX}"
+    "TILT_MAX_RAD=${TILT_MAX_RAD}"
+    "F_MIN=${F_MIN}"
+    "F_MAX=${F_MAX}"
+    "VEHICLE_MASS=${VEHICLE_MASS}"
+    "GRAVITY=${GRAVITY}"
     "BENCHMARK_RUN_ID=${run_id}"
     "BENCHMARK_RUN_DIR=${run_dir}"
     "CONTAINER_NAME=${container_name}"
@@ -251,6 +295,7 @@ for ((index = 1; index <= COUNT; index++)); do
   fi
 
   if [[ -s "${trajectory_file}" ]]; then
+    runtime_config_file="${run_dir}/${run_id}_mighty.yaml"
     goal_args=()
     [[ -n "${GOAL_X:-}" ]] && goal_args+=(--goal-x "${GOAL_X}")
     [[ -n "${GOAL_Y:-}" ]] && goal_args+=(--goal-y "${GOAL_Y}")
@@ -258,7 +303,7 @@ for ((index = 1; index <= COUNT; index++)); do
     python3 "${REPO_DIR}/scripts/validate_trajectory_ground_truth.py" \
       --trajectory "${trajectory_file}" \
       --world "${REPO_DIR}/worlds/${WORLD}.world" \
-      --config "${REPO_DIR}/config/mighty.yaml" \
+      --config "${runtime_config_file}" \
       --output "${ground_truth_file}" \
       --mission-summary "${planner_summary_file}" \
       --plot-output "${overlay_file}" \

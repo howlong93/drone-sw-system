@@ -174,6 +174,8 @@ struct parameters {
   bool sfc_use_unknown_as_obstacle{false};
   std::string sc_method{"ellipsoid"};
   double risp_alpha{0.05};
+  bool hgp_voxel_aware{true};
+  bool risp_voxel_aware{false};
   bool sc_ellipsoid_fallback{false};
   int risp_random_seed{1};
   bool corridor_three_tier_optimization{true};

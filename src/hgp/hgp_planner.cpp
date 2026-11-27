@@ -8,6 +8,7 @@
 
 #include <hgp/hgp_planner.hpp>
 
+#include <algorithm>
 #include <fstream>
 #include <iomanip>
 
@@ -34,7 +35,7 @@ std::ofstream& hgp_debug_log() {
 HGPPlanner::HGPPlanner(std::string global_planner, bool verbose, double v_max, double a_max,
                        double j_max, int hgp_timeout_duration_ms, double w_unknown, double w_align,
                        double decay_len_cells, double w_side, int los_cells, double min_len,
-                       double min_turn)
+                       double min_turn, bool voxel_aware)
     : global_planner_(global_planner),
       planner_verbose_(verbose),
       v_max_(v_max),
@@ -47,13 +48,63 @@ HGPPlanner::HGPPlanner(std::string global_planner, bool verbose, double v_max, d
       w_side_(w_side),
       los_cells_(los_cells),
       min_len_(min_len),
-      min_turn_(min_turn) {
+      min_turn_(min_turn),
+      voxel_aware_(voxel_aware) {
   if (planner_verbose_) printf(ANSI_COLOR_CYAN "HGP PLANNER VERBOSE ON\n" ANSI_COLOR_RESET);
 }
 
 // --- In hgp_planner.cpp (definitions) ---
+bool HGPPlanner::lineClearsOccupiedVoxelSupport(const Vecf<3>& a,
+                                                const Vecf<3>& b) const {
+  if (!voxel_aware_) return true;
+  if (!map_util_) return false;
+  const double res = map_util_->getRes();
+  const Vecf<3> delta = b - a;
+  const double length_squared = delta.squaredNorm();
+  if (length_squared < 1e-12) return !map_util_->isOccupied(a);
+
+  const double length = std::sqrt(length_squared);
+  const double support_radius_squared = 0.75 * res * res;
+  const double sample_step = 0.5 * res;
+  const int sample_count = std::max(1, static_cast<int>(std::ceil(length / sample_step)));
+
+  // Sampling is used only to enumerate a bounded local set of candidate
+  // voxel centres.  The acceptance test itself is the exact centre-to-full-
+  // segment distance, not the sample distance.
+  for (int sample = 0; sample <= sample_count; ++sample) {
+    const double fraction = static_cast<double>(sample) / sample_count;
+    const Vecf<3> point = a + static_cast<decimal_t>(fraction) * delta;
+    const Veci<3> cell = map_util_->floatToInt(point);
+    const Veci<3> dim = map_util_->getDim();
+    for (int ox = -2; ox <= 2; ++ox) {
+      for (int oy = -2; oy <= 2; ++oy) {
+        for (int oz = -2; oz <= 2; ++oz) {
+          const Veci<3> candidate = cell + Veci<3>(ox, oy, oz);
+          if (candidate.x() < 0 || candidate.x() >= dim.x() ||
+              candidate.y() < 0 || candidate.y() >= dim.y() ||
+              candidate.z() < 0 || candidate.z() >= dim.z())
+            continue;
+          if (!map_util_->isOccupied(candidate)) continue;
+          const Vecf<3> center = map_util_->intToFloat(candidate);
+          const double projection = std::clamp(
+              static_cast<double>((center - a).dot(delta)) / length_squared,
+              0.0, 1.0);
+          const Vecf<3> closest = a + static_cast<decimal_t>(projection) * delta;
+          if ((center - closest).squaredNorm() <= support_radius_squared + 1e-12)
+            return false;
+        }
+      }
+    }
+  }
+  return true;
+}
+
 bool HGPPlanner::lineOfSightCapsule(const Vecf<3>& a, const Vecf<3>& b,
                                     int inflate_radius_cells) const {
+  // Shortcutting must not reintroduce an edge that the voxel-volume-aware A*
+  // graph would have forbidden.
+  if (!lineClearsOccupiedVoxelSupport(a, b)) return false;
+
   // Sample along the segment and check a "capsule" of radius r around it.
   // r is in *cells* (so r=1.5 checks a segment thickened by 1.5 voxels).
   const double res = map_util_->getRes();
@@ -466,7 +517,8 @@ bool HGPPlanner::plan(const Vecf<3>& start, const Vecf<3>& start_vel, const Vecf
 
   graph_search_ = std::make_shared<mighty::GraphSearch>(cMap_for_search, map_util_, dim(0), dim(1),
                                                         zDim_for_search, eps, planner_verbose_,
-                                                        global_planner_, w_unknown_);
+                                                        global_planner_, w_unknown_, w_align_,
+                                                        decay_len_cells_, w_side_, voxel_aware_);
   graph_search_->setStartAndGoal(start, goal);
   double max_values[3] = {v_max_, a_max_, j_max_};
   graph_search_->setBounds(max_values);

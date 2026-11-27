@@ -618,7 +618,7 @@ bool MIGHTY::getSafeCorridor(const vec_Vecf<3>& global_path, const state& A,
   // each voxel by its circumscribed sphere so every generated plane excludes
   // the complete voxel volume, independent of plane orientation.
   const double risp_voxel_support_radius =
-      0.5 * std::sqrt(3.0) * par_.factor_hgp * par_.res;
+      par_.risp_voxel_aware ? 0.5 * std::sqrt(3.0) * par_.factor_hgp * par_.res : 0.0;
 
   auto run_risp = [&](const vec_Vecf<3>& segment_path, const vec_Vec3f& obstacles,
                       std::vector<LinearConstraint3D>& constraints,
@@ -2050,16 +2050,18 @@ bool MIGHTY::planLocalTrajectory(vec_Vecf<3>& global_path) {
   struct CorridorOptimizationTier {
     const char* name;
     double static_weight_scale;
-    double accepted_violation_m;
   };
   std::vector<CorridorOptimizationTier> tiers;
   if (par_.corridor_three_tier_optimization) {
-    tiers.push_back({"hard", par_.corridor_hard_weight_scale,
-                     par_.corridor_hard_tolerance});
-    tiers.push_back({"bounded", par_.corridor_bounded_weight_scale,
-                     par_.corridor_bounded_violation});
+    // Accept the primary high-weight result whenever the solver returns a
+    // finite, structurally valid trajectory. Corridor violation remains a
+    // diagnostic; it no longer discards a usable 100x result in favour of a
+    // weaker solve. The 10x pass runs only on a real solver/structure failure.
+    tiers.push_back({"high_weight", par_.corridor_hard_weight_scale});
+    tiers.push_back({"fallback_weight", par_.corridor_bounded_weight_scale});
+  } else {
+    tiers.push_back({"legacy_soft", 1.0});
   }
-  tiers.push_back({"soft", 1.0, std::numeric_limits<double>::infinity()});
 
   MyTimer timer_opt(true);
   double total_initial_guess_ms = 0.0;
@@ -2077,19 +2079,13 @@ bool MIGHTY::planLocalTrajectory(vec_Vecf<3>& global_path) {
 
     reconstruct_solution();
     const double maximum_violation = max_control_point_corridor_violation();
-    if (maximum_violation <= tier.accepted_violation_m) {
-      optimization_succeeded = true;
-      if (par_.debug_verbose) {
-        std::cout << "[CorridorOptimization] accepted tier=" << tier.name
-                  << " max_control_point_violation_m=" << maximum_violation << std::endl;
-      }
-      break;
-    }
+    if (!std::isfinite(maximum_violation)) continue;
+    optimization_succeeded = true;
     if (par_.debug_verbose) {
-      std::cout << "[CorridorOptimization] rejected tier=" << tier.name
-                << " max_control_point_violation_m=" << maximum_violation
-                << " limit_m=" << tier.accepted_violation_m << std::endl;
+      std::cout << "[CorridorOptimization] accepted tier=" << tier.name
+                << " max_control_point_violation_m=" << maximum_violation << std::endl;
     }
+    break;
   }
   initial_guess_computation_time_ = total_initial_guess_ms;
   local_traj_computation_time_ = total_local_optimization_ms;

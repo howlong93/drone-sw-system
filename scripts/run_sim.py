@@ -751,6 +751,10 @@ def generate_gazebo_yaml(setup_bash: Path, goal: tuple, sim_env: str,
                          debug_testing: bool = False,
                          sc_method: str = 'ellipsoid',
                          risp_alpha: float = 0.05,
+                         hgp_voxel_aware: bool = True,
+                         risp_voxel_aware: bool = False,
+                         corridor_primary_weight_scale: float = 30.0,
+                         corridor_fallback_weight_scale: float = 5.0,
                          sc_ellipsoid_fallback: bool = False,
                          risp_random_seed: int = 1,
                          pathcover_max_corridors: int = 12,
@@ -813,6 +817,10 @@ def generate_gazebo_yaml(setup_bash: Path, goal: tuple, sim_env: str,
                 f'enable_safety_gate:={str(enable_safety_gate).lower()} '
                 f'debug_testing:={str(debug_testing).lower()} '
                 f'sc_method:={sc_method} risp_alpha:={risp_alpha} '
+                f'hgp_voxel_aware:={str(hgp_voxel_aware).lower()} '
+                f'risp_voxel_aware:={str(risp_voxel_aware).lower()} '
+                f'corridor_hard_weight_scale:={corridor_primary_weight_scale} '
+                f'corridor_bounded_weight_scale:={corridor_fallback_weight_scale} '
                 f'sc_ellipsoid_fallback:={str(sc_ellipsoid_fallback).lower()} '
                 f'risp_random_seed:={risp_random_seed} '
                 f'pathcover_max_corridors:={pathcover_max_corridors} '
@@ -1032,6 +1040,22 @@ def main():
         help='RISP separation margin fraction in (0, 1) (default: 0.05)'
     )
     parser.add_argument(
+        '--hgp-voxel-aware', type=int, choices=[0, 1], default=1,
+        help='Enable HGP occupied-voxel volume edge checks (1/0; default: 1)'
+    )
+    parser.add_argument(
+        '--risp-voxel-aware', type=int, choices=[0, 1], default=0,
+        help='Enable complete occupied-voxel support in RISP (1/0; default: 0)'
+    )
+    parser.add_argument(
+        '--corridor-primary-weight-scale', type=float, default=30.0,
+        help='Primary corridor optimizer stat_weight multiplier (default: 30)'
+    )
+    parser.add_argument(
+        '--corridor-fallback-weight-scale', type=float, default=5.0,
+        help='Fallback multiplier after a failed/invalid primary solve (default: 5)'
+    )
+    parser.add_argument(
         '--sc-ellipsoid-fallback', action='store_true',
         help='Use ellipsoid decomposition when RISP fails; the event remains classified as RISP failure'
     )
@@ -1107,6 +1131,10 @@ def main():
         parser.error('--benchmark-file is only supported with --mode gazebo')
     if not 0.0 < args.risp_alpha < 1.0:
         parser.error('--risp-alpha must be in (0, 1)')
+    if args.corridor_primary_weight_scale <= 0.0:
+        parser.error('--corridor-primary-weight-scale must be positive')
+    if not 0.0 < args.corridor_fallback_weight_scale <= args.corridor_primary_weight_scale:
+        parser.error('--corridor-fallback-weight-scale must be positive and no greater than primary')
     if args.risp_random_seed < 0:
         parser.error('--risp-random-seed must be non-negative')
     if args.pathcover_max_corridors < 2:
@@ -1315,6 +1343,10 @@ def main():
             debug_testing=args.debug_testing,
             sc_method=args.sc_method,
             risp_alpha=args.risp_alpha,
+            hgp_voxel_aware=bool(args.hgp_voxel_aware),
+            risp_voxel_aware=bool(args.risp_voxel_aware),
+            corridor_primary_weight_scale=args.corridor_primary_weight_scale,
+            corridor_fallback_weight_scale=args.corridor_fallback_weight_scale,
             sc_ellipsoid_fallback=args.sc_ellipsoid_fallback,
             risp_random_seed=args.risp_random_seed,
             pathcover_max_corridors=args.pathcover_max_corridors,

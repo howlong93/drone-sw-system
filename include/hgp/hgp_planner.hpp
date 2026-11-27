@@ -43,7 +43,8 @@ class HGPPlanner {
    */
   HGPPlanner(std::string global_planner, bool verbose, double v_max, double a_max, double j_max,
              int hgp_timeout_duration_ms, double w_unknown, double w_align, double decay_len_cells,
-             double w_side, int los_cells = 3, double min_len = 0.5, double min_turn = 10.0);
+             double w_side, int los_cells = 3, double min_len = 0.5, double min_turn = 10.0,
+             bool voxel_aware = true);
 
   /** @brief Set the voxel map utility used for collision checking.
    *  @param map_util Shared pointer to a 3D voxel map utility.
@@ -173,6 +174,12 @@ class HGPPlanner {
    */
   bool lineOfSightCapsule(const Vecf<3>& a, const Vecf<3>& b, int inflate_radius_cells) const;
 
+  /** @brief Exact occupied-voxel support test shared by HGP shortcutting.
+   *  Occupied cells are represented by their centre plus half a voxel
+   *  diagonal; UNKNOWN remains traversable.
+   */
+  bool lineClearsOccupiedVoxelSupport(const Vecf<3>& a, const Vecf<3>& b) const;
+
   /** @brief Merge consecutive edges shorter than a minimum length.
    *  @param in Input waypoint path.
    *  @param min_len Minimum edge length.
@@ -251,6 +258,7 @@ class HGPPlanner {
   int los_cells_ = 3;       // number of cells for inflation in LoS
   double min_len_ = 0.5;    // minimum length of edges
   double min_turn_ = 10.0;  // minimum turn angle in degrees
+  bool voxel_aware_{true};
 
  public:
   /// Whether 2D ground robot planning mode is active.

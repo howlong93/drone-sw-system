@@ -120,7 +120,8 @@ void HGPManager::setupHGPPlanner(const std::string& global_planner, bool global_
   if (!planner_ptr_) {
     planner_ptr_ = std::unique_ptr<HGPPlanner>(new HGPPlanner(
         global_planner, global_planner_verbose, v_max, a_max, j_max, hgp_timeout_duration_ms,
-        w_unknown, w_align, decay_len_cells, w_side, los_cells, min_len, min_turn));
+        w_unknown, w_align, decay_len_cells, w_side, los_cells, min_len, min_turn,
+        par_.hgp_voxel_aware));
   }
 
   // Set max node expansion

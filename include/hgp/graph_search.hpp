@@ -180,7 +180,7 @@ class GraphSearch {
   GraphSearch(const int8_t* cMap, const std::shared_ptr<mighty::VoxelMapUtil>& map_util, int xDim,
               int yDim, int zDim, double eps, bool verbose, std::string global_planner,
               double w_unknown, double w_align = 60.0, double decay_len_cells = 20.0,
-              double w_side = 0.2);
+              double w_side = 0.2, bool voxel_aware = true);
 
   /**
    * @brief start 3D planning thread
@@ -272,6 +272,11 @@ class GraphSearch {
   /// Check if (x, y, z) is unknown
   bool isUnknown(int x, int y, int z) const;
 
+  /// Check whether an adjacent graph edge clears the finite volume of every
+  /// occupied voxel.  Unknown voxels remain traversable.
+  bool edgeClearsOccupiedVoxelSupport(int x, int y, int z,
+                                      size_t neighbor_index) const;
+
   /// Clculate heuristic
   double getHeur(int x, int y, int z) const;
 
@@ -327,6 +332,11 @@ class GraphSearch {
   std::vector<StatePtr> path_;
 
   std::vector<std::vector<int>> ns_;
+  // For each entry in ns_, occupied-voxel offsets whose centres lie within
+  // half a voxel diagonal of that unit graph edge.  Precomputed once so A*
+  // only performs a small, fixed set of occupancy lookups per transition.
+  std::vector<std::vector<Veci<3>>> edge_voxel_offsets_;
+  bool voxel_aware_{true};
   std::shared_ptr<JPS2DNeib> jn2d_;
   std::shared_ptr<JPS3DNeib> jn3d_;
 

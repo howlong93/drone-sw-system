@@ -8,6 +8,7 @@
 
 #include "hgp/graph_search.hpp"
 
+#include <algorithm>
 #include <cmath>
 
 using namespace mighty;
@@ -22,7 +23,7 @@ static inline double hypot2d(double x, double y) { return std::sqrt(x * x + y * 
 GraphSearch::GraphSearch(const int8_t* cMap, const std::shared_ptr<mighty::VoxelMapUtil>& map_util,
                          int xDim, int yDim, int zDim, double eps, bool verbose,
                          std::string global_planner, double w_unknown, double w_align,
-                         double decay_len_cells, double w_side)
+                         double decay_len_cells, double w_side, bool voxel_aware)
     : cMap_(cMap),
       map_util_(map_util),
       xDim_(xDim),
@@ -34,7 +35,8 @@ GraphSearch::GraphSearch(const int8_t* cMap, const std::shared_ptr<mighty::Voxel
       w_unknown_(w_unknown),
       w_align_(w_align),
       decay_len_cells_(decay_len_cells),
-      w_side_(w_side) {
+      w_side_(w_side),
+      voxel_aware_(voxel_aware) {
   hm_.assign(xDim_ * yDim_ * zDim_, nullptr);
   seen_.assign(xDim_ * yDim_ * zDim_, false);
 
@@ -47,6 +49,38 @@ GraphSearch::GraphSearch(const int8_t* cMap, const std::shared_ptr<mighty::Voxel
         if (x == 0 && y == 0 && z == 0) continue;
         ns_.push_back(std::vector<int>{x, y, z});
       }
+    }
+  }
+
+  // Build the exact local collision stencil for every adjacent transition.
+  // Grid coordinates are expressed in voxel units, so the conservative
+  // support radius is half the voxel diagonal: sqrt(3)/2 in 3D and
+  // sqrt(2)/2 in 2D.  This makes finite occupied-voxel volume part of the
+  // search graph itself instead of a post-plan validation step.
+  if (voxel_aware_) {
+    const double support_radius_squared = (zDim_ == 1) ? 0.5 : 0.75;
+    edge_voxel_offsets_.reserve(ns_.size());
+    for (const auto& d : ns_) {
+    std::vector<Veci<3>> offsets;
+    const Eigen::Vector3d edge(static_cast<double>(d[0]),
+                               static_cast<double>(d[1]),
+                               static_cast<double>(d[2]));
+    const double edge_squared = edge.squaredNorm();
+    const int z_min = (zDim_ == 1) ? 0 : std::min(0, d[2]) - 1;
+    const int z_max = (zDim_ == 1) ? 0 : std::max(0, d[2]) + 1;
+    for (int ox = std::min(0, d[0]) - 1; ox <= std::max(0, d[0]) + 1; ++ox) {
+      for (int oy = std::min(0, d[1]) - 1; oy <= std::max(0, d[1]) + 1; ++oy) {
+        for (int oz = z_min; oz <= z_max; ++oz) {
+          const Eigen::Vector3d center(static_cast<double>(ox),
+                                       static_cast<double>(oy),
+                                       static_cast<double>(oz));
+          const double t = std::clamp(center.dot(edge) / edge_squared, 0.0, 1.0);
+          if ((center - t * edge).squaredNorm() <= support_radius_squared + 1e-12)
+            offsets.emplace_back(ox, oy, oz);
+        }
+      }
+    }
+      edge_voxel_offsets_.push_back(std::move(offsets));
     }
   }
 
@@ -70,6 +104,23 @@ inline bool GraphSearch::isOccupied(int x, int y, int z) const {
 inline bool GraphSearch::isUnknown(int x, int y, int z) const {
   return x >= 0 && x < xDim_ && y >= 0 && y < yDim_ && z >= 0 && z < zDim_ &&
          cMap_[coordToId(x, y, z)] == val_unknown_;
+}
+
+bool GraphSearch::edgeClearsOccupiedVoxelSupport(int x, int y, int z,
+                                                 size_t neighbor_index) const {
+  if (!voxel_aware_) return true;
+  if (neighbor_index >= edge_voxel_offsets_.size()) return false;
+  for (const Veci<3>& offset : edge_voxel_offsets_[neighbor_index]) {
+    const int ox = x + offset.x();
+    const int oy = y + offset.y();
+    const int oz = z + offset.z();
+    // Outside-map space is not an occupied voxel.  The successor bounds check
+    // still prevents the search itself from leaving the planning map.
+    if (ox < 0 || ox >= xDim_ || oy < 0 || oy >= yDim_ || oz < 0 || oz >= zDim_)
+      continue;
+    if (cMap_[coordToId(ox, oy, oz)] == val_occupied_) return false;
+  }
+  return true;
 }
 
 inline double GraphSearch::getHeur(int x, int y, int z) const {
@@ -563,7 +614,8 @@ void GraphSearch::getSucc(const StatePtr& curr, std::vector<int>& succ_ids,
   }
   const double vref_n = vref.norm();
 
-  for (const auto& d : ns_) {
+  for (size_t neighbor_index = 0; neighbor_index < ns_.size(); ++neighbor_index) {
+    const auto& d = ns_[neighbor_index];
     int new_x = curr->x + d[0];
     int new_y = curr->y + d[1];
     int new_z = curr->z + d[2];
@@ -579,6 +631,16 @@ void GraphSearch::getSucc(const StatePtr& curr, std::vector<int>& succ_ids,
     if (new_x < 0 || new_x >= xDim_ ||
         new_y < 0 || new_y >= yDim_ ||
         new_z < 0 || new_z >= zDim_) {
+      continue;
+    }
+
+
+    // The finite occupied-voxel volume is a hard constraint of the graph:
+    // an intersecting transition is never inserted into the A* open set.
+    // This is independent of the optional soft obstacle cost and leaves
+    // UNKNOWN voxels traversable.
+    if (!edgeClearsOccupiedVoxelSupport(curr->x, curr->y, curr->z,
+                                        neighbor_index)) {
       continue;
     }
 

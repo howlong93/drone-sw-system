@@ -52,6 +52,18 @@ def generate_launch_description():
         description='Safe-corridor generator: ellipsoid, risp_point, risp_line, pathcover_line, pathcover_point, or pathcover_line_reuse')
     risp_alpha_arg = DeclareLaunchArgument(
         'risp_alpha', default_value='0.05', description='RISP separation margin fraction')
+    hgp_voxel_aware_arg = DeclareLaunchArgument(
+        'hgp_voxel_aware', default_value='true',
+        description='Reject HGP edges that intersect occupied voxel volume')
+    risp_voxel_aware_arg = DeclareLaunchArgument(
+        'risp_voxel_aware', default_value='false',
+        description='Make RISP planes exclude the complete occupied voxel support')
+    corridor_hard_weight_scale_arg = DeclareLaunchArgument(
+        'corridor_hard_weight_scale', default_value='30.0',
+        description='Primary corridor optimizer stat_weight multiplier')
+    corridor_bounded_weight_scale_arg = DeclareLaunchArgument(
+        'corridor_bounded_weight_scale', default_value='5.0',
+        description='Fallback multiplier after a failed or invalid primary solve')
     sc_ellipsoid_fallback_arg = DeclareLaunchArgument(
         'sc_ellipsoid_fallback', default_value='false',
         description='Use ellipsoid decomposition if RISP fails')
@@ -141,6 +153,14 @@ def generate_launch_description():
             LaunchConfiguration('debug_testing').perform(context))
         sc_method = LaunchConfiguration('sc_method').perform(context)
         risp_alpha = float(LaunchConfiguration('risp_alpha').perform(context))
+        hgp_voxel_aware = convert_str_to_bool(
+            LaunchConfiguration('hgp_voxel_aware').perform(context))
+        risp_voxel_aware = convert_str_to_bool(
+            LaunchConfiguration('risp_voxel_aware').perform(context))
+        corridor_hard_weight_scale = float(
+            LaunchConfiguration('corridor_hard_weight_scale').perform(context))
+        corridor_bounded_weight_scale = float(
+            LaunchConfiguration('corridor_bounded_weight_scale').perform(context))
         sc_ellipsoid_fallback = convert_str_to_bool(
             LaunchConfiguration('sc_ellipsoid_fallback').perform(context))
         risp_random_seed = int(LaunchConfiguration('risp_random_seed').perform(context))
@@ -222,6 +242,10 @@ def generate_launch_description():
         parameters['debug_testing'] = bool(debug_testing)
         parameters['sc_method'] = sc_method
         parameters['risp_alpha'] = risp_alpha
+        parameters['hgp_voxel_aware'] = bool(hgp_voxel_aware)
+        parameters['risp_voxel_aware'] = bool(risp_voxel_aware)
+        parameters['corridor_hard_weight_scale'] = corridor_hard_weight_scale
+        parameters['corridor_bounded_weight_scale'] = corridor_bounded_weight_scale
         parameters['sc_ellipsoid_fallback'] = bool(sc_ellipsoid_fallback)
         parameters['risp_random_seed'] = risp_random_seed
         parameters['pathcover_max_corridors'] = pathcover_max_corridors
@@ -477,6 +501,10 @@ def generate_launch_description():
         debug_testing_arg,
         sc_method_arg,
         risp_alpha_arg,
+        hgp_voxel_aware_arg,
+        risp_voxel_aware_arg,
+        corridor_hard_weight_scale_arg,
+        corridor_bounded_weight_scale_arg,
         sc_ellipsoid_fallback_arg,
         risp_random_seed_arg,
         pathcover_max_corridors_arg,
